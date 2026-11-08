@@ -27,7 +27,7 @@ It replaces three source files and adds/updates three test files:
 - `bubu/test/unit/normalizer.test.js`
 - `bubu/test/unit/runtime.test.js`
 - `bubu/test/unit/message-context.test.js` (new)
-- `bubu/docs/PATCH_TASK_2_4_NOTES.md`
+- `bubu/docs/TASK-2.4-CAPTION-QUOTE-CONTEXT.md`
 
 No `.env`, database, storage, PM2 config, package manifest, dependency lockfile, or dependency is changed.
 

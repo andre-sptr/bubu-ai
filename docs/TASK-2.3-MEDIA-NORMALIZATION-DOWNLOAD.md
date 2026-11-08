@@ -19,7 +19,7 @@ It replaces four source files and adds/updates five test files:
 - `bubu/test/unit/p3-media.test.js`
 - `bubu/test/unit/group-routing.test.js`
 - `bubu/test/unit/message-processor-media-errors.test.js`
-- `bubu/docs/PATCH_TASK_2_3_NOTES.md`
+- `bubu/docs/TASK-2.3-MEDIA-NORMALIZATION-DOWNLOAD.md`
 
 The Task 2.2 media-error test file is included with a small fixture update (`config.waha.baseUrl`) because Task 2.3 now normalizes media URLs at the MessageProcessor boundary.
 

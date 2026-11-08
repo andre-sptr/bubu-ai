@@ -9,8 +9,8 @@
 Extract from `/www/wwwroot/bot-project` (parent of the existing `bubu` folder).
 
 - `bubu/test/unit/voice-output.test.js` — new tests for DM/group delivery modes and WAHA `sendVoice` payload contract.
-- `bubu/docs/PATCH_TASK_2_5C_NOTES.md` — this handover.
-- `bubu/docs/BUBU_PHASE_2_5_TEST_EVIDENCE.docx` — consolidated Task 2.5 evidence provided/approved in the conversation.
+- `bubu/docs/TASK-2.5C-VOICE-OUTPUT-DELIVERY.md` — this handover.
+- `bubu/docs/TASK-2.5-VOICE-AUDIO-EVIDENCE.docx` — consolidated Task 2.5 evidence provided/approved in the conversation.
 
 The ZIP intentionally does not replace `src/p3/media/service.js`, `src/channels/response-handler.js`, `src/channels/waha/client.js`, `.env`, database, PM2 files, or dependencies. The source snapshot already contains the Piper synthesis, FFmpeg Opus conversion, ResponseHandler modes, and WAHA `/api/sendVoice` adapter. Avoid overwriting the Task 2.5B source that has already been accepted on the VPS.
 

@@ -8,7 +8,7 @@
 
 Gunakan prompt berikut bila melanjutkan verifikasi VPS dan acceptance WhatsApp Phase 2:
 
-> Bertindak sebagai Senior AI Engineer dan Technical Lead untuk Bubu. Baca `docs/BUBU_PHASE_2_ROADMAP_TASKS_HANDOVER.md` dan `docs/PATCH_TASK_2_6_2_7_2_8_NOTES.md`. Pertahankan kontrak Phase 1 yang sudah disetujui. Implementasi kode untuk Task 2.2 hingga Task 2.8 sudah selesai di source dan lulus 203/203 unit test terfokus. Bantu saya memverifikasi deployment di VPS, menjalankan `npm test`, `npm run test:phase1`, dan `bash scripts/phase2-regression.sh`, lalu mencatat matriks acceptance WhatsApp akhir untuk menutup Phase 2.
+> Bertindak sebagai Senior AI Engineer dan Technical Lead untuk Bubu. Baca `docs/PHASE-2-ROADMAP.md` dan `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md`. Pertahankan kontrak Phase 1 yang sudah disetujui. Implementasi kode untuk Task 2.2 hingga Task 2.8 sudah selesai di source dan lulus 203/203 unit test terfokus. Bantu saya memverifikasi deployment di VPS, menjalankan `npm test`, `npm run test:phase1`, dan `bash scripts/phase2-regression.sh`, lalu mencatat matriks acceptance WhatsApp akhir untuk menutup Phase 2.
 
 ## 1. Baseline source dan VPS
 
@@ -18,9 +18,9 @@ Gunakan prompt berikut bila melanjutkan verifikasi VPS dan acceptance WhatsApp P
 | Runtime | Node shell dan Node PM2 **v24.22.1**. Bubu `/health` dan `/ready` HTTP 200. | Readiness membuktikan layanan dan cek SQLite merespons. Acceptance media WhatsApp tetap dicatat terpisah. |
 | Database | `MAX(version)` pada `schema_migrations` adalah **9**. | Tidak ada migrasi skema baru pada Phase 2 (tetap v9). |
 | Kapasitas | **2 CPU tersedia**, **1,9 GiB RAM total**, **23,7 GiB disk bebas** pada filesystem storage. | Single-concurrency guard aktif untuk `audioBusy` dan `videoBusy` di `MediaIntelligenceService`. |
-| WAHA | **2026.10.1 · CORE · GOWS · WORKING**. GET versi dan sesi HTTP 200. Event terpasang `message` dan `session.status`. | Fixture GOWS untuk gambar, PTT, audio biasa, video, dan reply/quote sudah tercatat di `docs/BUBU_PHASE_2_TASK_2_1_TEST_EVIDENCE.md`. |
+| WAHA | **2026.10.1 · CORE · GOWS · WORKING**. GET versi dan sesi HTTP 200. Event terpasang `message` dan `session.status`. | Fixture GOWS untuk gambar, PTT, audio biasa, video, dan reply/quote sudah tercatat di `docs/TASK-2.1-PRODUCTION-AUDIT-EVIDENCE.md`. |
 | Media lokal | FFmpeg dan FFprobe **6.1.1**, encoder `libopus` tersedia. Tesseract **5.3.4**, paket `ind` dan `eng` tersedia. | Digunakan untuk normalisasi gambar ke JPEG terukur, sampling frame video ber-timestamp, normalisasi WAV 16 kHz mono, dan encoding OGG/Opus 48 kHz. |
-| STT dan TTS | Whisper.cpp (`/opt/whisper.cpp/build/bin/whisper-cli`, `ggml-base.bin`), Silero VAD (`ggml-silero-v6.2.0.bin`), dan Piper (`/opt/piper-venv/bin/piper`, `id_ID-news_tts-medium.onnx`) sudah diinstal dan diuji di VPS (`docs/BUBU_PHASE_2_5_TEST_EVIDENCE.docx`). | Integrasi STT + Silero VAD (Task 2.5B) dan jalur TTS Piper → Opus → `sendVoice` (Task 2.5C) sudah terhubung. |
+| STT dan TTS | Whisper.cpp (`/opt/whisper.cpp/build/bin/whisper-cli`, `ggml-base.bin`), Silero VAD (`ggml-silero-v6.2.0.bin`), dan Piper (`/opt/piper-venv/bin/piper`, `id_ID-news_tts-medium.onnx`) sudah diinstal dan diuji di VPS (`docs/TASK-2.5-VOICE-AUDIO-EVIDENCE.docx`). | Integrasi STT + Silero VAD (Task 2.5B) dan jalur TTS Piper → Opus → `sendVoice` (Task 2.5C) sudah terhubung. |
 | Batas aktif | Media aktif, **25 MiB**, visual image **4 MiB / 1280px**, audio **900 detik**, video **180 detik**, maksimal **8 frame**. | Batas ukuran dan dimensi visual ditegakkan sebelum pengiriman ke Sumopod. |
 | Routing | `GROUP_POLICY=all`, mention grup wajib, media tanpa caption mengikuti kebijakan terpisah dengan `GROUP_MEDIA_REQUIRE_MENTION=false`. | Uji caption dan media-only secara terpisah. DM tetap dibatasi pemilik. |
 | Sumopod | `fast` = `claude-haiku-5-5`. `balanced`, `coding`, dan `vision` = `claude-sonnet-5-5`. `reasoning` = `claude-opus-5-5`. `summary` = `gemini/gemini-3.1-pro-preview`. | `claude-sonnet-5-5` lulus probe kontrol teks, identifikasi 2 gambar tanpa teks, serta gambar + tool calling pada Task 2.1C dan dipilih pemilik sebagai model visual. |
@@ -77,21 +77,21 @@ Setiap perubahan Phase 2 diuji terhadap kontrak berikut.
 
 | Task | Status kode & unit test | Status VPS / WhatsApp acceptance | Dokumen bukti / patch |
 |---|---|---|---|
-| **2.1 — Audit kemampuan produksi** | **Selesai (2.1A–2.1D).** Inventaris VPS, fixture GOWS, probe Sumopod `claude-sonnet-5-5`, dan pemilihan kandidat model visual selesai. | Lulus untuk baseline, GOWS metadata, dan probe visual Sumopod. | `docs/BUBU_PHASE_2_TASK_2_1_TEST_EVIDENCE.md` |
-| **2.2 — Pulihkan penanganan error media** | **Selesai.** Error media dilempar utuh ke `InboxWorker`; notice awal menghormati mode output chat; voice-only tetap fail-closed. | Menunggu re-verifikasi akhir bersama Task 2.8. | `docs/PATCH_TASK_2_2_NOTES.md` |
-| **2.3 — Normalisasi dan unduhan media** | **Selesai.** Normalisasi struktur native GOWS, resolusi URL relatif, blokir origin asing/redirect/kredensial URL, validasi MIME & signature. | Menunggu konfirmasi acceptance lengkap pada Task 2.8. | `docs/PATCH_TASK_2_3_NOTES.md` |
-| **2.4 — Caption, kutipan, dan konteks chat** | **Selesai.** Pemisahan `bodyText`, `captionContext`, `voiceInstruction`, `attachmentEvidence`, `quoteContext`, penolakan quote lintas chat, skip auto-memory pada media/quote. | Menunggu konfirmasi acceptance lengkap pada Task 2.8. | `docs/PATCH_TASK_2_4_NOTES.md` |
-| **2.5 — Voice note dan audio** | **Selesai (2.5A, 2.5B, 2.5C).** Whisper `ggml-base.bin` + Silero VAD `ggml-silero-v6.2.0.bin`, normalisasi WAV 16 kHz, stop awal `noSpeech`, guard `audioBusy`, dan jalur Piper → Opus → `sendVoice`. | 2.5A–2.5B diuji di VPS (noise lingkungan di-skip atas keputusan pemilik); 2.5C menunggu uji kirim WAHA langsung di DM & grup. | `docs/BUBU_PHASE_2_5_TEST_EVIDENCE.docx`, `docs/PATCH_TASK_2_5_NOTES.md`, `docs/PATCH_TASK_2_5C_NOTES.md` |
-| **2.6 — Pemahaman gambar** | **Selesai.** Routing visual ke `claude-sonnet-5-5`, normalisasi FFmpeg JPEG (`<=1280px`, `<=4 MiB`), sanitasi `data:image/jpeg;base64` di `SumopodProvider`, suplemen OCR & fallback `[OCR_FALLBACK]`. | Menunggu deploy overlay dan acceptance WhatsApp DM & grup. | `docs/PATCH_TASK_2_6_2_7_2_8_NOTES.md` |
-| **2.7 — Pemahaman video** | **Selesai.** Ekstraksi frame ber-timestamp (`Frame #k [t=MM:SS.s]`), penggabungan transkrip audio Task 2.5, rekonsiliasi durasi metadata vs FFprobe, status `insufficient_sample` dan `partial_ocr_audio`, guard `videoBusy`. | Menunggu deploy overlay dan acceptance WhatsApp DM & grup. | `docs/PATCH_TASK_2_6_2_7_2_8_NOTES.md` |
-| **2.8 — Regresi, performa, dan acceptance** | **Selesai (suite lokal & skrip regresi).** 203/203 tes unit lulus; `test/unit/phase2-regression-contract.test.js` dan `scripts/phase2-regression.sh` tersedia. | Gate rilis Phase 2 di VPS oleh pemilik. | `docs/PATCH_TASK_2_6_2_7_2_8_NOTES.md` |
+| **2.1 — Audit kemampuan produksi** | **Selesai (2.1A–2.1D).** Inventaris VPS, fixture GOWS, probe Sumopod `claude-sonnet-5-5`, dan pemilihan kandidat model visual selesai. | Lulus untuk baseline, GOWS metadata, dan probe visual Sumopod. | `docs/TASK-2.1-PRODUCTION-AUDIT-EVIDENCE.md` |
+| **2.2 — Pulihkan penanganan error media** | **Selesai.** Error media dilempar utuh ke `InboxWorker`; notice awal menghormati mode output chat; voice-only tetap fail-closed. | Menunggu re-verifikasi akhir bersama Task 2.8. | `docs/TASK-2.2-MEDIA-ERROR-HANDLING.md` |
+| **2.3 — Normalisasi dan unduhan media** | **Selesai.** Normalisasi struktur native GOWS, resolusi URL relatif, blokir origin asing/redirect/kredensial URL, validasi MIME & signature. | Menunggu konfirmasi acceptance lengkap pada Task 2.8. | `docs/TASK-2.3-MEDIA-NORMALIZATION-DOWNLOAD.md` |
+| **2.4 — Caption, kutipan, dan konteks chat** | **Selesai.** Pemisahan `bodyText`, `captionContext`, `voiceInstruction`, `attachmentEvidence`, `quoteContext`, penolakan quote lintas chat, skip auto-memory pada media/quote. | Menunggu konfirmasi acceptance lengkap pada Task 2.8. | `docs/TASK-2.4-CAPTION-QUOTE-CONTEXT.md` |
+| **2.5 — Voice note dan audio** | **Selesai (2.5A, 2.5B, 2.5C).** Whisper `ggml-base.bin` + Silero VAD `ggml-silero-v6.2.0.bin`, normalisasi WAV 16 kHz, stop awal `noSpeech`, guard `audioBusy`, dan jalur Piper → Opus → `sendVoice`. | 2.5A–2.5B diuji di VPS (noise lingkungan di-skip atas keputusan pemilik); 2.5C menunggu uji kirim WAHA langsung di DM & grup. | `docs/TASK-2.5-VOICE-AUDIO-EVIDENCE.docx`, `docs/TASK-2.5B-STT-SILERO-VAD.md`, `docs/TASK-2.5C-VOICE-OUTPUT-DELIVERY.md` |
+| **2.6 — Pemahaman gambar** | **Selesai.** Routing visual ke `claude-sonnet-5-5`, normalisasi FFmpeg JPEG (`<=1280px`, `<=4 MiB`), sanitasi `data:image/jpeg;base64` di `SumopodProvider`, suplemen OCR & fallback `[OCR_FALLBACK]`. | Menunggu deploy overlay dan acceptance WhatsApp DM & grup. | `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md` |
+| **2.7 — Pemahaman video** | **Selesai.** Ekstraksi frame ber-timestamp (`Frame #k [t=MM:SS.s]`), penggabungan transkrip audio Task 2.5, rekonsiliasi durasi metadata vs FFprobe, status `insufficient_sample` dan `partial_ocr_audio`, guard `videoBusy`. | Menunggu deploy overlay dan acceptance WhatsApp DM & grup. | `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md` |
+| **2.8 — Regresi, performa, dan acceptance** | **Selesai (suite lokal & skrip regresi).** 203/203 tes unit lulus; `test/unit/phase2-regression-contract.test.js` dan `scripts/phase2-regression.sh` tersedia. | Gate rilis Phase 2 di VPS oleh pemilik. | `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md` |
 
 ## 4. Rincian task
 
 ### Task 2.1 — Selesaikan audit kemampuan produksi
 
 - [x] **2.1A · Inventaris VPS & source.** Enam hash cocok, Node v24.22.1, SQLite v9, WAHA 2026.10.1 CORE/GOWS WORKING, kapasitas 2 vCPU / 1,9 GiB RAM / 23,7 GiB disk.
-- [x] **2.1B · Metadata webhook GOWS.** Gambar dengan/tanpa caption, PTT OGG/Opus, audio biasa, video pendek, dan reply/quote gambar tercatat di `docs/BUBU_PHASE_2_TASK_2_1_TEST_EVIDENCE.md`.
+- [x] **2.1B · Metadata webhook GOWS.** Gambar dengan/tanpa caption, PTT OGG/Opus, audio biasa, video pendek, dan reply/quote gambar tercatat di `docs/TASK-2.1-PRODUCTION-AUDIT-EVIDENCE.md`.
 - [x] **2.1C · Probe Sumopod.** `claude-sonnet-5-5` lulus kontrol teks, identifikasi 2 gambar tanpa teks (apel vs pisang), dan kombinasi input gambar + tool calling (`report_visual_observation`).
 - [x] **2.1D · Keputusan arsitektur.** `claude-sonnet-5-5` dipilih sebagai model visual kandidat; Whisper base + Silero VAD + Piper `id_ID-news_tts-medium` dipilih untuk STT/TTS lokal dengan concurrency 1 job.
 
@@ -116,9 +116,9 @@ Setiap perubahan Phase 2 diuji terhadap kontrak berikut.
 
 ### Task 2.5 — Voice note dan audio intelligence
 
-- [x] **2.5A · Prasyarat.** Whisper.cpp (`ggml-base.bin`), Silero VAD (`ggml-silero-v6.2.0.bin`), dan Piper (`id_ID-news_tts-medium.onnx`) diuji di VPS (`docs/BUBU_PHASE_2_5_TEST_EVIDENCE.docx`).
-- [x] **2.5B · STT dan ringkasan.** Normalisasi FFmpeg 16 kHz mono WAV, eksekusi Silero VAD + Whisper, penanganan `noSpeech: true` tanpa memanggil Agent, dan guard `audioBusy` (`docs/PATCH_TASK_2_5_NOTES.md`). *(Catatan: uji background noise lingkungan di-skip atas keputusan pemilik).*
-- [x] **2.5C · Output.** Verifikasi kontrak Piper → FFmpeg OGG/Opus → `sendVoice` di DM dan grup untuk mode `text`, `voice`, dan `both`, termasuk fail-closed dan partial uncertain delivery (`test/unit/voice-output.test.js`, `docs/PATCH_TASK_2_5C_NOTES.md`).
+- [x] **2.5A · Prasyarat.** Whisper.cpp (`ggml-base.bin`), Silero VAD (`ggml-silero-v6.2.0.bin`), dan Piper (`id_ID-news_tts-medium.onnx`) diuji di VPS (`docs/TASK-2.5-VOICE-AUDIO-EVIDENCE.docx`).
+- [x] **2.5B · STT dan ringkasan.** Normalisasi FFmpeg 16 kHz mono WAV, eksekusi Silero VAD + Whisper, penanganan `noSpeech: true` tanpa memanggil Agent, dan guard `audioBusy` (`docs/TASK-2.5B-STT-SILERO-VAD.md`). *(Catatan: uji background noise lingkungan di-skip atas keputusan pemilik).*
+- [x] **2.5C · Output.** Verifikasi kontrak Piper → FFmpeg OGG/Opus → `sendVoice` di DM dan grup untuk mode `text`, `voice`, dan `both`, termasuk fail-closed dan partial uncertain delivery (`test/unit/voice-output.test.js`, `docs/TASK-2.5C-VOICE-OUTPUT-DELIVERY.md`).
 - [ ] Konfirmasi pengiriman dan pemutaran voice note nyata melalui WAHA GOWS di DM dan grup (Task 2.8).
 
 ### Task 2.6 — Pemahaman gambar

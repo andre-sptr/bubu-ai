@@ -58,10 +58,10 @@
 - `scripts/phase2-regression.sh` (new)
 
 ### Updated documentation
-- `docs/BUBU_PHASE_2_ROADMAP_TASKS_HANDOVER.md`
+- `docs/PHASE-2-ROADMAP.md`
 - `docs/PHASE-1-FULL-REGRESSION-PLAN.md`
 - `docs/P3-WHATSAPP-MULTIMODAL.md`
-- `docs/PATCH_TASK_2_6_2_7_2_8_NOTES.md`
+- `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md`
 
 ---
 
