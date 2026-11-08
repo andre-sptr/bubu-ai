@@ -1,0 +1,34 @@
+{
+  "name": "bubu-whatsapp-agent",
+  "version": "2.4.0",
+  "private": true,
+  "description": "Clean rebuild of Bubu WhatsApp personal AI agent",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/unit/*.test.js test/integration/*.test.js",
+    "test:unit": "node --test test/unit/*.test.js",
+    "check": "node --check src/index.js && node --test test/unit/*.test.js test/integration/*.test.js",
+    "models": "node scripts/list-models.js",
+    "backup": "node scripts/backup.js",
+    "test:phase1": "bash scripts/phase1-regression.sh"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@fastify/helmet": "^13.2.0",
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "pino": "^9.6.0",
+    "zod": "^3.24.2",
+    "axios": "^1.7.9",
+    "pdf-parse": "^1.1.4",
+    "mammoth": "^1.13.0",
+    "exceljs": "^4.4.0",
+    "docx": "^9.15.3"
+  },
+  "devDependencies": {}
+}
