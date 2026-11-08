@@ -64,7 +64,12 @@ function loadConfig(env = process.env) {
     },
     documents: {
       maxFileBytes: Math.min(30 * 1024 * 1024, Math.max(1024 * 1024, Number(env.MAX_DOCUMENT_BYTES || 15 * 1024 * 1024))),
-      maxExtractChars: Math.min(100000, Math.max(5000, Number(env.MAX_DOCUMENT_CHARS || 50000)))
+      maxExtractChars: Math.min(100000, Math.max(5000, Number(env.MAX_DOCUMENT_CHARS || 50000))),
+      ocrEnabled: parseBool(env.DOCUMENT_OCR_ENABLED, true),
+      maxPdfOcrPages: Math.min(25, Math.max(1, Number(env.MAX_PDF_OCR_PAGES || 10))),
+      pdfRenderDpi: Math.min(300, Math.max(72, Number(env.PDF_RENDER_DPI || 150))),
+      pdftoppmBin: env.PDFTOPPM_BIN || 'pdftoppm',
+      ghostscriptBin: env.GHOSTSCRIPT_BIN || 'gs'
     },
     media: {
       enabled: parseBool(env.MEDIA_INTELLIGENCE_ENABLED, true),

@@ -3,8 +3,8 @@
 8 November 2026 · Handover & Rencana Kerja Phase 3 (Diadaptasi dari Roadmap 6-Fase Bubu v2.4.0)
 
 **Phase 1 — Core Reliability & Response Control** sudah selesai dan disetujui pemilik.  
-**Phase 2 — Full Multimodal WhatsApp** sudah selesai pada sisi implementasi kode & suite regresi unit lokal (`203/203` tes lulus), menunggu penutupan gate rilis VPS oleh pemilik.  
-**Phase 3 — Deep Document Intelligence** kini dirancang untuk membawa kemampuan baca, OCR dokumen scan, analisis struktur halaman/sheet, pembuatan/ekspor dokumen profesional, dan manajemen siklus hidup dokumen ke standar produksi di DM dan grup.  
+**Phase 2 — Full Multimodal WhatsApp** sudah selesai pada sisi implementasi kode & suite regresi unit lokal, menunggu penutupan gate rilis VPS oleh pemilik.  
+**Phase 3 — Deep Document Intelligence** kini **selesai diimplementasikan pada kode & suite regresi unit lokal (`217/217` tes lulus di 29 suite)**, mencakup OCR otomatis untuk PDF scan/hybrid, ekstraksi DOCX terstruktur, pencarian snippet kontekstual & pembacaan per halaman, analitik spreadsheet/CSV deterministik, resolusi reply/quote dokumen same-chat, `compare_documents`, pembuatan PDF native & inline Markdown DOCX, serta `delete_document` dan deduplikasi `database.js`. Menunggu verifikasi VPS dan acceptance WhatsApp langsung oleh pemilik.  
 **Phase 4** (Pengiriman Native WhatsApp Baru), **Phase 5** (Agent & Memory Lanjutan), dan **Phase 6** (Redesign Antrean & Hardening Menyeluruh) tetap berada pada fase berikutnya.
 
 ---
@@ -74,72 +74,58 @@ Setiap perubahan pada Phase 3 **wajib** mematuhi kontrak berikut tanpa pengecual
 ## 4. Rincian setiap Task
 
 ### Task 3.1 — Audit prasyarat dokumen di VPS & pembekuan desain
-- [ ] **3.1A · Inventaris biner konversi/render halaman PDF di VPS.** Periksa ketersediaan utilitas CLI lokal di VPS (`/www/wwwroot/bot-project/bubu`), seperti `pdftoppm` (`poppler-utils`), `pdftotext`, `gs` (Ghostscript), atau `soffice` (LibreOffice) bersama `ffmpeg` dan `tesseract` yang sudah terpasang.
-- [ ] **3.1B · Evaluasi jejak resource (CPU/RAM) pada VPS 2 vCPU / 1,9 GiB.** Ukur penggunaan memori saat merender 1–10 halaman PDF scan ke citra 150–200 DPI dan menjalankan Tesseract OCR (`ind+eng`) + opsional Sumopod Vision (`claude-sonnet-5-5`).
-- [ ] **3.1C · Pembekuan desain skema & batas aman.** Tetapkan apakah penyimpanan halaman/section menggunakan struktur terindeks pada tabel `documents` / `document_chunks` (migrasi SQLite v10 yang backward-compatible) atau metadata JSON terstruktur, serta kunci batas default di `src/config/env.js` (mis. `maxPdfOcrPages = 10`, `pdfRenderDpi = 150`).
+- [x] **3.1A · Rantai fallback renderer halaman PDF di VPS.** `DocumentService.renderPdfPagesToImages` mendukung rantai fallback otomatis `pdftoppm` (`poppler-utils`) -> `gs` (`Ghostscript`) -> `ffmpeg` (sudah terverifikasi aktif di VPS v6.1.1) bersama `tesseract` (`v5.3.4`, `ind+eng`).
+- [x] **3.1B · Perlindungan resource (CPU/RAM) pada VPS 2 vCPU / 1,9 GiB.** Dilengkapi single-concurrency guard `this.ocrBusy` pada `DocumentService`, batas default `maxPdfOcrPages = 10`, dan resolusi render `pdfRenderDpi = 150`.
+- [x] **3.1C · Pembekuan desain skema & batas aman.** Seluruh konfigurasi default Phase 3 (`ocrEnabled`, `maxPdfOcrPages`, `pdfRenderDpi`, `pdftoppmBin`, `ghostscriptBin`) ditempatkan langsung di `src/config/env.js` agar `.env` di VPS tetap minimal.
 
 ### Task 3.2 — Pemahaman PDF hasil scan, gambar-saja, dan hybrid
-- [ ] **Deteksi kepadatan teks per halaman.** Saat meng-ingest PDF, periksa apakah teks hasil ekstraksi kosong atau sangat minim (mis. rata-rata `< 25` karakter/halaman atau halaman tertentu hanya berisi gambar scan).
-- [ ] **Pipeline OCR & Vision halaman PDF terukur.**
-  - Render halaman yang tidak memiliki lapisan teks menjadi gambar JPEG terukur di direktori kerja sementara (`os.tmpdir()`), dibatasi maksimal `maxPdfOcrPages` halaman per dokumen.
-  - Jalankan Tesseract OCR (`ind+eng`) per halaman dan, bila diperlukan untuk halaman berdiagram/tabel visual, dukung ringkasan visual terukur melalui model vision (`claude-sonnet-5-5`) dengan menjaga batas `maxVisionBytes`.
-  - Beri penanda eksplisit per halaman (`[Halaman 1 — Teks Asli]`, `[Halaman 2 — OCR Scan]`) dan cantumkan catatan jujur apabila jumlah halaman dokumen melebihi batas halaman OCR (`maxPdfOcrPages`).
-- [ ] **Single-concurrency & cleanup ketat.** Lindungi proses render/OCR PDF dengan concurrency guard agar tidak bertabrakan dengan job STT/Video di VPS 1,9 GiB RAM, dan hapus seluruh file gambar halaman sementara di blok `finally`.
+- [x] **Deteksi kepadatan teks per halaman.** `parsePdfDigitalPages` mengekstrak teks per halaman dan mendeteksi halaman dengan teks kosong/minim (`< 20` karakter).
+- [x] **Pipeline OCR halaman PDF terukur (`ocrPdfPages`).**
+  - Merender halaman scan/minim teks ke gambar sementara di `os.tmpdir()`, dibatasi maksimal `maxPdfOcrPages` (`10`) halaman per dokumen.
+  - Menjalankan Tesseract OCR (`ind+eng`) hanya pada halaman yang membutuhkan OCR, dan mempertahankan teks digital asli pada halaman yang sudah memiliki teks.
+  - Memberi penanda eksplisit per halaman (`--- [HALAMAN N — TEKS ASLI] ---`, `--- [HALAMAN N — OCR SCAN] ---`) serta catatan jujur apabila jumlah halaman dokumen melebihi `maxPdfOcrPages`.
+- [x] **Single-concurrency & cleanup ketat.** Dilindungi `this.ocrBusy` dan selalu menghapus direktori kerja sementara di blok `finally`.
 
 ### Task 3.3 — Ekstraksi terstruktur & pencarian dokumen berbasis cuplikan kontekstual
-- [ ] **Penomoran halaman & struktur bagian.**
-  - Simpan batas halaman pada PDF (`--- [HALAMAN N] ---`) dan struktur heading (`#`, `##`, `###`), bullet list, serta tabel pipa pada ekstraksi DOCX sehingga informasi tata letak tidak hilang.
-  - Tingkatkan batas penyimpanan teks dokumen dan sediakan metadata ringkas (`pageCount`, `charCount`, `hasOcrPages`, `sheetNames` untuk spreadsheet).
-- [ ] **Perbaikan `search_document` (Contextual Snippet Search).**
-  - Ganti perilaku lama (`extracted_text.slice(0, 1800)`) dengan pencarian berbasis segmen/halaman yang mengembalikan **cuplikan tepat di sekitar lokasi kata kunci ditemukan** beserta nomor halaman/bagian dan skor kecocokan.
-- [ ] **Peningkatan `read_document` (Paginated / Section Read).**
-  - Tambahkan parameter opsional `page` / `startPage`–`endPage` atau `offset`–`limit` pada tool `read_document` agar Agent dapat membaca halaman spesifik pada dokumen panjang (mis. halaman 15–18 dari laporan 40 halaman) tanpa kehilangan bagian akhir dokumen.
+- [x] **Penomoran halaman & struktur bagian.**
+  - `extractStructuredDocxText` membaca `word/document.xml` dari container ZIP `.docx` menggunakan `node:zlib` untuk mempertahankan heading (`#`, `##`, `###`), bullet list (`- `), dan tabel pipa Markdown (`| ... |`), dengan fallback ke `mammoth`.
+  - `splitDocumentIntoPages` mendukung pemisahan halaman PDF (`HALAMAN N`), worksheet (`SHEET:`), dan pembagian bagian otomatis untuk dokumen panjang.
+- [x] **Perbaikan `search_document` (Contextual Snippet Search).**
+  - `searchDocumentSnippets` dan `db.searchDocuments` mencari di seluruh halaman dokumen dan mengembalikan cuplikan kontekstual tepat di sekitar kata kunci beserta label halaman (`pageNumber`, `pageLabel`, `matchedPages`, `snippets`, `excerpt`).
+- [x] **Peningkatan `read_document` (Paginated / Section Read).**
+  - Tool `read_document` mendukung parameter opsional `page`, `startPage`, `endPage`, dan `maxChars`, serta mengembalikan `totalPages`, `returnedPages`, `pageLabels`, `hasMorePages`, dan `text`.
 
 ### Task 3.4 — Analitik Spreadsheet & CSV deterministik (`analyze_spreadsheet`)
-- [ ] **Parser CSV tangguh.** Dukung deteksi otomatis delimiter (`,`, `;`, `\t`), quoted fields multi-baris, BOM UTF-8, dan normalisasi angka format Indonesia/internasional (`1.250.000,50` vs `1,250,000.50`).
-- [ ] **Mesin komputasi & profil tabel di sisi server.**
-  - Saat `analyze_spreadsheet` dipanggil, selain mengembalikan sampel baris, kembalikan juga:
-    1. Daftar nama sheet, jumlah baris, dan daftar kolom beserta tipe datanya (`numeric`, `text`, `date`, `formula`, `empty`).
-    2. Statistik agregat deterministik otomatis untuk kolom numerik (`count`, `sum`, `min`, `max`, `avg`) per sheet.
-    3. Dukungan parameter opsional pada `analyze_spreadsheet`: `sheetName`, `filterColumn`, `filterValue`, `groupByColumn`, `aggregateColumn`, dan `rowLimit` sehingga Agent tidak perlu menebak jumlah/rata-rata secara manual dari teks terpotong.
+- [x] **Parser CSV tangguh (`parseCsvText`, `parseSpreadsheetNumber`).** Mendukung deteksi otomatis delimiter (`,`, `;`, `\t`), quoted fields multi-baris (RFC 4180), penghapusan BOM UTF-8, dan normalisasi angka format Indonesia (`Rp 1.250.000,50`) maupun internasional (`$1,250,000.50`, format akuntansi `(500)`).
+- [x] **Mesin komputasi & profil tabel di sisi server (`analyzeSpreadsheetText`).**
+  - Mengembalikan daftar `sheetNames`, `selectedSheet`, `totalRows`, `filteredRows`, profil skema tiap kolom (`inferredType`: `numeric`, `text`, `mixed`, `empty`), statistik deterministik (`count`, `sum`, `avg`, `min`, `max`), ringkasan `groupSummary` (`groupByColumn` + `aggregateColumn`), dan sampel baris terfilter (`filterColumn` + `filterValue`).
 
 ### Task 3.5 — Konteks dokumen multi-turn, kutipan (reply) dokumen, & perbandingan dokumen
-- [ ] **Resolusi reply/quote ke pesan dokumen di chat yang sama.**
-  - Jika pengguna me-reply pesan dokumen (atau pesan balasan asisten atas dokumen) di dalam chat yang sama (`quoteContext.present` dan tidak `rejected`), hubungkan otomatis ke dokumen workspace yang sesuai di chat tersebut sehingga instruksi seperti *"Ringkas poin ke-3 dari file ini"* atau *"Berapa total di sheet kedua?"* langsung mengetahui `documentId` target.
-  - Pertahankan penolakan keras terhadap quote lintas chat (`quote.rejected = true`).
-- [ ] **Tool `compare_documents` (Perbandingan 2 dokumen dalam workspace yang sama).**
-  - Sediakan kemampuan membandingkan dua dokumen di dalam workspace yang sama (mis. revisi kontrak v1 vs v2, atau anggaran Q1 vs Q2) dengan memastikan kedua `documentId` diverifikasi milik `(scope, ownerId/chatId)` yang sama.
-- [ ] **Kepatuhan memori.** Pastikan giliran yang melibatkan lampiran dokumen atau quote dokumen tetap melewati automatic memory extraction kecuali pengguna memberi perintah eksplisit untuk menyimpan fakta.
+- [x] **Resolusi reply/quote ke pesan dokumen di chat yang sama.**
+  - `MessageProcessor.process` otomatis mencocokkan pesan yang di-reply (`quoteContext.present` dan tidak `rejected`) dengan dokumen di workspace aktif (`quoteContext.referencedDocument = { documentId, filename, mimeType }`), serta `AgentRuntime` menyertakan daftar `recentDocuments` workspace aktif di konteks sistem.
+  - Kutipan lintas chat tetap ditolak keras (`quote.rejected = true`).
+- [x] **Tool `compare_documents` (Perbandingan 2 dokumen dalam workspace yang sama).**
+  - Membandingkan dua dokumen di dalam workspace yang sama (`firstDocumentId`, `secondDocumentId`, opsional `focus`) dengan memverifikasi isolasi `(scope, ownerId/chatId)`, menghasilkan ringkasan baris yang ditambah/dihapus, cuplikan fokus, dan selisih numerik antar kolom (`spreadsheetDelta`) untuk file spreadsheet/CSV.
+- [x] **Kepatuhan memori.** Giliran yang melibatkan lampiran dokumen atau quote dokumen tetap melewati automatic memory extraction.
 
 ### Task 3.6 — Peningkatan pembuatan dokumen (Rich DOCX, XLSX lanjutan, & ekspor PDF)
-- [ ] **Inline Markdown parsing pada generator DOCX (`createDocx`).**
-  - Parse sintaks inline `**teks tebal**`, `*teks miring*`, dan `` `kode` `` di dalam paragraf, daftar bullet/nomor, kutipan, dan sel tabel menjadi `TextRun` dengan properti `bold`, `italics`, dan font monospace, sehingga dokumen Word yang dihasilkan bersih tanpa simbol bintang mentah.
-- [ ] **Peningkatan `create_spreadsheet`.**
-  - Dukung baris ringkasan/total terformat otomatis dan validasi referensi lintas sheet yang aman, sambil tetap mempertahankan blokir penuh terhadap formula berbahaya (`HYPERLINK`, `WEBSERVICE`, `RTD`, `DDE`, `CALL`, `REGISTER.ID`, `EXEC`, referensi workbook eksternal).
-- [ ] **Dukungan pembuatan / ekspor dokumen PDF (`format: 'docx' | 'pdf'` atau `create_pdf`).**
-  - Dukung pembuatan dokumen PDF profesional (proposal, invoice, quotation, surat resmi, laporan) dan simpan di workspace aktif (`.pdf`, `application/pdf`).
-  - Terapkan kontrak pengiriman yang identik dengan DOCX/XLSX:
-    - Di **grup**: verifikasi record `(id, scope='group', chat_id=ctx.chatId)`, validasi path di dalam `storageDir`, lalu kirim otomatis hanya ke `ctx.chatId` melalui `ResponseHandler.sendFile`; bila WAHA timeout, tandai `deliveryStatus='uncertain'` tanpa retry otomatis.
-    - Di **DM pribadi**: buat permintaan approval pemilik melalui `ApprovalManager`.
+- [x] **Inline Markdown parsing pada generator DOCX (`createDocx`).**
+  - `parseInlineMarkdownTokens` mem-parse `***bold italic***`, `**bold**`, `*italic*`, dan `` `code` `` di dalam paragraf, daftar bullet/nomor, kutipan, dan sel tabel menjadi `TextRun` berformat rapi.
+- [x] **Dukungan pembuatan / ekspor dokumen PDF (`create_pdf` & `create_document(format='pdf')`).**
+  - `createPdf` (`buildPdf14Buffer`) menghasilkan file multi-halaman `%PDF-1.4` native (tanpa dependency eksternal tambahan) lengkap dengan header, nomor halaman di footer, heading, daftar, dan tabel bergaris.
+  - Mematuhi kontrak pengiriman Phase 1: auto-send ke `ctx.chatId` di grup setelah verifikasi ulang record DB & path `storageDir`, penandaan `deliveryStatus='uncertain'` tanpa retry otomatis bila WAHA gagal/timeout, dan alur `ApprovalManager` di DM pribadi.
 
 ### Task 3.7 — Manajemen siklus hidup dokumen, deduplikasi `database.js`, & tata kelola storage
-- [ ] **Pembersihan duplikasi metode di `src/db/database.js`.**
-  - Hapus definisi metode ganda (`saveDocument`, `getDocument`, `listDocuments`, `searchDocuments`, `createUserTask`, `getUserTask`, `listUserTasks`, `updateUserTask`, `listReminders`) di `src/db/database.js` agar hanya ada satu implementasi kanonik yang bersih dan konsisten.
-- [ ] **Tool manajemen dokumen workspace (`delete_document`).**
-  - Sediakan tool untuk menghapus dokumen dari workspace aktif (menghapus baik record SQLite maupun file fisik di `storage/`) dengan validasi kepemilikan `(scope, ownerId/chatId)` dan pencatatan di `audit_logs`.
-- [ ] **Perlindungan storage & pembersihan file yatim.**
-  - Pastikan kegagalan ekstraksi, kegagalan simpan DB, atau pembatalan tidak meninggalkan file yatim di `storage/`, dan sediakan pengecekan integritas direktori dokumen.
+- [x] **Pembersihan duplikasi metode di `src/db/database.js`.**
+  - Menghapus blok duplikat metode (`saveDocument`, `getDocument`, `listDocuments`, `searchDocuments`, `createUserTask`, `getUserTask`, `listUserTasks`, `updateUserTask`, `listReminders`) di `src/db/database.js` dan menambahkan `deleteDocument`.
+- [x] **Tool manajemen dokumen workspace (`delete_document`).**
+  - Menghapus record dokumen dari SQLite dan menghapus file fisik di dalam `storageDir` (dengan validasi path traversal) serta mencatat ke `audit_logs` (`action: 'delete_document'`).
 
 ### Task 3.8 — Regresi penuh Phase 1–3, performa VPS, dan acceptance WhatsApp
-- [ ] **Unit & integration test baru Phase 3.**
-  - `test/unit/document-ocr-pdf.test.js` (Task 3.2: PDF scan, hybrid, batas halaman, cleanup, concurrency guard).
-  - `test/unit/document-structured-search.test.js` (Task 3.3: ekstraksi per halaman, DOCX terstruktur, snippet search di halaman tengah/akhir, paginated read).
-  - `test/unit/spreadsheet-analytics.test.js` (Task 3.4: CSV `;`/quoted, statistik deterministik `sum/avg/min/max/count`, filter sheet).
-  - `test/unit/document-context-compare.test.js` (Task 3.5: quote dokumen same-chat, blokir quote lintas chat, `compare_documents` isolasi workspace).
-  - `test/unit/document-generation-v3.test.js` (Task 3.6 & 3.7: inline Markdown DOCX, pembuatan & pengiriman PDF DM/grup, `delete_document`).
-  - `test/unit/phase3-regression-contract.test.js` & `scripts/phase3-regression.sh`.
-- [ ] **Verifikasi penuh di VPS.**
-  - Jalankan `npm test`, `npm run test:phase1`, `bash scripts/phase2-regression.sh`, dan `bash scripts/phase3-regression.sh` di VPS (`/www/wwwroot/bot-project/bubu`).
+- [x] **Unit test & skrip regresi Phase 3 (`test/unit/phase3-document-intelligence.test.js` & `scripts/phase3-regression.sh`).**
+  - Seluruh **217/217** unit test di 29 file test suite lulus (`0` gagal).
+- [ ] **Verifikasi penuh di VPS (`/www/wwwroot/bot-project/bubu`).**
+  - Jalankan `npm test`, `npm run test:phase1`, `bash scripts/phase2-regression.sh`, dan `bash scripts/phase3-regression.sh` di VPS.
 - [ ] **Matriks acceptance WhatsApp langsung (DM Pemilik, Grup A, Grup B):**
   1. Kirim PDF teks multi-halaman (>10 halaman) -> tanya isi di halaman akhir -> Bubu menemukan dan mengutip halaman yang tepat.
   2. Kirim PDF hasil scan (tanpa teks digital) -> Bubu berhasil menjalankan OCR halaman dan menjelaskan isinya.
@@ -150,7 +136,25 @@ Setiap perubahan pada Phase 3 **wajib** mematuhi kontrak berikut tanpa pengecual
 
 ---
 
-## 5. Prosedur setiap patch dan penutupan fase
+## 5. Manifest SHA-256 File Phase 3 (Siap Deploy ke VPS)
+
+```text
+e3dc1137792534b890ead5889be8debb6a637519fd128a4e086ee2a04bf29c59  src/index.js
+01498ec98439525a2d684ab85bafc805ffb8cf57c0add1709f5e635857445de1  src/config/env.js
+84f122cdebcb0d3435e49f7e3ae05f94d085e6fb31aae4bc1cc019f0fd2965d9  src/db/database.js
+5d404f436434f34132d5a0157e54219752673fe49bbf1a47fd65b9ff38538f85  src/p1/documents/service.js
+767c1bdce849c62c30ec5b75d570d40e1eb72d89a6a0e3106bfa87ce64c987b2  src/p1/tools.js
+33e3eb72a780a241642933da46fc8333aaf24d08c160b0dc93c46e46f7296b60  src/channels/waha/client.js
+e09a142f9c95fa06bcc907880e64bde3d978c39f280348f66eb08ab96dd90485  src/agent/message-processor.js
+ade77c3b988afe43f7d4e77243129fbcc8f829aff009af5a2520f5f3181483d2  src/agent/runtime.js
+19e31d7760ffc777073f2750610824aa46f548586fd96bf412ea17fcb110b638  test/unit/phase3-document-intelligence.test.js
+207e847ba7d21d295512bc0bd15b1c1704215f708398b218063906dde37b9161  scripts/phase3-regression.sh
+3fc998e3cb27a9d41985f26145a6c21cbe78e55d8492889a5956dc3b80516910  package.json (unchanged)
+```
+
+---
+
+## 6. Prosedur setiap patch dan penutupan fase
 
 1. **Sebelum deploy.** Pemilik memverifikasi hash file target dan menyimpan backup source serta SQLite (`npm run backup`).
 2. **Kebijakan konfigurasi.** Pertahankan `.env` tetap minimal; seluruh nilai default baru wajib berada di `src/config/env.js`.

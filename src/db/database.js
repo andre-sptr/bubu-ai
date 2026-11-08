@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const Database = require('better-sqlite3');
+const { searchDocumentSnippets } = require('../p1/documents/service');
 
 const MIGRATIONS = [
   {
@@ -309,6 +309,7 @@ const { cosineSimilarity } = require('../p2/vector');
 
 class DatabaseStore {
   constructor(databasePath) {
+    const Database = require('better-sqlite3');
     fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
     this.db = new Database(databasePath);
     this.db.pragma('journal_mode = WAL');
@@ -988,116 +989,49 @@ class DatabaseStore {
   }
 
   searchDocuments({ scope, ownerId = null, chatId = null, query, limit = 5 }) {
-    const terms = String(query || '').toLowerCase().split(/\W+/).filter((x) => x.length > 2);
+    const rawQuery = String(query || '').trim();
+    const terms = rawQuery.toLowerCase().split(/[^\p{L}\p{N}_-]+/u).filter((x) => x.length >= 2);
     if (!terms.length) return [];
     const rows = this.db.prepare(`SELECT id,filename,mime_type,extracted_text,created_at FROM documents
       WHERE scope=? AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
-      ORDER BY created_at DESC LIMIT 100`).all(scope,ownerId,chatId);
+      ORDER BY created_at DESC LIMIT 100`).all(scope, ownerId, chatId);
     return rows.map((row) => {
-      const text = `${row.filename} ${row.extracted_text}`.toLowerCase();
-      return { ...row, score: terms.reduce((n,t) => n + (text.includes(t) ? 1 : 0),0) };
+      const filenameLower = String(row.filename || '').toLowerCase();
+      const filenameScore = terms.reduce((n, t) => n + (filenameLower.includes(t) ? 3 : 0), 0);
+      const snippetResult = searchDocumentSnippets(row.extracted_text, rawQuery, {
+        maxSnippets: 3,
+        snippetChars: 550,
+      });
+      const snippetScore = snippetResult.snippets.reduce((n, s) => n + s.score, 0);
+      const totalScore = filenameScore + snippetScore;
+      return {
+        ...row,
+        score: totalScore,
+        snippets: snippetResult.snippets,
+        matchedPages: snippetResult.snippets.map((s) => s.pageNumber),
+        totalPages: snippetResult.totalPages,
+        excerpt: snippetResult.excerpt || (filenameScore > 0 ? String(row.extracted_text || '').slice(0, 1800) : ''),
+      };
     }).filter((row) => row.score > 0)
-      .sort((a,b) => b.score-a.score || b.created_at.localeCompare(a.created_at))
-      .slice(0,Math.max(1,Math.min(limit,20)))
-      .map(({ extracted_text, ...row }) => ({ ...row, excerpt: extracted_text.slice(0,1800) }));
+      .sort((a, b) => b.score - a.score || b.created_at.localeCompare(a.created_at))
+      .slice(0, Math.max(1, Math.min(limit, 20)))
+      .map(({ extracted_text, ...row }) => row);
   }
 
-  createUserTask(task) {
-    const now = new Date().toISOString();
-    const result = this.db.prepare(`INSERT INTO user_tasks
-      (id,scope,owner_id,chat_id,title,description,status,priority,due_at,created_at,updated_at)
-      VALUES(?,?,?,?,?,?, 'open',?,?,?,?)`).run(
-      task.id,task.scope,task.ownerId || null,task.chatId || null,
-      task.title,task.description || null,task.priority || 'normal',
-      task.dueAt || null,now,now
-    );
-    return this.getUserTask(task.id,task.scope,task.ownerId || null,task.chatId || null);
-  }
-
-  getUserTask(id, scope, ownerId = null, chatId = null) {
-    return this.db.prepare(`SELECT * FROM user_tasks WHERE id=? AND scope=? AND
+  deleteDocument(id, scope, ownerId = null, chatId = null) {
+    const existing = this.getDocumentFile(id, scope, ownerId, chatId);
+    if (!existing) return null;
+    const result = this.db.prepare(`DELETE FROM documents WHERE id=? AND scope=? AND
       ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))`)
-      .get(id,scope,ownerId,chatId) || null;
-  }
-
-  listUserTasks({ scope, ownerId = null, chatId = null, status = null, limit = 20 }) {
-    return this.db.prepare(`SELECT id,title,description,status,priority,due_at,created_at,updated_at
-      FROM user_tasks WHERE scope=? AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
-      AND (? IS NULL OR status=?)
-      ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
-      CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,due_at ASC,created_at DESC LIMIT ?`)
-      .all(scope,ownerId,chatId,status,status,Math.max(1,Math.min(limit,50)));
-  }
-
-  updateUserTask({ id, scope, ownerId = null, chatId = null, fields }) {
-    const allowed = ['title','description','status','priority','due_at'];
-    const keys = Object.keys(fields).filter((key) => allowed.includes(key));
-    if (!keys.length) return this.getUserTask(id,scope,ownerId,chatId);
-    const assignments = keys.map((key) => `${key}=@${key}`).join(',');
-    const result = this.db.prepare(`UPDATE user_tasks SET ${assignments},updated_at=@updated_at
-      WHERE id=@id AND scope=@scope AND
-      ((scope='personal' AND owner_id=@ownerId) OR (scope='group' AND chat_id=@chatId))`)
-      .run({ ...fields,id,scope,ownerId,chatId,updated_at:new Date().toISOString() });
-    return result.changes ? this.getUserTask(id,scope,ownerId,chatId) : null;
-  }
-
-  listReminders({ chatId, requesterId, status = 'pending', limit = 20 }) {
-    return this.db.prepare(`SELECT id,message,due_at,status,delivery_uncertain,created_at
-      FROM reminders WHERE chat_id=? AND requester_id=? AND (? IS NULL OR status=?)
-      ORDER BY due_at LIMIT ?`).all(chatId,requesterId,status,status,Math.max(1,Math.min(limit,50)));
-  }
-
-  saveDocument(doc) {
-    const now = new Date().toISOString();
-    if (doc.sourceEventId) {
-      const existing = this.db.prepare(`SELECT id,scope,filename,mime_type,file_size,extracted_text,created_at
-        FROM documents WHERE source_event_id=? AND scope=? AND
-        ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))`)
-        .get(doc.sourceEventId,doc.scope,doc.ownerId || null,doc.chatId || null);
-      if (existing) return existing;
-    }
-    this.db.prepare(`INSERT OR IGNORE INTO documents
-      (id,scope,owner_id,chat_id,filename,mime_type,file_path,file_size,extracted_text,source_event_id,created_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
-      doc.id,doc.scope,doc.ownerId || null,doc.chatId || null,doc.filename,
-      doc.mimeType,doc.filePath,doc.fileSize,doc.extractedText,doc.sourceEventId || null,now
-    );
-    return this.getDocument(doc.id,doc.scope,doc.ownerId || null,doc.chatId || null);
-  }
-
-  getDocument(id, scope, ownerId = null, chatId = null) {
-    return this.db.prepare(`SELECT id,scope,filename,mime_type,file_size,extracted_text,created_at
-      FROM documents WHERE id=? AND scope=? AND
-      ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))`)
-      .get(id,scope,ownerId,chatId) || null;
-  }
-
-  listDocuments({ scope, ownerId = null, chatId = null, limit = 10 }) {
-    return this.db.prepare(`SELECT id,filename,mime_type,file_size,created_at FROM documents
-      WHERE scope=? AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
-      ORDER BY created_at DESC LIMIT ?`).all(scope,ownerId,chatId,Math.max(1,Math.min(limit,50)));
-  }
-
-  searchDocuments({ scope, ownerId = null, chatId = null, query, limit = 5 }) {
-    const terms = String(query || '').toLowerCase().split(/\W+/).filter((x) => x.length > 2);
-    if (!terms.length) return [];
-    const rows = this.db.prepare(`SELECT id,filename,mime_type,extracted_text,created_at FROM documents
-      WHERE scope=? AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
-      ORDER BY created_at DESC LIMIT 100`).all(scope,ownerId,chatId);
-    return rows.map((row) => {
-      const text = `${row.filename} ${row.extracted_text}`.toLowerCase();
-      return { ...row, score: terms.reduce((n,t) => n + (text.includes(t) ? 1 : 0),0) };
-    }).filter((row) => row.score > 0)
-      .sort((a,b) => b.score-a.score || b.created_at.localeCompare(a.created_at))
-      .slice(0,Math.max(1,Math.min(limit,20)))
-      .map(({ extracted_text, ...row }) => ({ ...row, excerpt: extracted_text.slice(0,1800) }));
+      .run(id, scope, ownerId, chatId);
+    return result.changes ? existing : null;
   }
 
   createUserTask(task) {
     const now = new Date().toISOString();
     this.db.prepare(`INSERT INTO user_tasks
       (id,scope,owner_id,chat_id,title,description,status,priority,due_at,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,'open',?,?,?,?)`).run(
+      VALUES(?,?,?,?,?,?, 'open',?,?,?,?)`).run(
       task.id,task.scope,task.ownerId || null,task.chatId || null,
       task.title,task.description || null,task.priority || 'normal',
       task.dueAt || null,now,now

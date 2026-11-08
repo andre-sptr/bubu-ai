@@ -229,7 +229,9 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
   const content = entry?.[1] || {};
   const quotedText = typeof content.text === 'string' ? content.text :
     typeof content.caption === 'string' ? content.caption :
-    typeof content.title === 'string' ? content.title : '';
+    typeof content.title === 'string' ? content.title :
+    typeof content.fileName === 'string' ? content.fileName :
+    typeof content.filename === 'string' ? content.filename : '';
 
   return {
     present: true,

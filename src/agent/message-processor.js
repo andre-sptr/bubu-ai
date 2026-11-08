@@ -165,8 +165,11 @@ class MessageProcessor {
           });
           attachmentEvidence = {
             kind: 'document',
+            ...(doc.id ? { documentId: doc.id } : {}),
             filename: doc.filename,
             mimeType: doc.mime_type,
+            ...(doc.pageCount ? { pageCount: doc.pageCount } : {}),
+            ...(doc.extractionMode ? { extractionMode: doc.extractionMode } : {}),
             extractedText: String(doc.extractedText || '').slice(0, this.config.documents.maxExtractChars)
           };
           if (!text) text = 'Tolong baca dan jelaskan dokumen yang saya kirim.';
@@ -236,6 +239,39 @@ class MessageProcessor {
           error: error.message
         }, 'P3 media processing failed');
         throw error;
+      }
+    }
+
+    if (quoteContext?.present && !quoteContext?.rejected && typeof this.db?.listDocuments === 'function') {
+      try {
+        const workspaceDocs = this.db.listDocuments({
+          scope,
+          ownerId: scope === 'personal' ? senderId : null,
+          chatId: scope === 'group' ? msg.chatId : null,
+          limit: 20
+        }) || [];
+        if (workspaceDocs.length > 0) {
+          const quotedTextLower = String(quoteContext.text || '').toLowerCase();
+          const quotedMimeLower = String(quoteContext.mimeType || '').toLowerCase();
+          const quotedTypeLower = String(quoteContext.type || '').toLowerCase();
+          let matchedDoc = workspaceDocs.find((d) =>
+            d.filename && quotedTextLower && quotedTextLower.includes(String(d.filename).toLowerCase())
+          );
+          if (!matchedDoc && (quotedTypeLower === 'document' || quotedMimeLower.includes('pdf') || quotedMimeLower.includes('word') || quotedMimeLower.includes('sheet') || quotedMimeLower.includes('excel') || quotedMimeLower.includes('csv'))) {
+            matchedDoc = workspaceDocs.find((d) =>
+              quotedMimeLower && String(d.mime_type || '').toLowerCase() === quotedMimeLower
+            ) || workspaceDocs[0];
+          }
+          if (matchedDoc) {
+            quoteContext.referencedDocument = {
+              documentId: matchedDoc.id,
+              filename: matchedDoc.filename,
+              mimeType: matchedDoc.mime_type || null
+            };
+          }
+        }
+      } catch (err) {
+        this.logger?.warn?.({ chatId: msg.chatId, error: err.message }, 'Unable to resolve quoted workspace document');
       }
     }
 

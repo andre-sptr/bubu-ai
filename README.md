@@ -10,8 +10,8 @@ Rebuild bersih (tanpa kode atau data Bubu v1) untuk asisten AI WhatsApp hybrid (
 |---|---|---|---|
 | **P0–P3 (Fondasi)** | Core Agent, Advanced Tools, Memory, Multimodal Baseline | **Selesai** | `docs/P0-CORE-AGENT.md` s/d `docs/P3-WHATSAPP-MULTIMODAL.md` |
 | **Phase 1** | Core Reliability & Response Control (Task 1.1–1.9) | **Selesai & Disetujui** | `docs/PHASE-1-FULL-REGRESSION-PLAN.md` |
-| **Phase 2** | Full Multimodal WhatsApp (Task 2.1–2.8) | **Kode & Unit Test Selesai (`203/203`)** · Menunggu Acceptance VPS | `docs/PHASE-2-ROADMAP.md`, `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md` |
-| **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Direncanakan (Siap Mulai)** | `docs/PHASE-3-ROADMAP.md` |
+| **Phase 2** | Full Multimodal WhatsApp (Task 2.1–2.8) | **Kode & Unit Test Selesai** · Menunggu Acceptance VPS | `docs/PHASE-2-ROADMAP.md`, `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md` |
+| **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Kode & Unit Test Selesai (`217/217`)** · Menunggu Acceptance VPS | `docs/PHASE-3-ROADMAP.md` |
 | **Phase 4** | Native WhatsApp Outbound Features | Berikutnya | — |
 | **Phase 5** | Advanced Agent & Memory Lifecycle | Berikutnya | — |
 | **Phase 6** | Queue Redesign & End-to-End Hardening | Berikutnya | — |
@@ -95,8 +95,12 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
   - Perintah `/voice on` (voice-only, fail-closed tanpa fallback teks jika TTS gagal), `/voice both` (teks + voice note), `/voice off` (teks saja), `/voice status`, dan `/voice reset` tersimpan per chat di SQLite.
 - **Konteks Caption & Reply/Quote (`Task 2.4`):** Memisahkan `bodyText`, `captionContext`, `voiceInstruction`, `attachmentEvidence`, dan `quoteContext`. Kutipan lintas chat (`remoteJid` berbeda) ditolak otomatis (`quote.rejected = true`), dan giliran media/quote melewati auto-memory capture.
 
-### C. Dokumen, Web, Memori, & Produktivitas (P1 & P2)
-- **Ingesti & Pembuatan Dokumen:** Membaca PDF, DOCX, XLSX, XLSM, CSV, dan TXT; membuat 16 tipe dokumen DOCX (`create_document`) dan 8 tipe workbook XLSX multi-sheet berformula aman (`create_spreadsheet`). Di grup, file otomatis dikirim ke `ctx.chatId` grup asal setelah verifikasi workspace.
+### C. Deep Document Intelligence, Web, Memori, & Produktivitas (P1, P2, & Phase 3)
+- **Ingesti PDF Digital, Scan, & Hybrid (`Task 3.2`):** Mengekstrak teks PDF per halaman (`--- [HALAMAN N — TEKS ASLI] ---`) dan otomatis menjalankan fallback render + Tesseract OCR (`ind+eng`) untuk halaman scan/minim teks (`--- [HALAMAN N — OCR SCAN] ---`), dilengkapi guard konkurensi tunggal `ocrBusy` dan pembersihan file sementara otomatis.
+- **Ekstraksi Terstruktur, Navigasi Halaman, & Snippet Search (`Task 3.3`):** Mengekstrak struktur heading (`# / ## / ###`), bullet list, dan tabel pipa dari `word/document.xml` pada file DOCX; mendukung pembacaan per halaman/rentang (`read_document` dengan `page`, `startPage`, `endPage`) serta pencarian cuplikan kontekstual di sekitar kata kunci (`search_document` dengan label halaman).
+- **Analitik Spreadsheet & CSV Deterministik (`Task 3.4`):** Auto-deteksi delimiter CSV (`,`, `;`, `\t`), dukungan sel multi-baris ber-quote, normalisasi angka Indonesia (`Rp 1.250.000,50`) & internasional, serta perhitungan statistik deterministik (`count`, `sum`, `avg`, `min`, `max`), filter baris, dan agregasi `groupByColumn` pada `analyze_spreadsheet`.
+- **Resolusi Reply Dokumen, Perbandingan, & Siklus Hidup (`Task 3.5` & `3.7`):** Menghubungkan reply/quote pesan dokumen di chat yang sama ke `documentId` workspace secara otomatis, membandingkan dua dokumen dalam satu workspace (`compare_documents`), dan menghapus dokumen beserta file fisiknya (`delete_document`).
+- **Pembuatan DOCX Kaya, XLSX Multi-Sheet, & PDF Native (`Task 3.6`):** Merender inline Markdown (`**bold**`, `*italic*`, `` `code` ``) pada DOCX, membuat workbook XLSX berformula aman (`create_spreadsheet`), serta membuat dokumen PDF multi-halaman siap cetak (`create_pdf` / `create_document(format='pdf')`). Di grup, file otomatis dikirim ke `ctx.chatId` grup asal setelah verifikasi workspace; di DM pribadi wajib melalui persetujuan pemilik (`/approve <id>`).
 - **Riset Web Aman:** `web_search` (opsional dengan `TAVILY_API_KEY`) dan `web_fetch` (memblokir IP privat/localhost dan kredensial URL).
 - **Memori Hibrida & Proyek:** Pencarian gabungan kemiripan kosinus + leksikal + signifikansi + kebaruan, ekstraksi memori konservatif berbasis sinyal eksplisit, serta manajemen task (`create_task`, `list_tasks`, `update_task`, `complete_task`) dan pengingat (`create_reminder`, `list_reminders`, `cancel_reminder`).
 
@@ -123,13 +127,14 @@ bubu/
 │   ├── list-models.js          # Cek katalog model Sumopod
 │   ├── phase1-regression.sh    # Gate regresi otomatis Phase 1
 │   ├── phase2-regression.sh    # Gate regresi otomatis Phase 2
+│   ├── phase3-regression.sh    # Gate regresi otomatis Phase 3
 │   └── smoke-tool-calling.js   # Uji smoke tool calling
 ├── src/
 │   ├── agent/                  # Runtime, MessageProcessor, ModelRouter, Approval, RateLimiter
 │   ├── channels/               # ResponseHandler, WhatsApp Formatter, WAHA Client & Normalizer
 │   ├── config/                 # Konfigurasi & default produksi (env.js)
 │   ├── db/                     # SQLite DatabaseStore & migrasi v1–v9 (database.js)
-│   ├── p1/                     # DocumentService (PDF/DOCX/XLSX/CSV/TXT), Web Search/Fetch, P1 Tools
+│   ├── p1/                     # DocumentService (PDF OCR/DOCX/XLSX/CSV/TXT/PDF Gen), Web Search/Fetch, P1 Tools
 │   ├── p2/                     # MemoryService, Vector cosine similarity, P2 Tools
 │   ├── p3/                     # MediaIntelligenceService (Vision, Video frames, STT+VAD, Piper TTS)
 │   ├── providers/              # SumopodProvider (OpenAI-compatible + image_url sanitizer)
@@ -140,7 +145,7 @@ bubu/
 ├── storage/                    # Penyimpanan privat dokumen & media sementara
 └── test/
     ├── integration/            # Tes integrasi SQLite & migrasi (database.test.js)
-    └── unit/                   # 29 file unit test kontrak Phase 1 & Phase 2
+    └── unit/                   # 30 file unit test kontrak Phase 1, Phase 2, & Phase 3
 ```
 
 ---
@@ -157,9 +162,10 @@ npm run backup
 # 2. Jalankan seluruh unit & integration test
 npm test
 
-# 3. Jalankan gate regresi Phase 1 & Phase 2 di VPS
+# 3. Jalankan gate regresi Phase 1, Phase 2, & Phase 3 di VPS
 npm run test:phase1
 bash scripts/phase2-regression.sh
+bash scripts/phase3-regression.sh
 
 # 4. Restart layanan melalui PM2 & cek kesehatan
 pm2 restart bubu

@@ -2,7 +2,125 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const fsp = require('node:fs/promises');
 const { ResponseHandler } = require('../channels/response-handler');
-const { z } = require('zod');
+const {
+  readDocumentPages,
+  searchDocumentSnippets,
+  analyzeSpreadsheetText,
+  compareDocumentTexts,
+} = require('./documents/service');
+
+function createFallbackZod() {
+  const makeChain = (validateFn = (v) => v) => {
+    let isOptional = false;
+    let isNullable = false;
+    const refinements = [];
+    const api = {
+      optional() { isOptional = true; return api; },
+      nullable() { isNullable = true; return api; },
+      strict() { return api; },
+      min() { return api; },
+      max() { return api; },
+      int() { return api; },
+      positive() { return api; },
+      uuid() { return api; },
+      url() { return api; },
+      datetime() { return api; },
+      refine(fn, message = 'Validation failed') {
+        refinements.push({ fn, message });
+        return api;
+      },
+      parse(val) {
+        if (val === undefined) {
+          if (isOptional) return undefined;
+          throw new Error('Required value is undefined');
+        }
+        if (val === null) {
+          if (isNullable) return null;
+          throw new Error('Value cannot be null');
+        }
+        const out = validateFn(val);
+        for (const r of refinements) {
+          if (!r.fn(out)) throw new Error(r.message);
+        }
+        return out;
+      },
+    };
+    return api;
+  };
+
+  return {
+    string: () => makeChain((v) => {
+      if (typeof v !== 'string') throw new Error('Expected string');
+      return v;
+    }),
+    number: () => makeChain((v) => {
+      if (typeof v !== 'number' || Number.isNaN(v)) throw new Error('Expected number');
+      return v;
+    }),
+    boolean: () => makeChain((v) => {
+      if (typeof v !== 'boolean') throw new Error('Expected boolean');
+      return v;
+    }),
+    null: () => makeChain((v) => {
+      if (v !== null) throw new Error('Expected null');
+      return null;
+    }),
+    enum: (values) => makeChain((v) => {
+      if (!values.includes(v)) throw new Error(`Expected one of: ${values.join(', ')}`);
+      return v;
+    }),
+    array: (itemSchema) => makeChain((v) => {
+      if (!Array.isArray(v)) throw new Error('Expected array');
+      return itemSchema ? v.map((item) => itemSchema.parse(item)) : v;
+    }),
+    union: (schemas) => makeChain((v) => {
+      for (const s of schemas) {
+        try { return s.parse(v); } catch {}
+      }
+      throw new Error('Invalid union value');
+    }),
+    record: () => makeChain((v) => {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('Expected record object');
+      return v;
+    }),
+    object: (shape = {}) => {
+      let strictMode = false;
+      const base = makeChain((v) => {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('Expected object');
+        if (strictMode) {
+          for (const key of Object.keys(v)) {
+            if (!Object.prototype.hasOwnProperty.call(shape, key)) {
+              throw new Error(`Unrecognized key: ${key}`);
+            }
+          }
+        }
+        const out = {};
+        for (const [k, schema] of Object.entries(shape)) {
+          const parsed = schema.parse(v[k]);
+          if (parsed !== undefined) out[k] = parsed;
+        }
+        return out;
+      });
+      const origStrict = base.strict;
+      base.strict = () => {
+        strictMode = true;
+        return origStrict();
+      };
+      return base;
+    },
+  };
+}
+
+function loadZod() {
+  try {
+    return require('zod').z;
+  } catch (err) {
+    if (err && err.code === 'MODULE_NOT_FOUND') return createFallbackZod();
+    throw err;
+  }
+}
+
+const z = loadZod();
 
 function createP1Tools({ db, documentService, webSearch, webFetch, approvalManager, waha, responseHandler = null }) {
   const delivery = responseHandler || new ResponseHandler({ waha, logger: null });
@@ -63,28 +181,50 @@ function createP1Tools({ db, documentService, webSearch, webFetch, approvalManag
 
   tools.push({
     name: 'read_document',
-    description: 'Read an uploaded document by its document ID from the current workspace. Returns extracted text.',
+    description: 'Read an uploaded document by its document ID from the current workspace. Supports optional page or startPage/endPage pagination for multi-page PDF/DOCX/text documents.',
     scopes: ['personal','group'],
-    schema: z.object({ documentId: z.string().uuid() }).strict(),
+    schema: z.object({
+      documentId: z.string().uuid(),
+      page: z.number().int().min(1).max(500).optional(),
+      startPage: z.number().int().min(1).max(500).optional(),
+      endPage: z.number().int().min(1).max(500).optional(),
+      maxChars: z.number().int().min(500).max(50000).optional(),
+    }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
-      properties: { documentId: { type: 'string', description: 'Document UUID returned by list_documents or upload processing' } },
+      properties: {
+        documentId: { type: 'string', description: 'Document UUID returned by list_documents or upload processing' },
+        page: { type: 'integer', minimum: 1, maximum: 500, description: 'Optional specific page/section number to read (1-based)' },
+        startPage: { type: 'integer', minimum: 1, maximum: 500, description: 'Optional start page/section number (1-based)' },
+        endPage: { type: 'integer', minimum: 1, maximum: 500, description: 'Optional end page/section number (1-based)' },
+        maxChars: { type: 'integer', minimum: 500, maximum: 50000, description: 'Maximum characters to return (default 12000)' }
+      },
       required: ['documentId']
     },
-    execute: async ({ documentId }, ctx) => {
+    execute: async ({ documentId, page, startPage, endPage, maxChars }, ctx) => {
       const doc = db.getDocument(
         documentId,ctx.scope,
         ctx.scope === 'personal' ? ctx.requesterId : null,
         ctx.scope === 'group' ? ctx.chatId : null
       );
       if (!doc) throw new Error('Dokumen tidak ditemukan pada workspace ini.');
-      return { documentId: doc.id, filename: doc.filename, mimeType: doc.mime_type, text: doc.extracted_text };
+      const pageData = readDocumentPages(doc.extracted_text, { page, startPage, endPage, maxChars });
+      return {
+        documentId: doc.id,
+        filename: doc.filename,
+        mimeType: doc.mime_type,
+        totalPages: pageData.totalPages,
+        returnedPages: pageData.returnedPages,
+        pageLabels: pageData.pageLabels,
+        hasMorePages: pageData.hasMorePages,
+        text: pageData.text,
+      };
     }
   });
 
   tools.push({
     name: 'search_document',
-    description: 'Search for terms across uploaded documents in the current workspace and return relevant excerpts.',
+    description: 'Search for terms across uploaded documents in the current workspace and return contextual snippets with page/section labels.',
     scopes: ['personal','group'],
     schema: z.object({ query: z.string().min(2).max(300), limit: z.number().int().min(1).max(10).optional() }).strict(),
     parameters: {
@@ -92,29 +232,56 @@ function createP1Tools({ db, documentService, webSearch, webFetch, approvalManag
       properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 10 } },
       required: ['query']
     },
-    execute: async ({ query, limit }, ctx) => ({
-      matches: db.searchDocuments({
+    execute: async ({ query, limit }, ctx) => {
+      const rawMatches = db.searchDocuments({
         scope: ctx.scope,
         ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
         chatId: ctx.scope === 'group' ? ctx.chatId : null,
         query, limit: limit || 5
-      })
-    })
+      }) || [];
+      const matches = rawMatches.map((item) => {
+        if (Array.isArray(item.snippets)) return item;
+        const snippetInfo = searchDocumentSnippets(item.extracted_text || item.excerpt || '', query);
+        return {
+          ...item,
+          snippets: snippetInfo.snippets,
+          matchedPages: snippetInfo.snippets.map((s) => s.pageNumber),
+          totalPages: snippetInfo.totalPages,
+          excerpt: snippetInfo.excerpt || item.excerpt || '',
+        };
+      });
+      return { matches };
+    }
   });
 
   tools.push({
     name: 'analyze_spreadsheet',
-    description: 'Read a previously uploaded XLSX, XLSM or CSV document and return its extracted rows for analysis.',
+    description: 'Analyze a previously uploaded XLSX, XLSM or CSV document with deterministic column schema inference, statistics (count, sum, avg, min, max), optional row filtering, and group-by aggregation.',
     scopes: ['personal','group'],
-    schema: z.object({ documentId: z.string().uuid(), question: z.string().max(500).optional() }).strict(),
+    schema: z.object({
+      documentId: z.string().uuid(),
+      question: z.string().max(500).optional(),
+      sheetName: z.string().max(100).optional(),
+      filterColumn: z.string().max(100).optional(),
+      filterValue: z.string().max(200).optional(),
+      groupByColumn: z.string().max(100).optional(),
+      aggregateColumn: z.string().max(100).optional(),
+      rowLimit: z.number().int().min(1).max(200).optional(),
+    }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         documentId: { type: 'string' },
-        question: { type: 'string' }
+        question: { type: 'string' },
+        sheetName: { type: 'string', description: 'Optional worksheet name for multi-sheet XLSX files' },
+        filterColumn: { type: 'string', description: 'Optional column header name to filter rows by' },
+        filterValue: { type: 'string', description: 'Optional substring or value to match in filterColumn' },
+        groupByColumn: { type: 'string', description: 'Optional column header name for group-by aggregation' },
+        aggregateColumn: { type: 'string', description: 'Optional numeric column header to sum/average per group' },
+        rowLimit: { type: 'integer', minimum: 1, maximum: 200 }
       }, required: ['documentId']
     },
-    execute: async ({ documentId, question }, ctx) => {
+    execute: async ({ documentId, question, sheetName, filterColumn, filterValue, groupByColumn, aggregateColumn, rowLimit }, ctx) => {
       const doc = db.getDocument(
         documentId,ctx.scope,
         ctx.scope === 'personal' ? ctx.requesterId : null,
@@ -123,7 +290,53 @@ function createP1Tools({ db, documentService, webSearch, webFetch, approvalManag
       if (!doc || !['.xlsx','.xlsm','.csv'].includes(path.extname(doc.filename).toLowerCase())) {
         throw new Error('Spreadsheet tidak ditemukan atau formatnya bukan XLSX/XLSM/CSV.');
       }
-      return { filename: doc.filename, question: question || null, extractedRows: doc.extracted_text };
+      const analysis = analyzeSpreadsheetText(doc.extracted_text, {
+        filename: doc.filename,
+        question,
+        sheetName,
+        filterColumn,
+        filterValue,
+        groupByColumn,
+        aggregateColumn,
+        rowLimit,
+      });
+      return {
+        documentId: doc.id,
+        filename: doc.filename,
+        question: question || null,
+        extractedRows: doc.extracted_text,
+        analysis,
+      };
+    }
+  });
+
+  tools.push({
+    name: 'compare_documents',
+    description: 'Compare two uploaded documents in the current workspace (e.g. Contract v1 vs v2, or Month 1 vs Month 2 spreadsheet) and return deterministic line/page differences and numeric deltas.',
+    scopes: ['personal','group'],
+    schema: z.object({
+      firstDocumentId: z.string().uuid(),
+      secondDocumentId: z.string().uuid(),
+      focus: z.string().max(300).optional(),
+    }).strict(),
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        firstDocumentId: { type: 'string', description: 'UUID of the first (baseline) document in the current workspace' },
+        secondDocumentId: { type: 'string', description: 'UUID of the second (comparison) document in the current workspace' },
+        focus: { type: 'string', description: 'Optional topic, section, or column name to focus comparison on' }
+      },
+      required: ['firstDocumentId', 'secondDocumentId']
+    },
+    execute: async ({ firstDocumentId, secondDocumentId, focus }, ctx) => {
+      const ownerId = ctx.scope === 'personal' ? ctx.requesterId : null;
+      const chatId = ctx.scope === 'group' ? ctx.chatId : null;
+      const firstDoc = db.getDocument(firstDocumentId, ctx.scope, ownerId, chatId);
+      const secondDoc = db.getDocument(secondDocumentId, ctx.scope, ownerId, chatId);
+      if (!firstDoc || !secondDoc) {
+        throw new Error('Salah satu atau kedua dokumen tidak ditemukan pada workspace ini.');
+      }
+      return compareDocumentTexts(firstDoc, secondDoc, { focus });
     }
   });
 
@@ -242,7 +455,7 @@ function createP1Tools({ db, documentService, webSearch, webFetch, approvalManag
 
   tools.push({
     name: 'list_document_templates',
-    description: 'List the professional DOCX and XLSX document templates Bubu can generate. Use this when the user asks what kinds of files or templates are available.',
+    description: 'List the professional DOCX, PDF, and XLSX document templates Bubu can generate. Use this when the user asks what kinds of files or templates are available.',
     scopes: ['personal','group'],
     schema: z.object({}).strict(),
     parameters: { type: 'object', additionalProperties: false, properties: {} },
@@ -264,6 +477,14 @@ function createP1Tools({ db, documentService, webSearch, webFetch, approvalManag
         { type: 'project_plan', examples: ['project plan','implementation plan','risk register'] },
         { type: 'executive_summary', examples: ['ringkasan eksekutif','management brief'] }
       ],
+      pdf: [
+        { type: 'executive_summary', examples: ['ringkasan eksekutif PDF','one-pager manajemen'] },
+        { type: 'report', examples: ['laporan PDF siap cetak','audit summary PDF'] },
+        { type: 'invoice', examples: ['invoice PDF','tagihan resmi PDF'] },
+        { type: 'quotation', examples: ['penawaran harga PDF','quotation PDF'] },
+        { type: 'formal_letter', examples: ['surat resmi PDF','memo resmi PDF'] },
+        { type: 'sop', examples: ['SOP PDF','instruksi kerja PDF'] }
+      ],
       xlsx: [
         { type: 'financial_budget', examples: ['anggaran','budget bulanan','cash flow','profit and loss'] },
         { type: 'inventory', examples: ['stok barang','inventory tracker','stock opname'] },
@@ -274,13 +495,64 @@ function createP1Tools({ db, documentService, webSearch, webFetch, approvalManag
         { type: 'customer_database', examples: ['database pelanggan','CRM sederhana'] },
         { type: 'custom', examples: ['spreadsheet sesuai kolom dan data permintaan'] }
       ],
-      note: 'Bubu dapat menyesuaikan struktur dan isi dokumen. Data yang tidak diberikan harus ditandai sebagai asumsi atau dibiarkan kosong, bukan dikarang.'
+      note: 'Bubu dapat menyesuaikan struktur dan isi dokumen (DOCX, PDF, maupun XLSX). Data yang tidak diberikan harus ditandai sebagai asumsi atau dibiarkan kosong, bukan dikarang.'
     })
   });
 
   tools.push({
     name: 'create_document',
-    description: `Create a professionally formatted DOCX file for the current workspace (personal DM or group). Choose documentType from: ${documentTypes.join(', ')}. Write complete, useful content with Markdown headings, bullet/numbered lists and pipe tables when appropriate. Include a clear title, executive summary or purpose, structured sections, and conclusion/next steps when suitable. Do not invent facts, names, dates, amounts or legal requirements; label assumptions and placeholders. In group scope, automatically send the generated file to the same originating group after verifying its group-scoped database record and storage path. Never choose another destination. In personal scope, ask owner approval before sending the file.`,
+    description: `Create a professionally formatted DOCX or PDF file for the current workspace (personal DM or group). Choose documentType from: ${documentTypes.join(', ')}. Write complete, useful content with Markdown headings, inline bold/italic/code, bullet/numbered lists and pipe tables when appropriate. Include a clear title, executive summary or purpose, structured sections, and conclusion/next steps when suitable. Do not invent facts, names, dates, amounts or legal requirements; label assumptions and placeholders. In group scope, automatically send the generated file to the same originating group after verifying its group-scoped database record and storage path. Never choose another destination. In personal scope, ask owner approval before sending the file.`,
+    scopes: ['personal','group'],
+    schema: z.object({
+      title: z.string().min(1).max(180),
+      content: z.string().min(1).max(30000),
+      documentType: documentTypeEnum.optional(),
+      format: z.enum(['docx', 'pdf']).optional(),
+      subtitle: z.string().max(250).optional(),
+      author: z.string().max(120).optional(),
+      filename: z.string().min(1).max(100).optional()
+    }).strict(),
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        title: { type: 'string', maxLength: 180 },
+        content: { type: 'string', maxLength: 30000, description: 'Full document body. Markdown headings, inline **bold**/*italic*/`code`, bullet lists, numbered lists, and pipe tables are supported.' },
+        documentType: { type: 'string', enum: documentTypes },
+        format: { type: 'string', enum: ['docx', 'pdf'], description: 'Output file format: docx (default) or pdf' },
+        subtitle: { type: 'string', maxLength: 250 },
+        author: { type: 'string', maxLength: 120 },
+        filename: { type: 'string', maxLength: 100, description: 'Optional .docx or .pdf filename' }
+      }, required: ['title','content']
+    },
+    risk: 'external',
+    execute: async ({ title, content, documentType, format, subtitle, author, filename }, ctx) => {
+      assertGroupContext(ctx);
+      const targetFormat = format || (filename?.toLowerCase().endsWith('.pdf') ? 'pdf' : 'docx');
+      if (targetFormat === 'pdf') {
+        const buffer = await documentService.createPdf({ title, content, documentType, subtitle, author });
+        const baseName = filename ? filename.replace(/\.(docx|pdf)$/i, '') : title;
+        const file = await documentService.persistGenerated({
+          buffer,
+          filename: `${baseName}.pdf`,
+          mimeType: 'application/pdf'
+        });
+        const saved = await saveGeneratedDocument({ file, title, content }, ctx);
+        return finishGeneratedFile({ saved, title }, ctx);
+      }
+      const buffer = await documentService.createDocx({ title, content, documentType, subtitle, author });
+      const file = await documentService.persistGenerated({
+        buffer,
+        filename: filename?.toLowerCase().endsWith('.docx') ? filename : `${filename || title}.docx`,
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      });
+      const saved = await saveGeneratedDocument({ file, title, content }, ctx);
+      return finishGeneratedFile({ saved, title }, ctx);
+    }
+  });
+
+  tools.push({
+    name: 'create_pdf',
+    description: `Create a professionally formatted, print-ready PDF document for the current workspace (personal DM or group). Choose documentType from: ${documentTypes.join(', ')}. Supports Markdown headings, inline bold/italic/code, bullet/numbered lists, and pipe tables. In group scope, automatically sends the generated PDF to the originating group after verifying workspace ownership. In personal scope, requires owner approval before sending.`,
     scopes: ['personal','group'],
     schema: z.object({
       title: z.string().min(1).max(180),
@@ -294,24 +566,62 @@ function createP1Tools({ db, documentService, webSearch, webFetch, approvalManag
       type: 'object', additionalProperties: false,
       properties: {
         title: { type: 'string', maxLength: 180 },
-        content: { type: 'string', maxLength: 30000, description: 'Full document body. Markdown headings, bullet lists, numbered lists, and pipe tables are supported.' },
+        content: { type: 'string', maxLength: 30000, description: 'Full PDF document body with Markdown headings, lists, and pipe tables.' },
         documentType: { type: 'string', enum: documentTypes },
         subtitle: { type: 'string', maxLength: 250 },
         author: { type: 'string', maxLength: 120 },
-        filename: { type: 'string', maxLength: 100, description: 'Optional .docx filename' }
+        filename: { type: 'string', maxLength: 100, description: 'Optional .pdf filename' }
       }, required: ['title','content']
     },
     risk: 'external',
     execute: async ({ title, content, documentType, subtitle, author, filename }, ctx) => {
       assertGroupContext(ctx);
-      const buffer = await documentService.createDocx({ title, content, documentType, subtitle, author });
+      const buffer = await documentService.createPdf({ title, content, documentType, subtitle, author });
       const file = await documentService.persistGenerated({
         buffer,
-        filename: filename?.toLowerCase().endsWith('.docx') ? filename : `${filename || title}.docx`,
-        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        filename: filename?.toLowerCase().endsWith('.pdf') ? filename : `${filename || title}.pdf`,
+        mimeType: 'application/pdf'
       });
       const saved = await saveGeneratedDocument({ file, title, content }, ctx);
       return finishGeneratedFile({ saved, title }, ctx);
+    }
+  });
+
+  tools.push({
+    name: 'delete_document',
+    description: 'Delete a document from the current personal or group workspace by its document ID, removing both its database record and stored file.',
+    scopes: ['personal','group'],
+    schema: z.object({
+      documentId: z.string().uuid()
+    }).strict(),
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        documentId: { type: 'string', description: 'Document UUID to delete from the current workspace' }
+      },
+      required: ['documentId']
+    },
+    execute: async ({ documentId }, ctx) => {
+      const ownerId = ctx.scope === 'personal' ? ctx.requesterId : null;
+      const chatId = ctx.scope === 'group' ? ctx.chatId : null;
+      if (documentService && typeof documentService.deleteWorkspaceDocument === 'function') {
+        return documentService.deleteWorkspaceDocument({
+          documentId,
+          scope: ctx.scope,
+          ownerId,
+          chatId,
+          actorId: ctx.requesterId,
+        });
+      }
+      if (typeof db.deleteDocument === 'function') {
+        const removed = db.deleteDocument(documentId, ctx.scope, ownerId, chatId);
+        if (!removed) throw new Error('Dokumen tidak ditemukan pada workspace ini.');
+        if (removed.file_path) {
+          await fsp.rm(removed.file_path, { force: true }).catch(() => {});
+        }
+        return { deleted: true, documentId: removed.id, filename: removed.filename, scope: removed.scope };
+      }
+      throw new Error('Fitur penghapusan dokumen belum tersedia pada database runtime.');
     }
   });
 

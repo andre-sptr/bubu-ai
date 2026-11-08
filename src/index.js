@@ -36,7 +36,15 @@ async function main() {
   const documentService = new DocumentService({
     db, wahaConfig: config.waha, storageDir: config.storageDir,
     maxFileBytes: config.documents.maxFileBytes,
-    maxExtractChars: config.documents.maxExtractChars
+    maxExtractChars: config.documents.maxExtractChars,
+    ocrEnabled: config.documents.ocrEnabled,
+    maxPdfOcrPages: config.documents.maxPdfOcrPages,
+    pdfRenderDpi: config.documents.pdfRenderDpi,
+    pdftoppmBin: config.documents.pdftoppmBin,
+    ghostscriptBin: config.documents.ghostscriptBin,
+    tesseractBin: config.media.tesseractBin,
+    ffmpegBin: config.media.ffmpegBin,
+    logger
   });
   const mediaService = new MediaIntelligenceService({
     wahaConfig: config.waha,
