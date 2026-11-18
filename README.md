@@ -11,10 +11,10 @@ Rebuild bersih (tanpa kode atau data Bubu v1) untuk asisten AI WhatsApp hybrid (
 | **P0–P3 (Fondasi)** | Core Agent, Advanced Tools, Memory, Multimodal Baseline | **Selesai** | `docs/P0-CORE-AGENT.md` s/d `docs/P3-WHATSAPP-MULTIMODAL.md` |
 | **Phase 1** | Core Reliability & Response Control (Task 1.1–1.9) | **Selesai & Disetujui** | `docs/PHASE-1-FULL-REGRESSION-PLAN.md` |
 | **Phase 2** | Full Multimodal WhatsApp (Task 2.1–2.8) | **Kode & Unit Test Selesai** · Menunggu Acceptance VPS | `docs/PHASE-2-ROADMAP.md`, `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md` |
-| **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Kode & Unit Test Selesai (`217/217`)** · Menunggu Acceptance VPS | `docs/PHASE-3-ROADMAP.md` |
-| **Phase 4** | Native WhatsApp Outbound Features | Berikutnya | — |
-| **Phase 5** | Advanced Agent & Memory Lifecycle | Berikutnya | — |
-| **Phase 6** | Queue Redesign & End-to-End Hardening | Berikutnya | — |
+| **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Kode & Unit Test Selesai (`217/217`)** · Lulus Regresi VPS | `docs/PHASE-3-ROADMAP.md` |
+| **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Direncanakan (Siap Mulai)** | `docs/PHASE-4-ROADMAP.md` |
+| **Phase 5** | Advanced Agent & Memory Lifecycle (Task 5.1–5.8) | **Direncanakan** | `docs/PHASE-5-ROADMAP.md` |
+| **Phase 6** | Queue Redesign & End-to-End Hardening (Task 6.1–6.8) | **Direncanakan** | `docs/PHASE-6-ROADMAP.md` |
 
 ---
 
@@ -119,6 +119,9 @@ bubu/
 │   ├── PHASE-1-FULL-REGRESSION-PLAN.md
 │   ├── PHASE-2-ROADMAP.md
 │   ├── PHASE-3-ROADMAP.md
+│   ├── PHASE-4-ROADMAP.md
+│   ├── PHASE-5-ROADMAP.md
+│   ├── PHASE-6-ROADMAP.md
 │   ├── TASK-1.1-*.md ... TASK-1.8-*.md
 │   ├── TASK-2.1-*.md ... TASK-2.6-2.8-*.md
 │   └── TEST-REPORT.md
