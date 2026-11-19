@@ -5,7 +5,7 @@ const { ResponseHandler } = require('../channels/response-handler');
 const { normalizeIncoming } = require('../channels/waha/normalizer');
 const { normalizeMediaUrl } = require('../utils/media-http');
 const { detectMediaKind } = require('../media/media-validator');
-const { handleSlashCommand } = require('./command-handler');
+const { handleSlashCommand, isRecognizedSlashCommand } = require('./command-handler');
 
 function eventKey(message) {
   const identity = message.eventId
@@ -37,8 +37,8 @@ function hasBotMention(message, botJid = '') {
 }
 
 class MessageProcessor {
-  constructor({ config, db, waha, responseHandler = null, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger }) {
-    Object.assign(this, { config, db, waha, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger });
+  constructor({ config, db, waha, responseHandler = null, sessionMonitor = null, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger }) {
+    Object.assign(this, { config, db, waha, sessionMonitor, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger });
     this.responseHandler = responseHandler || new ResponseHandler({ waha, mediaService, config, logger });
   }
 
@@ -73,32 +73,13 @@ class MessageProcessor {
 
   async process(payload) {
     const msg = normalizeIncoming(payload);
+    msg.chatId = normalizeJid(msg.chatId);
     if (!msg.chatId || (!msg.text && !msg.hasMedia && !msg.quote?.present && !msg.quote?.rejected) || msg.fromMe) return;
     if (msg.chatId.endsWith('@broadcast') || msg.chatId.endsWith('@newsletter')) return;
+    if (msg.eventType && msg.eventType !== 'message') return;
 
     const isGroup = msg.chatId.endsWith('@g.us');
     if (isGroup && this.config.groupPolicy !== 'all') return;
-
-    let senderId = normalizeJid(msg.senderId);
-    if (senderId.endsWith('@lid')) {
-      try { senderId = normalizeJid(await this.waha.resolveLid(senderId)); }
-      catch (error) { this.logger.warn({ senderId, error: error.message }, 'Unable to resolve sender LID'); }
-    }
-    const owner = senderId === this.config.ownerJid;
-    if (!owner) {
-      const rate = this.db.consumeRateLimit(`${msg.chatId}:${senderId}`, {
-        limit: this.config.agent.messageRateLimit,
-        windowMs: this.config.agent.messageRateWindowMs
-      });
-      if (!rate.allowed) {
-        this.logger.warn({ chatId: msg.chatId, senderId, retryAfterMs: rate.retryAfterMs }, 'Message rate limit reached');
-        return;
-      }
-    }
-    const scope = isGroup ? 'group' : (owner ? 'personal' : 'untrusted');
-
-    // The personal assistant is owner-only. In groups, anyone may address Bubu.
-    if (scope === 'untrusted') return;
 
     const bodyText = String(msg.bodyText || '').trim();
     const captionText = String(msg.captionText || '').trim();
@@ -113,7 +94,7 @@ class MessageProcessor {
     const quoteContext = msg.quote?.present || msg.quote?.rejected ? msg.quote : null;
     if (isGroup) {
       const hasMention = hasBotMention(msg, this.config.botJid);
-      const isCommand = text.startsWith('/');
+      const isCommand = isRecognizedSlashCommand(text);
       const mediaOnly = msg.hasMedia && !currentMessageText;
       const mediaMayTriggerWithoutMention = mediaOnly && !this.config.groupMediaRequireMention;
 
@@ -123,16 +104,63 @@ class MessageProcessor {
       }
     }
 
+    let senderId = normalizeJid(msg.senderId);
+    if (senderId.endsWith('@lid') && typeof this.waha?.resolveLid === 'function') {
+      try {
+        senderId = normalizeJid(await this.waha.resolveLid(senderId));
+      } catch (error) {
+        this.logger.warn({ senderId, error: error.message }, 'Unable to resolve sender LID');
+        if (!isGroup) throw error;
+      }
+    }
+    if (!isGroup && msg.chatId.endsWith('@lid')) {
+      if (senderId && !senderId.endsWith('@lid')) {
+        msg.chatId = senderId;
+      } else if (typeof this.waha?.resolveLid === 'function') {
+        const resolvedChat = normalizeJid(await this.waha.resolveLid(msg.chatId));
+        if (resolvedChat) msg.chatId = resolvedChat;
+      }
+    }
+
+    const owner = senderId === this.config.ownerJid;
+    const scope = isGroup ? 'group' : (owner ? 'personal' : 'untrusted');
+
+    // The personal assistant is owner-only. In groups, anyone may address Bubu.
+    if (scope === 'untrusted') return;
+
+    if (!owner) {
+      const rate = this.db.consumeRateLimit(`${msg.chatId}:${senderId}`, {
+        limit: this.config.agent.messageRateLimit,
+        windowMs: this.config.agent.messageRateWindowMs
+      });
+      if (!rate.allowed) {
+        this.logger.warn({ chatId: msg.chatId, senderId, retryAfterMs: rate.retryAfterMs }, 'Message rate limit reached');
+        return;
+      }
+    }
+
     // Acknowledge eligible messages and show live typing while Bubu works.
     // Presence failures must never prevent the actual AI task from running.
-    if (typeof this.waha.sendSeen === 'function') {
+    if (typeof this.waha?.sendSeen === 'function') {
       try {
         await this.waha.sendSeen(msg.chatId);
       } catch (error) {
         this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA sendSeen failed');
       }
     }
-    if (typeof this.waha.startTyping === 'function') {
+    const typingKeepalive = typeof this.waha?.createTypingKeepalive === 'function'
+      ? this.waha.createTypingKeepalive(msg.chatId, {
+          intervalMs: this.config?.waha?.typingKeepaliveMs,
+          logger: this.logger
+        })
+      : null;
+    if (typingKeepalive) {
+      try {
+        await typingKeepalive.start();
+      } catch (error) {
+        this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA typing keepalive start failed');
+      }
+    } else if (typeof this.waha?.startTyping === 'function') {
       try {
         await this.waha.startTyping(msg.chatId);
       } catch (error) {
@@ -250,11 +278,33 @@ class MessageProcessor {
             chatId: scope === 'group' ? msg.chatId : null,
             limit: 20
           }) || [];
-          if (workspaceDocs.length > 0) {
+          let matchedDoc = null;
+          if (quoteContext.quotedMessageId) {
+            const quotedEventKey = eventKey({ chatId: msg.chatId, eventId: quoteContext.quotedMessageId });
+            matchedDoc = workspaceDocs.find((d) =>
+              d.source_event_id &&
+              (d.source_event_id === quoteContext.quotedMessageId || d.source_event_id === quotedEventKey)
+            ) || null;
+            if (!matchedDoc && typeof this.db?.db?.prepare === 'function') {
+              matchedDoc = this.db.db.prepare(
+                `SELECT id, filename, mime_type FROM documents
+                 WHERE scope = ? AND ((scope = 'personal' AND owner_id = ?) OR (scope = 'group' AND chat_id = ?))
+                 AND source_event_id IN (?, ?)
+                 LIMIT 1`
+              ).get(
+                scope,
+                scope === 'personal' ? senderId : null,
+                scope === 'group' ? msg.chatId : null,
+                quoteContext.quotedMessageId,
+                quotedEventKey
+              ) || null;
+            }
+          }
+          if (!matchedDoc && workspaceDocs.length > 0) {
             const quotedTextLower = String(quoteContext.text || '').toLowerCase();
             const quotedMimeLower = String(quoteContext.mimeType || '').toLowerCase();
             const quotedTypeLower = String(quoteContext.type || '').toLowerCase();
-            let matchedDoc = workspaceDocs.find((d) =>
+            matchedDoc = workspaceDocs.find((d) =>
               d.filename && quotedTextLower && quotedTextLower.includes(String(d.filename).toLowerCase())
             );
             if (!matchedDoc && (quotedTypeLower === 'document' || quotedMimeLower.includes('pdf') || quotedMimeLower.includes('word') || quotedMimeLower.includes('sheet') || quotedMimeLower.includes('excel') || quotedMimeLower.includes('csv'))) {
@@ -262,13 +312,13 @@ class MessageProcessor {
                 quotedMimeLower && String(d.mime_type || '').toLowerCase() === quotedMimeLower
               ) || workspaceDocs[0];
             }
-            if (matchedDoc) {
-              quoteContext.referencedDocument = {
-                documentId: matchedDoc.id,
-                filename: matchedDoc.filename,
-                mimeType: matchedDoc.mime_type || null
-              };
-            }
+          }
+          if (matchedDoc) {
+            quoteContext.referencedDocument = {
+              documentId: matchedDoc.id,
+              filename: matchedDoc.filename,
+              mimeType: matchedDoc.mime_type || null
+            };
           }
         } catch (err) {
           this.logger?.warn?.({ chatId: msg.chatId, error: err.message }, 'Unable to resolve quoted workspace document');
@@ -316,7 +366,8 @@ class MessageProcessor {
       const result = await this.agent.run({
         text, chatId: msg.chatId, requesterId: senderId, scope, history, memories, projects,
         captionContext, voiceInstruction, attachmentEvidence, quoteContext,
-        sourceEventId: eventId
+        sourceEventId: eventId,
+        incomingMessageId: msg.eventId || null
       });
       if (result.text) {
         const responseText = this.db.claimTaskResponse(result.taskId);
@@ -328,7 +379,13 @@ class MessageProcessor {
               defaultMode: this.config.media.voiceReplyDefault ? 'both' : 'text'
             });
 
-            await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode);
+            if (isGroup && msg.eventId) {
+              await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode, {
+                replyTo: msg.eventId
+              });
+            } else {
+              await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode);
+            }
 
             this.db.finishTaskResponse(result.taskId, 'sent');
             this.db.addMessage({
@@ -360,7 +417,13 @@ class MessageProcessor {
         }
       }
     } finally {
-      if (typeof this.waha.stopTyping === 'function') {
+      if (typingKeepalive) {
+        try {
+          await typingKeepalive.stop();
+        } catch (error) {
+          this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA typing keepalive stop failed');
+        }
+      } else if (typeof this.waha?.stopTyping === 'function') {
         try {
           await this.waha.stopTyping(msg.chatId);
         } catch (error) {

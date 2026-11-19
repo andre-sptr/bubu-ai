@@ -41,3 +41,33 @@ test('reminder worker records uncertain delivery when shared handler fails', asy
   assert.equal(finished[1], false);
   assert.equal(finished[2], 'delivery uncertain');
 });
+
+test('reminder worker reports isHealthy(), runs throttled periodic stale recovery in tick(), and stops cleanly', async () => {
+  const recoveredCalls = [];
+  const worker = new ReminderWorker({
+    db: {
+      recoverStaleReminders: (ms) => { recoveredCalls.push(ms); return 1; },
+      claimDueReminders: () => []
+    },
+    responseHandler: { sendText: async () => ({ ok: true }) },
+    logger: { warn: () => {}, error: () => {} },
+    staleMs: 60000,
+    staleSweepIntervalMs: 5000
+  });
+
+  assert.equal(worker.isHealthy(), true);
+  await worker.tick();
+  assert.deepEqual(recoveredCalls, [60000]);
+
+  await worker.tick();
+  assert.equal(recoveredCalls.length, 1);
+
+  worker.lastStaleSweepAt = Date.now() - 6000;
+  await worker.tick();
+  assert.equal(recoveredCalls.length, 2);
+
+  await worker.stop();
+  assert.equal(worker.isHealthy(), false);
+  await worker.tick();
+  assert.equal(recoveredCalls.length, 2);
+});

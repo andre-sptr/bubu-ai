@@ -298,6 +298,17 @@ const MIGRATIONS = [
         CHECK(voice_reply_mode_is_set IN (0,1));
       UPDATE chat_preferences SET voice_reply_mode_is_set = 1;
     `
+  },
+  {
+    version: 10,
+    sql: `
+      DROP INDEX IF EXISTS idx_memory_events_source;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_source
+        ON memory_events(scope,owner_id,chat_id,source_event_id)
+        WHERE source_event_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_rate_limit_events_created_at
+        ON rate_limit_events(created_at_ms);
+    `
   }
 ];
 

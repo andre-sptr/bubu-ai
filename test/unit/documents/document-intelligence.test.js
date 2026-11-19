@@ -610,3 +610,35 @@ test('Task 3.5: Quoted document resolution in MessageProcessor and workspace rec
   assert.ok(quotedMsg);
   assert.match(quotedMsg.content, /"referencedDocument":\{"documentId":"doc-uuid-kontrak-01"/);
 });
+
+test('DOCX XML parser guards out-of-range code points and limits zip bomb decompression', () => {
+  const { decodeXmlEntities, readZipEntryFromBuffer } = require('../../../src/documents/parsers/docx-xml-parser');
+  const decoded = decodeXmlEntities('Valid &#65; &#x42; invalid &#9999999; &#x9999999;');
+  assert.equal(decoded, 'Valid A B invalid &#9999999; &#x9999999;');
+
+  const bombPayload = Buffer.alloc(17 * 1024 * 1024, 0x41);
+  const bombZip = buildMinimalZipBuffer([{ name: 'word/document.xml', data: bombPayload }]);
+  assert.throws(
+    () => readZipEntryFromBuffer(bombZip, 'word/document.xml'),
+    /buffer|length|limit|size/i
+  );
+});
+
+test('readDocumentPages returns hasMorePages false when requested page is out of bounds', () => {
+  const text = [
+    '--- [HALAMAN 1] ---\nSatu',
+    '--- [HALAMAN 2] ---\nDua',
+    '--- [HALAMAN 3] ---\nTiga'
+  ].join('\n\n');
+  const outOfRange = readDocumentPages(text, { page: 99 });
+  assert.deepEqual(outOfRange.returnedPages, []);
+  assert.equal(outOfRange.hasMorePages, false);
+
+  const midPage = readDocumentPages(text, { page: 2 });
+  assert.deepEqual(midPage.returnedPages, [2]);
+  assert.equal(midPage.hasMorePages, true);
+
+  const lastPage = readDocumentPages(text, { page: 3 });
+  assert.deepEqual(lastPage.returnedPages, [3]);
+  assert.equal(lastPage.hasMorePages, false);
+});

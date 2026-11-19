@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { normalizeIncoming } = require('../../../src/channels/waha/normalizer');
+const { normalizeIncoming, normalizeSessionStatus } = require('../../../src/channels/waha/normalizer');
 const { normalizeJid } = require('../../../src/config/env');
 
 test('normalizes DM WAHA payload', () => {
@@ -307,4 +307,140 @@ test('quote-only webhook is recognized without promoting quote text to current t
   });
   assert.equal(m.text, '');
   assert.equal(m.quote.present, true);
+});
+
+test('unwraps object IDs for chatId, senderId, and eventId without [object Object]', () => {
+  const m = normalizeIncoming({
+    event: 'message',
+    payload: {
+      id: { fromMe: false, remote: '6281@c.us', id: 'ABC99', _serialized: 'false_6281@c.us_ABC99' },
+      from: { _serialized: '120363@g.us', user: '120363', server: 'g.us' },
+      author: { user: '6282', server: 'c.us' },
+      body: 'Obj ID test'
+    }
+  });
+  assert.equal(m.eventId, 'false_6281@c.us_ABC99');
+  assert.equal(m.chatId, '120363@g.us');
+  assert.equal(m.senderId, '6282@c.us');
+  assert.equal(JSON.stringify(m).includes('[object Object]'), false);
+});
+
+test('unwraps ephemeralMessage, viewOnceMessage, and viewOnceMessageV2 on incoming messages', () => {
+  const m = normalizeIncoming({
+    event: 'message',
+    payload: {
+      id: 'ephem-1',
+      from: '123@g.us',
+      author: '6281@c.us',
+      _data: {
+        Info: { Chat: '123@g.us', Sender: '6281@c.us', MediaType: 'image' },
+        Message: {
+          ephemeralMessage: {
+            message: {
+              viewOnceMessageV2: {
+                message: {
+                  imageMessage: {
+                    URL: 'https://waha.example/viewonce.jpg',
+                    caption: 'Secret photo',
+                    mimetype: 'image/jpeg',
+                    contextInfo: {
+                      mentionedJid: ['628999@c.us'],
+                      stanzaID: 'stanza-ephem',
+                      participant: '6281@c.us',
+                      quotedMessage: { conversation: 'Previous message' }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+  assert.equal(m.hasMedia, true);
+  assert.equal(m.media.url, 'https://waha.example/viewonce.jpg');
+  assert.equal(m.captionText, 'Secret photo');
+  assert.equal(m.text, 'Secret photo');
+  assert.deepEqual(m.mentions, ['628999@c.us']);
+  assert.equal(m.quote.present, true);
+  assert.equal(m.quote.text, 'Previous message');
+  assert.equal(m.quote.quotedMessageId, 'stanza-ephem');
+  assert.equal(m.quote.quotedParticipant, '6281@c.us');
+});
+
+test('detects isPtt across lowercase ptt, source.ptt, and Info.MediaType=ptt', () => {
+  const fromLowerNative = normalizeIncoming({
+    payload: {
+      id: 'ptt-lower',
+      from: '6281@c.us',
+      _data: {
+        Message: { audioMessage: { URL: 'https://waha.example/a.ogg', mimetype: 'audio/ogg', ptt: true } }
+      }
+    }
+  });
+  assert.equal(fromLowerNative.media.isPtt, true);
+
+  const fromSourcePtt = normalizeIncoming({
+    payload: {
+      id: 'ptt-source',
+      from: '6281@c.us',
+      hasMedia: true,
+      media: { url: 'https://waha.example/a.ogg', mimetype: 'audio/ogg', ptt: true }
+    }
+  });
+  assert.equal(fromSourcePtt.media.isPtt, true);
+
+  const fromInfoMediaType = normalizeIncoming({
+    payload: {
+      id: 'ptt-info',
+      from: '6281@c.us',
+      _data: {
+        Info: { MediaType: 'PTT' },
+        Message: { audioMessage: { URL: 'https://waha.example/a.ogg', mimetype: 'audio/ogg' } }
+      }
+    }
+  });
+  assert.equal(fromInfoMediaType.media.isPtt, true);
+});
+
+test('extracts payload.replyTo.body quotes and retains internal quotedMessageId and quotedParticipant', () => {
+  const m = normalizeIncoming({
+    payload: {
+      id: 'reply-body-1',
+      from: '6281@c.us',
+      body: 'Setuju!',
+      replyTo: {
+        id: 'orig-msg-42',
+        chatId: '6281@c.us',
+        participant: '6289@c.us',
+        body: 'Kita ketemu jam 3 sore'
+      }
+    }
+  });
+  assert.equal(m.quote.present, true);
+  assert.equal(m.quote.type, 'text');
+  assert.equal(m.quote.text, 'Kita ketemu jam 3 sore');
+  assert.equal(m.quote.referenceIdPresent, true);
+  assert.equal(m.quote.quotedMessageId, 'orig-msg-42');
+  assert.equal(m.quote.quotedParticipant, '6289@c.us');
+  assert.equal(Object.hasOwn(m.quote, 'participant'), false);
+  assert.equal(Object.hasOwn(m.quote, 'stanzaID'), false);
+});
+
+test('normalizeSessionStatus normalizes session, status, and bot JID metadata', () => {
+  const s = normalizeSessionStatus({
+    event: 'session.status',
+    session: 'bubu-prod',
+    timestamp: 1712345678,
+    me: { id: '628999:1@s.whatsapp.net' },
+    payload: { name: 'bubu-prod', status: 'scan_qr_code' }
+  });
+  assert.deepEqual(s, {
+    eventType: 'session.status',
+    session: 'bubu-prod',
+    status: 'SCAN_QR_CODE',
+    meId: '628999@c.us',
+    timestamp: 1712345678
+  });
 });

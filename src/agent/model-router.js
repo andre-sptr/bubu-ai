@@ -11,7 +11,12 @@ const TASK_TO_TIER = Object.freeze({
 
 function classifyTask(text = '') {
   const s = String(text).toLowerCase().trim();
-  if (/^(hai|halo|hello|hi|pagi|siang|sore|malam)\b/.test(s)) return 'greeting';
+  const isShortGreeting = s.length <= 40 &&
+    !/[.?!].*\S/.test(s) &&
+    !s.endsWith('?') &&
+    !/\b(rangkum|ringkas|summari[sz]e|resume|debug|bug|kode|coding|analisis|evaluasi|bandingkan|buatkan|carikan|tolong)\b/.test(s) &&
+    /^(hai|halo|hello|hi|pagi|siang|sore|malam|selamat\s+(?:pagi|siang|sore|malam))(?:\b|[!,.\s]*$)/.test(s);
+  if (isShortGreeting) return 'greeting';
   if (/\b(rangkum|ringkas|summari[sz]e|resume)\b/.test(s)) return 'summarize';
   if (/\b(debug|bug|kode|coding|program|javascript|python|error log)\b/.test(s)) return 'coding';
   if (/\b(lalu|kemudian|setelah itu|carikan.*dan|buatkan.*kemudian|kerjakan|jalankan|tolong.*kirim)\b/.test(s)) return 'agent';
@@ -36,8 +41,9 @@ class ModelRouter {
     for (const tier of [...new Set(preference)]) {
       const candidate = this.modelConfig[tier];
       if (!candidate?.id) continue;
+      if (needsTools && candidate.supportsTools === false) continue;
       if (needsVision && candidate.supportsVision === false) continue;
-      return { tier, model: candidate.id, supportsTools: true };
+      return { tier, model: candidate.id, supportsTools: candidate.supportsTools !== false };
     }
     throw new Error(needsTools
       ? `No configured Sumopod model has tool calling enabled for task ${task}`

@@ -1,14 +1,32 @@
-const PLACEHOLDER_START = '\u0001BUBU_MD_';
-const PLACEHOLDER_END = '\u0002';
+const crypto = require('node:crypto');
+
+function createStash(source) {
+  let nonce;
+  do {
+    nonce = crypto.randomBytes(8).toString('hex');
+  } while (source.includes(nonce));
+  return { items: [], nonce };
+}
 
 function protect(value, stash) {
-  const token = `${PLACEHOLDER_START}${stash.length}${PLACEHOLDER_END}`;
-  stash.push(value);
+  const token = `\u0001BUBU_${stash.nonce}_${stash.items.length}\u0002`;
+  stash.items.push(value);
   return token;
 }
 
 function restore(value, stash) {
-  return value.replace(/\u0001BUBU_MD_(\d+)\u0002/g, (_match, index) => stash[Number(index)] ?? '');
+  if (!stash.items.length) return value;
+  const pattern = new RegExp(`\\u0001BUBU_${stash.nonce}_(\\d+)\\u0002`, 'g');
+  let output = value;
+  for (let pass = 0; pass <= stash.items.length; pass++) {
+    let replaced = false;
+    output = output.replace(pattern, (_match, index) => {
+      replaced = true;
+      return stash.items[Number(index)] ?? '';
+    });
+    if (!replaced) break;
+  }
+  return output;
 }
 
 function formatInline(input, stash) {
@@ -87,7 +105,7 @@ function formatTable(lines, start, stash) {
 function formatWhatsAppText(input) {
   if (input === null || input === undefined) return '';
   const source = String(input).replace(/\r\n?/g, '\n');
-  const stash = [];
+  const stash = createStash(source);
   const fenced = source.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_m, language, code) => {
     const body = String(code || '').replace(/^\n/, '').replace(/\n+$/, '');
     return protect(`\`\`\`\n${body}\n\`\`\``, stash);

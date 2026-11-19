@@ -42,7 +42,7 @@ function detectMediaKind(filename, mimetype = '') {
 }
 
 function validateMediaSignature(buffer, ext, kind) {
-  const bytes = Buffer.from(buffer || []);
+  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
   const starts = (...values) => values.every((value, index) => bytes[index] === value);
   const ascii = (start, end) => bytes.subarray(start, end).toString('ascii');
 

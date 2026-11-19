@@ -374,3 +374,41 @@ test('Task 2.6: DM and group image understanding changes answer when photo conte
   assert.equal(fallbackHarness.providerRequests.length, 2);
   assert.match(fallbackHarness.sent[0].text, /FAKTUR PAJAK #9981/);
 });
+
+test('SumopodProvider strips AxiosError config, request, and Authorization header while preserving status and code', async () => {
+  const axios = require('axios');
+  const pino = require('pino');
+  const makeAxiosError = () => new axios.AxiosError(
+    'Request failed with status code 429',
+    'ERR_BAD_RESPONSE',
+    { headers: { Authorization: 'Bearer super-secret-sumopod-key' }, data: { secret: true } },
+    { req: true },
+    { status: 429, config: { headers: { Authorization: 'Bearer super-secret-sumopod-key' } } }
+  );
+
+  const provider = new SumopodProvider({
+    baseUrl: 'https://ai.sumopod.com/v1',
+    apiKey: 'super-secret-sumopod-key',
+    httpClient: {
+      get: async () => { throw makeAxiosError(); },
+      post: async () => { throw makeAxiosError(); }
+    }
+  });
+
+  for (const call of [
+    () => provider.listModels(),
+    () => provider.embed({ input: 'hello' }),
+    () => provider.chat({ model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'hi' }] })
+  ]) {
+    await assert.rejects(call, (err) => {
+      assert.equal(err.status, 429);
+      assert.equal(err.response?.status, 429);
+      assert.equal(err.code, 'ERR_BAD_RESPONSE');
+      assert.equal(err.config, undefined);
+      assert.equal(err.request, undefined);
+      const serialized = JSON.stringify(pino.stdSerializers.err(err));
+      assert.equal(serialized.includes('super-secret-sumopod-key'), false);
+      return true;
+    });
+  }
+});

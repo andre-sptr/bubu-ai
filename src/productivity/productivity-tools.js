@@ -85,9 +85,18 @@ function createProductivityTools({ db, approvalManager }) {
       }, required: ['taskId']
     },
     execute: async ({ taskId, dueAt, ...fields }, ctx) => {
-      if (dueAt !== undefined && dueAt !== null && Date.parse(dueAt) < Date.now()) throw new Error('Due date must be in the future.');
       const mapped = { ...fields };
-      if (dueAt !== undefined) mapped.due_at = dueAt ? new Date(dueAt).toISOString() : null;
+      if (dueAt !== undefined) {
+        if (dueAt === null) {
+          mapped.due_at = null;
+        } else {
+          const dueTime = Date.parse(dueAt);
+          if (!Number.isFinite(dueTime) || dueTime < Date.now()) {
+            throw new Error('Due date must be in the future.');
+          }
+          mapped.due_at = new Date(dueTime).toISOString();
+        }
+      }
       const task = db.updateUserTask({
         id: taskId,
         scope: ctx.scope,
@@ -194,11 +203,16 @@ function createProductivityTools({ db, approvalManager }) {
     requiresApproval: true,
     schema: z.object({
       targetId: z.string().min(5).max(100),
-      message: z.string().min(1).max(4000)
+      message: z.string().min(1).max(4000),
+      replyTo: z.string().min(1).max(200).optional()
     }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
-      properties: { targetId: { type: 'string' }, message: { type: 'string' } },
+      properties: {
+        targetId: { type: 'string' },
+        message: { type: 'string' },
+        replyTo: { type: 'string', description: 'Optional WhatsApp message ID to reply to' }
+      },
       required: ['targetId', 'message']
     },
     execute: async (args, ctx) => approvalManager.create({

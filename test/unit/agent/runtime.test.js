@@ -423,3 +423,119 @@ test('orphaned approval replay uses real newlines rather than escaped \\n litera
   assert.match(result.text, /\*Konfirmasi pengiriman file Bubu\*\n\nTujuan: 6281@c\.us\nFile: laporan\.pdf/);
   assert.equal(updates[0].status, 'awaiting_approval');
 });
+
+test('uncertain and cancelled task status take precedence over orphaned pending approvals', async () => {
+  for (const status of ['uncertain', 'cancelled']) {
+    const db = {
+      getTask: () => ({ status, model_tier: 'balanced', tool_calls: 1 }),
+      getPendingApprovalForTask: () => ({ id: 'ap-stale', tool_name: 'send_whatsapp_message', arguments: {} }),
+      queueTaskResponse: () => {},
+      audit: () => {}
+    };
+    const agent = new AgentRuntime({
+      provider: { chat: async () => assert.fail('model should not be called') },
+      router: { select: () => ({ tier: 'balanced', model: 'test' }) },
+      tools: { definitions: () => [] },
+      db,
+      config: { agent: { maxRounds: 2, maxToolCalls: 2, taskTimeoutMs: 1000, toolTimeoutMs: 500 } },
+      logger: { debug: () => {}, warn: () => {}, error: () => {} }
+    });
+    const res = await agent.run({
+      text: 'Kirim', chatId: '6281@c.us', requesterId: '6281@c.us', scope: 'personal', sourceEventId: `evt-${status}`
+    });
+    assert.equal(res.replayed, true);
+    assert.equal(res.awaitingApproval, undefined);
+    if (status === 'uncertain') assert.equal(res.uncertain, true);
+  }
+});
+
+test('runtime passes incomingMessageId in context, guards undefined tool results, and stops per-tool JSON/schema loops', async () => {
+  let seenContext = null;
+  let round = 0;
+  const db = {
+    task: null,
+    steps: [],
+    createTask: (t) => { db.task = { ...t, status: 'running' }; },
+    getTask: () => db.task,
+    getPendingApprovalForTask: () => null,
+    countTaskSteps: () => db.steps.length,
+    logModelUsage: () => {},
+    updateTask: (_id, f) => { db.task = { ...db.task, ...f }; },
+    queueTaskResponse: (_id, text) => { db.queuedResponse = text; },
+    audit: () => {},
+    addTaskStep: (s) => db.steps.push(s),
+    beginToolExecution: () => ({ state: 'claimed' }),
+    completeToolExecution: () => {},
+    failToolExecution: () => {}
+  };
+  const tools = {
+    definitions: () => [
+      { type: 'function', function: { name: 'noop_tool', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'bad_tool', parameters: { type: 'object' } } }
+    ],
+    get: (name) => name === 'noop_tool'
+      ? {
+          scopes: ['personal'],
+          schema: { parse: (v) => v },
+          execute: async (_args, ctx) => { seenContext = ctx; return undefined; }
+        }
+      : {
+          scopes: ['personal'],
+          schema: { parse: (v) => v },
+          execute: async () => assert.fail('must not execute invalid JSON')
+        }
+  };
+  const agent = new AgentRuntime({
+    provider: {
+      chat: async () => {
+        round++;
+        if (round === 1) {
+          return {
+            message: {
+              role: 'assistant',
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 'noop_tool', arguments: '{}' } }]
+            },
+            model: 'sumo/test',
+            usage: {}
+          };
+        }
+        if (round === 2) {
+          return {
+            message: {
+              role: 'assistant',
+              tool_calls: [{ id: 'c2', type: 'function', function: { name: 'bad_tool', arguments: '{not-json-1' } }]
+            },
+            model: 'sumo/test',
+            usage: {}
+          };
+        }
+        return {
+          message: {
+            role: 'assistant',
+            tool_calls: [{ id: 'c3', type: 'function', function: { name: 'bad_tool', arguments: '{not-json-2' } }]
+          },
+          model: 'sumo/test',
+          usage: {}
+        };
+      }
+    },
+    router: { select: () => ({ tier: 'balanced', model: 'sumo/test' }) },
+    tools,
+    db,
+    config: { agent: { maxRounds: 5, maxToolCalls: 6, maxToolResultChars: 1000, taskTimeoutMs: 5000, toolTimeoutMs: 1000 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+
+  const res = await agent.run({
+    text: 'Jalankan',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    scope: 'personal',
+    sourceEventId: 'loop-json-evt',
+    incomingMessageId: 'wa-msg-77'
+  });
+  assert.equal(seenContext.incomingMessageId, 'wa-msg-77');
+  assert.equal(res.toolValidationLoop, true);
+  assert.match(res.text, /parameter tool yang tidak lengkap/);
+  assert.match(res.text, /bad_tool/);
+});

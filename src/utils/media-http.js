@@ -2,8 +2,43 @@ const path = require('node:path');
 
 function safeFilename(name, fallback = 'document') {
   const portable = String(name || fallback).replace(/\\/g, '/');
-  const base = path.basename(portable).replace(/[^\p{L}\p{N}._ -]/gu, '_').slice(0, 100);
-  return base || fallback;
+  const rawBase = path.basename(portable).replace(/[^\p{L}\p{N}._ -]/gu, '_').trim();
+  if (!rawBase || /^\.+$/.test(rawBase)) return fallback;
+
+  const ext = path.extname(rawBase);
+  if (ext && ext.length < 100) {
+    const stem = rawBase.slice(0, rawBase.length - ext.length).slice(0, 100 - ext.length).trim();
+    if (!stem || /^\.+$/.test(stem)) {
+      return `${fallback}${ext}`.slice(0, 100);
+    }
+    return `${stem}${ext}`;
+  }
+
+  const sliced = rawBase.slice(0, 100).trim();
+  if (!sliced || /^\.+$/.test(sliced)) return fallback;
+  return sliced;
+}
+
+function sanitizeAxiosError(error) {
+  if (!error || typeof error !== 'object') {
+    return new Error(String(error || 'HTTP request failed'));
+  }
+  const status = Number(error.status || error.statusCode || error.response?.status || error.cause?.response?.status || 0) || undefined;
+  const code = error.code || error.cause?.code;
+  const message = String(error.message || 'HTTP request failed');
+  const sanitized = new Error(message);
+  if (error.name && error.name !== 'AxiosError') {
+    sanitized.name = error.name;
+  }
+  if (code) sanitized.code = String(code);
+  if (status) {
+    sanitized.status = status;
+    sanitized.response = { status };
+  }
+  if (error.stack) {
+    sanitized.stack = error.stack;
+  }
+  return sanitized;
 }
 
 function normalizeMimeType(value) {
@@ -76,6 +111,7 @@ function validateResponseMime(declaredMime, responseMime, acceptedMimes, label) 
 
 module.exports = {
   safeFilename,
+  sanitizeAxiosError,
   normalizeMediaUrl,
   normalizeMimeType,
   isGenericMime,

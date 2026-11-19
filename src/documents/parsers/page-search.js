@@ -112,7 +112,7 @@ function readDocumentPages(extractedText, { page = null, startPage = null, endPa
   }
 
   const lastReturnedPage = selected.length ? selected[selected.length - 1].pageNumber : 0;
-  const hasMorePages = lastReturnedPage < pages.length;
+  const hasMorePages = candidates.length > 0 && lastReturnedPage < pages.length;
   const text = selected.map((s) => s.formatted).join('\n\n').slice(0, boundedMaxChars);
 
   return {

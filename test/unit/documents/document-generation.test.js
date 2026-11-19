@@ -67,4 +67,21 @@ test('rejects duplicate worksheet names and unsafe external formula references',
     rows: [['x']],
     formulas: { A2: 'WEBSERVICE("https://example.com")' }
   }), /Formula ditolak/);
+
+  for (const fn of [
+    'IMAGE("https://tracker.example/pixel.png")',
+    'IMPORTDATA("https://example.com/a.csv")',
+    'IMPORTXML("https://example.com","//a")',
+    'IMPORTHTML("https://example.com","table",1)',
+    'IMPORTRANGE("sheet-id","A1:B2")',
+    'INFO("directory")',
+    'CELL("filename")'
+  ]) {
+    await assert.rejects(() => service().createXlsx({
+      title: 'Test',
+      headers: ['Value'],
+      rows: [['x']],
+      formulas: { A2: fn }
+    }), /Formula ditolak/, `Expected ${fn} to be rejected`);
+  }
 });

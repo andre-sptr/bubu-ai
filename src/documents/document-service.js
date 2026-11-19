@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { runCommand } = require('../utils/process-runner');
 const {
   safeFilename,
+  sanitizeAxiosError,
   normalizeMediaUrl,
   normalizeMimeType,
   isGenericMime,
@@ -128,14 +129,19 @@ class DocumentService {
     const ext = validateExtension(safeName, mimetype);
     const accepted = ALLOWED.get(ext);
     const axios = this.httpClient || require('axios');
-    const response = await axios.get(url.toString(), {
-      responseType: 'arraybuffer',
-      timeout: 30000,
-      maxContentLength: this.maxFileBytes,
-      maxBodyLength: this.maxFileBytes,
-      maxRedirects: 0,
-      headers: this.wahaConfig.apiKey ? { 'X-Api-Key': this.wahaConfig.apiKey } : {}
-    });
+    let response;
+    try {
+      response = await axios.get(url.toString(), {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+        maxContentLength: this.maxFileBytes,
+        maxBodyLength: this.maxFileBytes,
+        maxRedirects: 0,
+        headers: this.wahaConfig.apiKey ? { 'X-Api-Key': this.wahaConfig.apiKey } : {}
+      });
+    } catch (error) {
+      throw sanitizeAxiosError(error);
+    }
 
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Unduhan dokumen ditolak dengan HTTP ${response.status}. Redirect tidak diikuti.`);
@@ -504,8 +510,12 @@ class DocumentService {
       const storedPath = path.resolve(deleted.file_path);
       const relativePath = path.relative(storageRoot, storedPath);
       if (relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath)) {
-        await fsp.rm(storedPath, { force: true }).catch(() => {});
-        fileRemoved = true;
+        try {
+          await fsp.rm(storedPath, { force: true });
+          fileRemoved = true;
+        } catch (err) {
+          this.logger?.warn?.({ documentId: deleted.id, error: err.message }, 'Failed to remove stored document file');
+        }
       }
     }
 

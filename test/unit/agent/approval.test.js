@@ -59,3 +59,40 @@ test('ambiguous outbound error is not retried automatically', async () => {
   assert.equal(sends, 1);
   assert.equal(finished[1], 'uncertain');
 });
+
+test('pre-send validation and missing file return failed rather than uncertain', async () => {
+  const finished = [];
+  const db = {
+    claimApproval: (id) => id === 'bad-target'
+      ? { tool_name: 'send_whatsapp_message', arguments: { targetId: 'invalid', message: 'Hi' } }
+      : { tool_name: 'send_whatsapp_file', arguments: { targetId: '6282@c.us', filePath: '/no/such/bubu-missing-file.pdf', filename: 'a.pdf' } },
+    finishApproval: (...args) => finished.push(args)
+  };
+  const manager = new ApprovalManager({
+    db, ownerJid: '6281@c.us',
+    waha: { sendText: async () => assert.fail('must not send'), sendFile: async () => assert.fail('must not send') }
+  });
+
+  const badTarget = await manager.resolve({ id: 'bad-target', actorId: '6281@c.us', approved: true });
+  assert.deepEqual(badTarget, { ok: false, reason: 'invalid_target' });
+  assert.equal(finished[0][1], 'failed');
+
+  const missingFile = await manager.resolve({ id: 'missing-file', actorId: '6281@c.us', approved: true });
+  assert.deepEqual(missingFile, { ok: false, reason: 'missing_file' });
+  assert.equal(finished[1][1], 'failed');
+});
+
+test('approved message forwards optional replyTo to WhatsApp delivery', async () => {
+  const sent = [];
+  const db = {
+    claimApproval: () => ({ tool_name: 'send_whatsapp_message', arguments: { targetId: '6282@c.us', message: 'Balasan', replyTo: 'orig-msg-9' } }),
+    finishApproval: () => {}
+  };
+  const manager = new ApprovalManager({
+    db, ownerJid: '6281@c.us',
+    waha: { sendText: async (text, chatId, opts) => sent.push({ text, chatId, opts }) }
+  });
+  const res = await manager.resolve({ id: 'ap-reply', actorId: '6281@c.us', approved: true });
+  assert.equal(res.sent, true);
+  assert.deepEqual(sent, [{ text: 'Balasan', chatId: '6282@c.us', opts: { replyTo: 'orig-msg-9' } }]);
+});

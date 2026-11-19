@@ -1,0 +1,118 @@
+# Harness v0 CI/STO Pipeline Blueprint for bubu-whatsapp-agent (andre-sptr/bubu-ai)
+#
+# Live Harness API Status (account: fH3gco1QSjSwvXrMFjkUCg, org: default, project: default_project):
+# - Connector `github_bubu_ai` (type: Github, spec.type: Repo, url: https://github.com/andre-sptr/bubu-ai, Anonymous):
+#   CREATED via `harness_create` and `test_connection` returned SUCCESS:
+#   https://app.harness.io/ng/account/fH3gco1QSjSwvXrMFjkUCg/all/orgs/default/projects/default_project/settings/connectors/github_bubu_ai
+# - Pipeline `bubu_ci` (local CI/STO blueprint):
+#   NOT YET CREATED in Harness because live `harness_create` rejected `Run` and `HarnessSAST`
+#   step types due to inactive CI and STO module licenses on account `fH3gco1QSjSwvXrMFjkUCg`:
+#   * Attempt 1 (Run + HarnessSAST): "Invalid yaml: Cannot use this entity because step type Run requires an active license; step type HarnessSAST requires an active license."
+#   * Attempt 2 (Run fallback without HarnessSAST, omitting repoName): "Invalid yaml: Cannot use this entity because step type Run requires an active license."
+# - Ready to import/create in Harness once an active Harness CI (and optional STO) license is enabled.
+
+pipeline:
+  identifier: bubu_ci
+  name: Bubu WhatsApp Agent CI
+  orgIdentifier: default
+  projectIdentifier: default_project
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: github_bubu_ai
+        build:
+          type: branch
+          spec:
+            branch: <+input>
+  stages:
+    - stage:
+        identifier: build_and_verify
+        name: Build and Verify
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  identifier: install_deps
+                  name: Install Dependencies
+                  type: Run
+                  spec:
+                    shell: Bash
+                    command: |
+                      set -euo pipefail
+                      NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)
+                      if [ "$NODE_MAJOR" -lt 22 ]; then
+                        if [ -s "${HOME}/.nvm/nvm.sh" ]; then
+                          . "${HOME}/.nvm/nvm.sh"
+                          nvm install 24
+                          nvm use 24
+                          NODE_BIN_DIR="$(dirname "$(command -v node)")"
+                        else
+                          NODE_VERSION="v24.22.1"
+                          curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.gz" -o /tmp/node.tar.gz
+                          mkdir -p /tmp/ci-node24
+                          tar -xzf /tmp/node.tar.gz -C /tmp/ci-node24 --strip-components=1
+                          rm -f /tmp/node.tar.gz
+                          NODE_BIN_DIR="/tmp/ci-node24/bin"
+                        fi
+                        printf 'export PATH="%s:$PATH"\n' "$NODE_BIN_DIR" > /tmp/ci-node.env
+                        . /tmp/ci-node.env
+                      fi
+                      node -v
+                      npm -v
+                      npm ci
+              - step:
+                  identifier: syntax_and_audit
+                  name: Syntax Check and Dependency Audit
+                  type: Run
+                  spec:
+                    shell: Bash
+                    command: |
+                      set -euo pipefail
+                      [ -f /tmp/ci-node.env ] && . /tmp/ci-node.env
+                      node -v
+                      node scripts/check-syntax.js
+                      npm audit --omit=dev --audit-level=high || true
+              - step:
+                  identifier: run_tests
+                  name: Run Tests
+                  type: Run
+                  spec:
+                    shell: Bash
+                    envVariables:
+                      NODE_ENV: test
+                    command: |
+                      set -euo pipefail
+                      [ -f /tmp/ci-node.env ] && . /tmp/ci-node.env
+                      node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=junit.xml "test/**/*.test.js"
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: ["junit.xml"]
+              - step:
+                  identifier: harness_code_scan
+                  name: Harness Code Scan
+                  type: HarnessSAST
+                  spec:
+                    mode: orchestration
+                    config: sast_sca
+                    target:
+                      type: repository
+                      detection: auto
+                    advanced:
+                      log:
+                        level: info
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: MarkAsFailure

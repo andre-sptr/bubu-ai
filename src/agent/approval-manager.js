@@ -1,5 +1,9 @@
 const crypto = require('node:crypto');
+const fsp = require('node:fs/promises');
+const { normalizeJid } = require('../config/env');
 const { ResponseHandler } = require('../channels/response-handler');
+
+const VALID_JID = /^[^@\s]+@(?:c\.us|g\.us|lid)$/i;
 
 function formatApprovalPrompt({ id, toolName, args, ttlMs = null }) {
   const expiryNote = ttlMs ? `\nBerlaku ${Math.ceil(ttlMs / 60000)} menit.` : '';
@@ -37,19 +41,51 @@ class ApprovalManager {
       this.db.finishApproval(id, 'failed', 'Unsupported approved tool');
       return { ok: false, reason: 'unsupported_tool' };
     }
+    const targetId = normalizeJid(item.arguments?.targetId);
+    if (!VALID_JID.test(targetId)) {
+      this.db.finishApproval(id, 'failed', 'Invalid or empty targetId');
+      return { ok: false, reason: 'invalid_target' };
+    }
+    if (item.tool_name === 'send_whatsapp_file') {
+      const filePath = String(item.arguments?.filePath || '').trim();
+      if (!filePath) {
+        this.db.finishApproval(id, 'failed', 'Missing filePath for approved file send');
+        return { ok: false, reason: 'missing_file' };
+      }
+      try {
+        const stat = await fsp.stat(filePath);
+        if (!stat.isFile() || stat.size <= 0) {
+          this.db.finishApproval(id, 'failed', 'Approved file does not exist or is empty');
+          return { ok: false, reason: 'missing_file' };
+        }
+      } catch (err) {
+        this.db.finishApproval(id, 'failed', `Approved file is unavailable: ${err.message}`);
+        return { ok: false, reason: 'missing_file' };
+      }
+    } else if (!String(item.arguments?.message || '').trim()) {
+      this.db.finishApproval(id, 'failed', 'Approved message is empty');
+      return { ok: false, reason: 'invalid_arguments' };
+    }
     try {
       if (item.tool_name === 'send_whatsapp_file') {
-        await this.responseHandler.sendFile(item.arguments.filePath, item.arguments.targetId, {
+        await this.responseHandler.sendFile(item.arguments.filePath, targetId, {
           filename: item.arguments.filename,
           mimetype: item.arguments.mimetype,
           caption: item.arguments.caption || ''
         });
       } else {
-        await this.responseHandler.sendText(item.arguments.message, item.arguments.targetId);
+        const sendOpts = item.arguments?.replyTo ? { replyTo: item.arguments.replyTo } : undefined;
+        await (sendOpts
+          ? this.responseHandler.sendText(item.arguments.message, targetId, sendOpts)
+          : this.responseHandler.sendText(item.arguments.message, targetId));
       }
       this.db.finishApproval(id, 'approved');
       return { ok: true, sent: true };
     } catch (error) {
+      if (error?.deliveryStatus === 'failed') {
+        this.db.finishApproval(id, 'failed', error.message);
+        return { ok: false, reason: 'send_failed' };
+      }
       // Network timeout can leave remote delivery ambiguous. Never auto-retry a send.
       this.db.finishApproval(id, 'uncertain', error.message);
       return { ok: false, reason: 'send_result_uncertain' };

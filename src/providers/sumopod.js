@@ -1,3 +1,5 @@
+const { sanitizeAxiosError } = require('../utils/media-http');
+
 const ALLOWED_VISION_DATA_URL = /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=\r\n]+)$/i;
 const DEFAULT_MAX_VISION_BYTES = 10 * 1024 * 1024;
 
@@ -56,21 +58,31 @@ class SumopodProvider {
   }
 
   async listModels() {
-    const response = await this.client().get(`${this.baseUrl}/models`, {
-      headers: this.headers(), timeout: this.timeoutMs
-    });
+    let response;
+    try {
+      response = await this.client().get(`${this.baseUrl}/models`, {
+        headers: this.headers(), timeout: this.timeoutMs
+      });
+    } catch (error) {
+      throw sanitizeAxiosError(error);
+    }
     return response.data?.data || [];
   }
 
 
   async embed({ input, model = 'gemini/gemini-embedding-001', timeoutMs = 12000 }) {
-    const response = await this.client().post(`${this.baseUrl}/embeddings`, {
-      model,
-      input: Array.isArray(input) ? input : [input]
-    }, {
-      headers: this.headers(),
-      timeout: timeoutMs
-    });
+    let response;
+    try {
+      response = await this.client().post(`${this.baseUrl}/embeddings`, {
+        model,
+        input: Array.isArray(input) ? input : [input]
+      }, {
+        headers: this.headers(),
+        timeout: timeoutMs
+      });
+    } catch (error) {
+      throw sanitizeAxiosError(error);
+    }
     const vector = response.data?.data?.[0]?.embedding;
     if (!Array.isArray(vector) || !vector.length) {
       throw new Error('Sumopod embeddings endpoint returned no vector');
@@ -86,9 +98,14 @@ class SumopodProvider {
     // thinking and may reject temperature/top_p parameters at the provider layer.
     if (Number.isFinite(temperature)) body.temperature = temperature;
     if (tools?.length) body.tools = tools;
-    const response = await this.client().post(`${this.baseUrl}/chat/completions`, body, {
-      headers: this.headers(), timeout: this.timeoutMs
-    });
+    let response;
+    try {
+      response = await this.client().post(`${this.baseUrl}/chat/completions`, body, {
+        headers: this.headers(), timeout: this.timeoutMs
+      });
+    } catch (error) {
+      throw sanitizeAxiosError(error);
+    }
     const choice = response.data?.choices?.[0];
     if (!choice?.message) throw new Error('Sumopod returned no assistant message');
     return {

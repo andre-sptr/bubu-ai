@@ -3,7 +3,8 @@ const { classifyOperationalError } = require('../utils/error-policy');
 class InboxWorker {
   constructor({
     db, handler, logger, onDeadLetter = null,
-    pollMs = 500, maxAttempts = 5, staleMs = 120000
+    pollMs = 500, maxAttempts = 5, staleMs = 120000,
+    staleSweepIntervalMs = 30000
   }) {
     this.db = db;
     this.handler = handler;
@@ -12,8 +13,32 @@ class InboxWorker {
     this.pollMs = pollMs;
     this.maxAttempts = maxAttempts;
     this.staleMs = staleMs;
+    this.staleSweepIntervalMs = staleSweepIntervalMs;
+    this.lastStaleSweepAt = 0;
     this.running = false;
     this.stopped = false;
+  }
+
+  isHealthy() {
+    return !this.stopped;
+  }
+
+  sweepStaleIfDue(now = Date.now()) {
+    if (now - this.lastStaleSweepAt < this.staleSweepIntervalMs) return 0;
+    this.lastStaleSweepAt = now;
+    const recovered = this.db.recoverStaleEvents?.(this.staleMs) || 0;
+    const recoveredApprovals = this.db.recoverStaleApprovals?.(this.staleMs) || 0;
+    const recoveredTools = this.db.recoverStaleToolExecutions?.(this.staleMs) || 0;
+    const recoveredResponses = this.db.recoverStaleTaskResponses?.(this.staleMs) || 0;
+    if (recovered || recoveredApprovals || recoveredTools || recoveredResponses) {
+      this.logger?.warn?.({
+        recovered,
+        recoveredApprovals,
+        recoveredTools,
+        recoveredResponses
+      }, 'Recovered stale inbox/task state');
+    }
+    return recovered;
   }
 
   async notifyDeadLetter(event, policy, error) {
@@ -37,6 +62,7 @@ class InboxWorker {
     if (this.running || this.stopped) return;
     this.running = true;
     try {
+      this.sweepStaleIfDue();
       const event = this.db.claimNextEvent();
       if (!event) return;
       try {
@@ -78,11 +104,13 @@ class InboxWorker {
   }
 
   start() {
-    const recovered = this.db.recoverStaleEvents(this.staleMs);
+    this.stopped = false;
+    const recovered = this.db.recoverStaleEvents?.(this.staleMs) || 0;
     if (recovered) {
-      this.logger.warn({ recovered }, 'Recovered stale inbox events');
+      this.logger?.warn?.({ recovered }, 'Recovered stale inbox events');
     }
-    this.timer = setInterval(() => this.tick().catch((err) => this.logger.error(err)), this.pollMs);
+    this.lastStaleSweepAt = Date.now();
+    this.timer = setInterval(() => this.tick().catch((err) => this.logger?.error?.(err)), this.pollMs);
     this.timer.unref?.();
     return this;
   }

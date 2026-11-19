@@ -433,3 +433,42 @@ test('searchMemoriesSemantic tokenizes multi-word lexical queries when queryEmbe
     assert.ok(matches[0].lexicalScore > 0);
   } finally { f.close(); }
 });
+
+test('Migration v10 allows the same sourceEventId across distinct scopes and indexes rate_limit_events', () => {
+  const f = fixture();
+  try {
+    const personalId = f.db.saveMemoryEvent({
+      scope: 'personal',
+      ownerId: 'owner@c.us',
+      eventType: 'conversation_turn',
+      summary: 'Personal turn summary',
+      sourceEventId: 'shared-source-evt-1'
+    });
+    const groupId = f.db.saveMemoryEvent({
+      scope: 'group',
+      chatId: 'group1@g.us',
+      eventType: 'conversation_turn',
+      summary: 'Group turn summary',
+      sourceEventId: 'shared-source-evt-1'
+    });
+    const personalIdRepeat = f.db.saveMemoryEvent({
+      scope: 'personal',
+      ownerId: 'owner@c.us',
+      eventType: 'conversation_turn',
+      summary: 'Duplicate personal turn summary',
+      sourceEventId: 'shared-source-evt-1'
+    });
+
+    assert.ok(personalId);
+    assert.ok(groupId);
+    assert.notEqual(personalId, groupId);
+    assert.equal(personalIdRepeat, personalId);
+    assert.equal(f.db.listMemoryEvents({ scope: 'personal', ownerId: 'owner@c.us' }).length, 1);
+    assert.equal(f.db.listMemoryEvents({ scope: 'group', chatId: 'group1@g.us' }).length, 1);
+
+    const versionRow = f.db.db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get();
+    assert.equal(versionRow.v, 10);
+    const rateIndex = f.db.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_rate_limit_events_created_at'").get();
+    assert.ok(rateIndex);
+  } finally { f.close(); }
+});

@@ -1,6 +1,6 @@
 require('dotenv').config();
 const pino = require('pino');
-const { loadConfig } = require('./config/env');
+const { loadConfig, normalizeJid } = require('./config/env');
 const { DatabaseStore } = require('./db/database');
 const { SumopodProvider } = require('./providers/sumopod');
 const { ModelRouter } = require('./agent/model-router');
@@ -8,6 +8,7 @@ const { registerAllTools } = require('./agent/tool-registry');
 const { ApprovalManager } = require('./agent/approval-manager');
 const { AgentRuntime } = require('./agent/runtime');
 const { WahaClient } = require('./channels/waha/client');
+const { WahaSessionMonitor } = require('./channels/waha/session-monitor');
 const { normalizeIncoming } = require('./channels/waha/normalizer');
 const { ResponseHandler } = require('./channels/response-handler');
 const { MessageProcessor } = require('./agent/message-processor');
@@ -21,12 +22,25 @@ const { MediaIntelligenceService } = require('./media/media-service');
 
 async function main() {
   const config = loadConfig();
-  const logger = pino({ level: config.logLevel });
+  const logger = pino({
+    level: config.logLevel,
+    redact: [
+      'err.config.headers',
+      'err.response.config.headers',
+      'err.config.data',
+      '*.headers.authorization',
+      '*.headers["x-api-key"]',
+      '*.apiKey',
+      '*.webhookToken',
+      '*.webhookHmacSecret'
+    ]
+  });
   const db = new DatabaseStore(config.databasePath);
   db.recoverStaleApprovals();
   db.recoverStaleToolExecutions();
   db.recoverStaleTaskResponses();
   const waha = new WahaClient(config.waha);
+  const sessionMonitor = new WahaSessionMonitor({ session: config.waha.session });
   const provider = new SumopodProvider(config.sumopod);
   const router = new ModelRouter(config.sumopod.models);
   router.assertReady();
@@ -81,6 +95,7 @@ async function main() {
     approvalManager,
     waha,
     responseHandler,
+    sessionMonitor,
     memoryService,
     documentService,
     webSearch,
@@ -88,10 +103,11 @@ async function main() {
   });
   const agent = new AgentRuntime({ provider, router, tools, db, config, logger });
   const processor = new MessageProcessor({
-    config, db, waha, responseHandler, agent, approvalManager, provider, router,
+    config, db, waha, responseHandler, sessionMonitor, agent, approvalManager, provider, router,
     documentService, memoryService, mediaService, logger
   });
 
+  let shuttingDown = false;
   const worker = new InboxWorker({
     db,
     handler: (payload) => processor.process(payload),
@@ -101,8 +117,10 @@ async function main() {
     staleMs: config.inbox.staleMs,
     onDeadLetter: async ({ event, message, category }) => {
       const incoming = normalizeIncoming(event.payload || {});
-      const chatId = event.chat_id || incoming.chatId;
+      const chatId = normalizeJid(event.chat_id || incoming.chatId);
       if (!chatId) return;
+      if (chatId !== config.ownerJid && !chatId.endsWith('@g.us')) return;
+      if (chatId.endsWith('@g.us') && config.groupPolicy !== 'all') return;
       const mode = db.getChatOutputMode({
         chatId,
         requesterId: config.ownerJid,
@@ -115,7 +133,14 @@ async function main() {
   const reminderWorker = new ReminderWorker({ db, waha, responseHandler, logger });
   reminderWorker.start();
 
-  const app = buildApp({ config, db, logger });
+  const app = buildApp({
+    config,
+    db,
+    logger,
+    worker,
+    sessionMonitor,
+    isShuttingDown: () => shuttingDown
+  });
   await app.listen({ host: config.host, port: config.port });
   logger.info({
     host: config.host,
@@ -124,14 +149,14 @@ async function main() {
     groupPolicy: config.groupPolicy
   }, 'Bubu v2 started');
 
-  let shuttingDown = false;
   async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'Shutting down Bubu v2');
+    await app.close();
     await reminderWorker.stop();
     await worker.stop();
-    await app.close();
+    waha.close?.();
     db.close();
     process.exit(0);
   }

@@ -88,14 +88,17 @@ test('Task 2.7: silent video without text extracts timestamped visual frames, pr
 
 test('Task 2.7: video with soundtrack combines timestamped visual frames and Task 2.5 VAD+Whisper audio transcript', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-27-soundtrack-'));
+  const modelPath = path.join(dir, 'ggml-base.bin');
+  fs.writeFileSync(modelPath, 'model-fixture');
   const vadPath = path.join(dir, 'silero.bin');
   fs.writeFileSync(vadPath, 'vad-fixture');
 
+  let audioBusyDuringWhisper = false;
   const service = new MediaIntelligenceService({
     wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
     storageDir: dir,
     visionEnabled: true,
-    whisperModelPath: '/opt/whisper.cpp/models/ggml-base.bin',
+    whisperModelPath: modelPath,
     whisperVadModelPath: vadPath,
     httpClient: {
       get: async () => ({
@@ -118,7 +121,10 @@ test('Task 2.7: video with soundtrack combines timestamped visual frames and Tas
         return { stdout: '', stderr: '' };
       }
       if (cmd === 'tesseract') return { stdout: 'SLIDE 1: AGENDA', stderr: '' };
-      if (cmd === 'whisper-cli') return { stdout: '[00:00.000 --> 00:05.000] Selamat pagi, kita mulai demo produk sekarang.\n', stderr: '' };
+      if (cmd === 'whisper-cli') {
+        audioBusyDuringWhisper = service.audioBusy;
+        return { stdout: '[00:00.000 --> 00:05.000] Selamat pagi, kita mulai demo produk sekarang.\n', stderr: '' };
+      }
       return { stdout: '', stderr: '' };
     }
   });
@@ -128,6 +134,9 @@ test('Task 2.7: video with soundtrack combines timestamped visual frames and Tas
       media: { url: '/api/files/demo.mp4', filename: 'demo.mp4', mimetype: 'video/mp4' }
     });
 
+    assert.equal(audioBusyDuringWhisper, true);
+    assert.equal(service.audioBusy, false);
+    assert.equal(service.videoBusy, false);
     assert.equal(result.visualMode, 'visual_frames');
     assert.equal(result.partialOnly, false);
     assert.equal(result.noSpeech, false);

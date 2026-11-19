@@ -3,6 +3,7 @@ const { createMemoryTools } = require('../memory/memory-tools');
 const { createProductivityTools } = require('../productivity/productivity-tools');
 const { createWebTools } = require('../web/web-tools');
 const { createDocumentTools } = require('../documents/document-tools');
+const { createWahaTools } = require('../channels/waha/waha-tools');
 
 class ToolRegistry {
   constructor() { this.tools = new Map(); }
@@ -49,6 +50,7 @@ function registerAllTools({
   approvalManager,
   waha,
   responseHandler = null,
+  sessionMonitor = null,
   memoryService,
   documentService,
   webSearch,
@@ -59,7 +61,8 @@ function registerAllTools({
     ...createMemoryTools({ db, memoryService }),
     ...createProductivityTools({ db, approvalManager }),
     ...createWebTools({ webSearch, webFetch }),
-    ...createDocumentTools({ db, documentService, approvalManager, waha, responseHandler })
+    ...createDocumentTools({ db, documentService, approvalManager, waha, responseHandler }),
+    ...createWahaTools({ waha, responseHandler, sessionMonitor })
   ];
   for (const tool of domainTools) {
     registry.register(tool);

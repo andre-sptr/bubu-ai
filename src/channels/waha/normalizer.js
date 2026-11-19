@@ -1,6 +1,45 @@
 const { normalizeJid } = require('../../config/env');
 
-function collectMentionIds(payload, info) {
+function extractIdString(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'object') {
+    if (typeof value._serialized === 'string' && value._serialized.trim()) return value._serialized.trim();
+    if (typeof value.id === 'string' && value.id.trim()) return value.id.trim();
+    if (value.id && typeof value.id === 'object') {
+      const nested = extractIdString(value.id);
+      if (nested) return nested;
+    }
+    if (typeof value.jid === 'string' && value.jid.trim()) return value.jid.trim();
+    if (typeof value.remoteJid === 'string' && value.remoteJid.trim()) return value.remoteJid.trim();
+    if (typeof value.user === 'string' && value.user.trim()) {
+      const server = typeof value.server === 'string' && value.server.trim() ? value.server.trim() : '';
+      return server ? `${value.user.trim()}@${server}` : value.user.trim();
+    }
+  }
+  return '';
+}
+
+function firstNonEmpty(values) {
+  return values.find((value) => typeof value === 'string' && value.trim())?.trim() || '';
+}
+
+function unwrapQuotedMessage(value) {
+  let current = value && typeof value === 'object' ? value : null;
+  for (let i = 0; i < 5 && current; i++) {
+    const wrapped = current.ephemeralMessage?.message ||
+      current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message ||
+      current.viewOnceMessageV2Extension?.message ||
+      current.documentWithCaptionMessage?.message;
+    if (!wrapped || typeof wrapped !== 'object') break;
+    current = wrapped;
+  }
+  return current || {};
+}
+
+function collectMentionIds(payload = {}, info = {}, messageSources = []) {
   const candidates = [
     payload.mentionedIds,
     payload.mentionIds,
@@ -21,6 +60,17 @@ function collectMentionIds(payload, info) {
     info.ContextInfo?.MentionedJID,
     info.ContextInfo?.MentionedJIDs
   ];
+  for (const source of messageSources) {
+    if (!source || typeof source !== 'object') continue;
+    const unwrapped = unwrapQuotedMessage(source);
+    candidates.push(
+      unwrapped.extendedTextMessage?.contextInfo?.mentionedJid,
+      unwrapped.imageMessage?.contextInfo?.mentionedJid,
+      unwrapped.videoMessage?.contextInfo?.mentionedJid,
+      unwrapped.documentMessage?.contextInfo?.mentionedJid,
+      unwrapped.audioMessage?.contextInfo?.mentionedJid
+    );
+  }
   const ids = new Set();
   const add = (value) => {
     if (!value) return;
@@ -45,35 +95,31 @@ function collectMentionIds(payload, info) {
   return [...ids].filter(Boolean);
 }
 
-function unwrapQuotedMessage(value) {
-  let current = value && typeof value === 'object' ? value : null;
-  for (let i = 0; i < 3 && current; i++) {
-    const wrapped = current.ephemeralMessage?.message ||
-      current.viewOnceMessage?.message ||
-      current.viewOnceMessageV2?.message ||
-      current.documentWithCaptionMessage?.message;
-    if (!wrapped || typeof wrapped !== 'object') break;
-    current = wrapped;
-  }
-  return current || {};
-}
-
 function extractQuoteContext({ payload, messageSources, currentChatId }) {
   const contexts = [];
-  for (const source of messageSources) {
-    if (!source || typeof source !== 'object') continue;
-    contexts.push(
-      source.extendedTextMessage?.contextInfo,
-      source.imageMessage?.contextInfo,
-      source.videoMessage?.contextInfo,
-      source.audioMessage?.contextInfo,
-      source.documentMessage?.contextInfo,
-      source.messageContextInfo
-    );
+  if (payload?.contextInfo && typeof payload.contextInfo === 'object') {
+    contexts.push(payload.contextInfo);
+  }
+  for (const rawSource of messageSources) {
+    if (!rawSource || typeof rawSource !== 'object') continue;
+    for (const source of [rawSource, unwrapQuotedMessage(rawSource)]) {
+      contexts.push(
+        source.extendedTextMessage?.contextInfo,
+        source.imageMessage?.contextInfo,
+        source.videoMessage?.contextInfo,
+        source.audioMessage?.contextInfo,
+        source.documentMessage?.contextInfo,
+        source.documentWithCaptionMessage?.message?.documentMessage?.contextInfo,
+        source.messageContextInfo,
+        source.contextInfo
+      );
+    }
   }
 
   const contextInfo = contexts.find((item) =>
     item && typeof item === 'object' && item.quotedMessage
+  ) || contexts.find((item) =>
+    item && typeof item === 'object' && (item.stanzaID || item.stanzaId)
   ) || null;
   const replyTo = payload.replyTo && typeof payload.replyTo === 'object'
     ? payload.replyTo : null;
@@ -83,7 +129,20 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
     replyTo?.quotedMessage ||
     null;
 
-  if (!quotedRaw || typeof quotedRaw !== 'object') {
+  const replyToBody = firstNonEmpty([
+    replyTo?.body,
+    replyTo?.text,
+    replyTo?.caption
+  ]);
+  const hasReplyToPayload = Boolean(
+    replyTo && (
+      replyToBody ||
+      replyTo.hasMedia === true ||
+      (replyTo.media && typeof replyTo.media === 'object')
+    )
+  );
+
+  if ((!quotedRaw || typeof quotedRaw !== 'object') && !hasReplyToPayload) {
     return { present: false, rejected: false };
   }
 
@@ -95,7 +154,7 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
     replyTo?.remoteJid,
     replyTo?._data?.Info?.Chat,
     replyTo?._data?.key?.remoteJid
-  ].filter((value) => typeof value === 'string' && value.trim());
+  ].map(extractIdString).filter(Boolean);
 
   const sameChat = explicitChatIds.every((id) =>
     normalizeJid(id) === normalizeJid(currentChatId)
@@ -104,34 +163,77 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
     return { present: false, rejected: true, reason: 'cross_chat_reference' };
   }
 
-  const quoted = unwrapQuotedMessage(quotedRaw);
-  const types = [
-    ['image', quoted.imageMessage],
-    ['video', quoted.videoMessage],
-    ['audio', quoted.audioMessage],
-    ['document', quoted.documentMessage],
-    ['text', quoted.extendedTextMessage],
-    ['text', typeof quoted.conversation === 'string' ? { text: quoted.conversation } : null]
-  ];
-  const entry = types.find(([, value]) => value && typeof value === 'object');
-  const type = entry?.[0] || 'unknown';
-  const content = entry?.[1] || {};
-  const quotedText = typeof content.text === 'string' ? content.text :
-    typeof content.caption === 'string' ? content.caption :
-    typeof content.title === 'string' ? content.title :
-    typeof content.fileName === 'string' ? content.fileName :
-    typeof content.filename === 'string' ? content.filename : '';
+  let type = 'unknown';
+  let quotedText = '';
+  let mimeType = '';
+  let hasMedia = false;
+
+  if (quotedRaw && typeof quotedRaw === 'object') {
+    const quoted = unwrapQuotedMessage(quotedRaw);
+    const types = [
+      ['image', quoted.imageMessage],
+      ['video', quoted.videoMessage],
+      ['audio', quoted.audioMessage],
+      ['document', quoted.documentMessage],
+      ['text', quoted.extendedTextMessage],
+      ['text', typeof quoted.conversation === 'string' ? { text: quoted.conversation } : null]
+    ];
+    const entry = types.find(([, value]) => value && typeof value === 'object');
+    type = entry?.[0] || 'unknown';
+    const content = entry?.[1] || {};
+    quotedText = firstNonEmpty([
+      content.text,
+      content.caption,
+      content.title,
+      content.fileName,
+      content.filename,
+      replyToBody
+    ]);
+    mimeType = String(content.mimetype || content.mimeType || '').slice(0, 120);
+    hasMedia = ['image', 'video', 'audio', 'document'].includes(type);
+  } else {
+    const replyMedia = replyTo?.media && typeof replyTo.media === 'object' ? replyTo.media : null;
+    mimeType = String(replyMedia?.mimetype || replyMedia?.mimeType || replyTo?.mimetype || '').slice(0, 120);
+    hasMedia = Boolean(replyTo?.hasMedia === true || replyMedia);
+    const mediaTypeHint = String(replyMedia?.mediaType || replyTo?.type || '').toLowerCase();
+    if (hasMedia) {
+      if (['image', 'video', 'audio', 'document'].includes(mediaTypeHint)) {
+        type = mediaTypeHint;
+      } else if (mimeType.startsWith('image/')) {
+        type = 'image';
+      } else if (mimeType.startsWith('video/')) {
+        type = 'video';
+      } else if (mimeType.startsWith('audio/')) {
+        type = 'audio';
+      } else {
+        type = 'document';
+      }
+      quotedText = replyToBody || String(replyMedia?.filename || replyMedia?.fileName || '').trim();
+    } else {
+      type = 'text';
+      quotedText = replyToBody;
+    }
+  }
+
+  const quotedMessageId = extractIdString(
+    contextInfo?.stanzaID || contextInfo?.stanzaId || replyTo?.id || ''
+  );
+  const quotedParticipant = extractIdString(
+    contextInfo?.participant || contextInfo?.Participant || replyTo?.participant || replyTo?.author || ''
+  );
 
   return {
     present: true,
     rejected: false,
     source: 'embedded_webhook',
     sameChat: true,
-    referenceIdPresent: Boolean(contextInfo?.stanzaID || contextInfo?.stanzaId || replyTo?.id),
+    referenceIdPresent: Boolean(quotedMessageId),
+    quotedMessageId,
+    quotedParticipant,
     type,
     text: quotedText.trim().slice(0, 4000),
-    mimeType: String(content.mimetype || content.mimeType || '').slice(0, 120),
-    hasMedia: ['image', 'video', 'audio', 'document'].includes(type)
+    mimeType,
+    hasMedia
   };
 }
 
@@ -139,12 +241,28 @@ function normalizeIncoming(body = {}) {
   const payload = body.payload || body.data || body;
   const data = payload._data || {};
   const info = data.Info || payload.Info || {};
-  const message = data.Message || data.RawMessage || payload.message || payload._data?.message || {};
-  const rawMessage = data.RawMessage || data.Message || payload.message || {};
-  const messageSources = [data.Message, data.RawMessage, payload.message, payload._data?.message]
+  const rawMessageSources = [data.Message, data.RawMessage, payload.message, payload._data?.message]
     .filter((item, index, all) => item && typeof item === 'object' && all.indexOf(item) === index);
-  const chatId = payload.from || payload.chatId || payload.chat?.id || info.Chat || '';
-  const senderId = payload.author || payload.participant || payload.sender?.id || info.Sender || chatId;
+  const message = unwrapQuotedMessage(data.Message || data.RawMessage || payload.message || payload._data?.message || {});
+  const rawMessage = unwrapQuotedMessage(data.RawMessage || data.Message || payload.message || {});
+  const messageSources = [...rawMessageSources];
+  for (const source of [message, rawMessage]) {
+    if (source && typeof source === 'object' && !messageSources.includes(source)) {
+      messageSources.push(source);
+    }
+  }
+
+  const chatId = extractIdString(payload.from) ||
+    extractIdString(payload.chatId) ||
+    extractIdString(payload.chat?.id) ||
+    extractIdString(payload.chat) ||
+    extractIdString(info.Chat) || '';
+  const senderId = extractIdString(payload.author) ||
+    extractIdString(payload.participant) ||
+    extractIdString(payload.sender?.id) ||
+    extractIdString(payload.sender) ||
+    extractIdString(info.Sender) ||
+    chatId;
 
   const nativeMediaCandidates = [
     ['image', message.imageMessage || rawMessage.imageMessage],
@@ -171,7 +289,9 @@ function normalizeIncoming(body = {}) {
       mimetype: source.mimetype || source.mimeType || nativeMedia?.mimetype ||
         nativeMedia?.mimeType || '',
       mediaType: info.MediaType || nativeKind || source.mediaType || '',
-      isPtt: nativeMedia?.PTT === true || source.isPtt === true,
+      isPtt: nativeMedia?.PTT === true || nativeMedia?.ptt === true ||
+        source.isPtt === true || source.ptt === true ||
+        String(info.MediaType || '').toLowerCase() === 'ptt',
       fileLength: source.fileLength ?? nativeMedia?.fileLength ?? null,
       durationSeconds: source.durationSeconds ?? nativeMedia?.seconds ?? null
     };
@@ -196,9 +316,6 @@ function normalizeIncoming(body = {}) {
     rawMessage.documentMessage?.caption,
     rawMessage.documentWithCaptionMessage?.message?.documentMessage?.caption
   ];
-  const firstNonEmpty = (values) => values.find((value) =>
-    typeof value === 'string' && value.trim()
-  )?.trim() || '';
   const bodyText = firstNonEmpty(bodyCandidates);
   const captionText = firstNonEmpty(captionCandidates);
   const text = [...new Set([bodyText, captionText].filter(Boolean))].join('\n\n');
@@ -211,23 +328,45 @@ function normalizeIncoming(body = {}) {
     String(info.MediaType || '').toLowerCase()
   );
 
-  const eventId = payload.id || payload.messageId || info.ID || data.ID || '';
+  const eventId = extractIdString(payload.id) ||
+    extractIdString(payload.messageId) ||
+    extractIdString(info.ID) ||
+    extractIdString(data.ID) || '';
   const fromMe = payload.fromMe === true || info.IsFromMe === true || body.me === true;
   const eventType = body.event || body.type || 'message';
   return {
-    chatId: String(chatId),
-    senderId: String(senderId),
+    chatId,
+    senderId,
     text: typeof text === 'string' ? text : '',
     bodyText,
     captionText,
     media,
     hasMedia,
     quote,
-    mentions: collectMentionIds(payload, info),
-    eventId: String(eventId),
+    mentions: collectMentionIds(payload, info, messageSources),
+    eventId,
     fromMe,
     eventType,
     raw: payload
+  };
+}
+
+function normalizeSessionStatus(body = {}) {
+  const payload = (body && typeof body.payload === 'object' && body.payload)
+    || (body && typeof body.data === 'object' && body.data)
+    || body
+    || {};
+  const rawStatus = payload.status || body?.status || '';
+  const status = String(rawStatus).trim().toUpperCase() || 'UNKNOWN';
+  const session = extractIdString(payload.name || payload.session || body?.session || 'default') || 'default';
+  const meId = extractIdString(body?.me?.id || body?.me || payload?.me?.id || payload?.me || '');
+  const timestamp = body?.timestamp ?? payload?.timestamp ?? null;
+  return {
+    eventType: String(body?.event || body?.type || 'session.status'),
+    session,
+    status,
+    meId: meId ? normalizeJid(meId) : '',
+    timestamp
   };
 }
 
@@ -235,5 +374,6 @@ module.exports = {
   collectMentionIds,
   unwrapQuotedMessage,
   extractQuoteContext,
-  normalizeIncoming
+  normalizeIncoming,
+  normalizeSessionStatus
 };

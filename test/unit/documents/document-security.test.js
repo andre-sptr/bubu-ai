@@ -165,3 +165,49 @@ test('DocumentService infers a missing filename extension from the declared MIME
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('DocumentService.downloadMedia sanitizes AxiosError credentials while preserving status and code', async () => {
+  const axios = require('axios');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-doc-axios-sanitize-'));
+  const service = new DocumentService({
+    db: {},
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000', apiKey: 'secret-waha-doc-key' },
+    storageDir: dir,
+    httpClient: {
+      get: async () => {
+        throw new axios.AxiosError(
+          'Request failed with status code 403',
+          'ERR_BAD_REQUEST',
+          { headers: { 'X-Api-Key': 'secret-waha-doc-key' } },
+          { socket: true },
+          { status: 403, config: { headers: { 'X-Api-Key': 'secret-waha-doc-key' } } }
+        );
+      }
+    }
+  });
+  try {
+    await assert.rejects(
+      () => service.downloadMedia('/api/files/secret.pdf', 'secret.pdf', 'application/pdf'),
+      (err) => {
+        assert.equal(err.status, 403);
+        assert.equal(err.response?.status, 403);
+        assert.equal(err.code, 'ERR_BAD_REQUEST');
+        assert.equal(err.config, undefined);
+        assert.equal(err.request, undefined);
+        assert.equal(JSON.stringify(err).includes('secret-waha-doc-key'), false);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('safeFilename keeps document extension when stem exceeds 100 chars and rejects dot names', () => {
+  const longName = `${'Proposal_Bisnis_Panjang_'.repeat(6)}.docx`;
+  const clean = safeFilename(longName);
+  assert.ok(clean.length <= 100);
+  assert.equal(clean.endsWith('.docx'), true);
+  assert.equal(safeFilename('.'), 'document');
+  assert.equal(safeFilename('..'), 'document');
+});

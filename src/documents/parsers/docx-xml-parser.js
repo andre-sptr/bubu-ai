@@ -1,5 +1,13 @@
 const zlib = require('node:zlib');
 
+const MAX_DOCX_XML_BYTES = 16 * 1024 * 1024;
+
+function safeFromCodePoint(codePoint, fallback) {
+  return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
+    ? String.fromCodePoint(codePoint)
+    : fallback;
+}
+
 function decodeXmlEntities(text) {
   return String(text || '')
     .replace(/&amp;/g, '&')
@@ -7,12 +15,12 @@ function decodeXmlEntities(text) {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
+    .replace(/&#x([0-9a-fA-F]+);/g, (match, hex) => safeFromCodePoint(Number.parseInt(hex, 16), match))
+    .replace(/&#(\d+);/g, (match, dec) => safeFromCodePoint(Number.parseInt(dec, 10), match));
 }
 
 function readZipEntryFromBuffer(zipBuffer, targetEntryName) {
-  const buf = Buffer.from(zipBuffer || []);
+  const buf = Buffer.isBuffer(zipBuffer) ? zipBuffer : Buffer.from(zipBuffer || []);
   let offset = 0;
   while (offset + 30 <= buf.length) {
     const signature = buf.readUInt32LE(offset);
@@ -40,7 +48,7 @@ function readZipEntryFromBuffer(zipBuffer, targetEntryName) {
     if (entryName === targetEntryName && dataEnd <= buf.length) {
       const rawData = buf.subarray(dataStart, dataEnd);
       if (compression === 0) return rawData.toString('utf8');
-      if (compression === 8) return zlib.inflateRawSync(rawData).toString('utf8');
+      if (compression === 8) return zlib.inflateRawSync(rawData, { maxOutputLength: MAX_DOCX_XML_BYTES }).toString('utf8');
       return null;
     }
     if (compressedSize === 0 && (flags & 0x08)) break;

@@ -89,3 +89,11 @@ test('preserves existing standalone WhatsApp bold such as approval headings', ()
     '*Konfirmasi pengiriman file Bubu*\nBalas /approve abc123.'
   );
 });
+
+test('literal legacy placeholder sentinels in input text do not collide with internal stash tokens', () => {
+  const input = 'Teks \u0001BUBU_MD_0\u0002 dengan **tebal** dan `kode` serta \u0001BUBU_MD_1\u0002.';
+  assert.equal(
+    formatWhatsAppText(input),
+    'Teks \u0001BUBU_MD_0\u0002 dengan *tebal* dan `kode` serta \u0001BUBU_MD_1\u0002.'
+  );
+});

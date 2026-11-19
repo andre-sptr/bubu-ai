@@ -127,3 +127,41 @@ test('worker uses configured stale-event recovery window', () => {
   assert.equal(recoveredWith, 45000);
   return worker.stop();
 });
+
+test('worker reports isHealthy() and runs throttled periodic stale recovery inside tick()', async () => {
+  const calls = [];
+  const worker = new InboxWorker({
+    db: {
+      recoverStaleEvents: (ms) => { calls.push(['events', ms]); return 1; },
+      recoverStaleApprovals: (ms) => { calls.push(['approvals', ms]); return 0; },
+      recoverStaleToolExecutions: (ms) => { calls.push(['tools', ms]); return 0; },
+      recoverStaleTaskResponses: (ms) => { calls.push(['responses', ms]); return 0; },
+      claimNextEvent: () => null
+    },
+    handler: async () => {},
+    logger: { warn: () => {}, error: () => {} },
+    staleMs: 30000,
+    staleSweepIntervalMs: 5000
+  });
+
+  assert.equal(worker.isHealthy(), true);
+  await worker.tick();
+  assert.deepEqual(calls, [
+    ['events', 30000],
+    ['approvals', 30000],
+    ['tools', 30000],
+    ['responses', 30000]
+  ]);
+
+  // Immediate second tick is throttled
+  await worker.tick();
+  assert.equal(calls.length, 4);
+
+  // Elapsed sweep interval triggers recovery again
+  worker.lastStaleSweepAt = Date.now() - 6000;
+  await worker.tick();
+  assert.equal(calls.length, 8);
+
+  await worker.stop();
+  assert.equal(worker.isHealthy(), false);
+});

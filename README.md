@@ -12,7 +12,7 @@ Rebuild bersih (tanpa kode atau data Bubu v1) untuk asisten AI WhatsApp hybrid (
 | **Phase 1** | Core Reliability & Response Control (Task 1.1–1.9) | **Selesai & Disetujui** | Antrean durable SQLite, idempotensi, unified `ResponseHandler`, isolasi DM/grup |
 | **Phase 2** | Full Multimodal WhatsApp (Task 2.1–2.8) | **Kode & Unit Test Selesai** | Pemahaman gambar/video ber-timestamp, STT + Silero VAD, Piper TTS & mode `/voice` |
 | **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Kode & Unit Test Selesai** | PDF hybrid + OCR, DOCX XML terstruktur, analitik spreadsheet, generasi DOCX/XLSX/PDF |
-| **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Direncanakan (Siap Mulai)** | Fitur outbound native WhatsApp lanjutan |
+| **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Kode & Unit Test Selesai** | Reaksi emoji, polling native, lokasi peta, kartu kontak vCard, info grup, cek nomor WhatsApp, & monitor sesi WAHA |
 | **Phase 5** | Advanced Agent & Memory Lifecycle (Task 5.1–5.8) | **Direncanakan** | Siklus hidup memori & orkestrasi agen lanjutan |
 | **Phase 6** | Queue Redesign & End-to-End Hardening (Task 6.1–6.8) | **Direncanakan** | Desain ulang antrean & pengerasan end-to-end |
 
@@ -76,7 +76,7 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 
 ---
 
-## 5. Kapabilitas Utama Saat Ini (Hingga Phase 3)
+## 5. Kapabilitas Utama Saat Ini (Hingga Phase 4)
 
 ### A. Keandalan Inti & Kontrol Respons (Phase 1)
 - **Antrean Inbox Durable (`InboxWorker`):** Deduplikasi event webhook, klaim atomik, retry eksponensial terbatas (`maxAttempts = 5`), transisi `dead`-letter dengan notifikasi aman, dan pemulihan event `stale` saat startup.
@@ -104,6 +104,11 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 - **Riset Web Aman:** `web_search` (opsional dengan `TAVILY_API_KEY`) dan `web_fetch` (memblokir IP privat/localhost dan kredensial URL).
 - **Memori Hibrida & Proyek:** Pencarian gabungan kemiripan kosinus + leksikal + signifikansi + kebaruan, ekstraksi memori konservatif berbasis sinyal eksplisit, serta manajemen task (`create_task`, `list_tasks`, `update_task`, `complete_task`) dan pengingat (`create_reminder`, `list_reminders`, `cancel_reminder`).
 
+### D. Fitur Native WhatsApp & Hardening Transport (Phase 4)
+- **Tools Native Outbound (`src/channels/waha/waha-tools.js`):** Mendukung reaksi emoji (`react_to_message`), polling native 2–12 opsi (`send_poll`), pin lokasi peta (`send_location`), serta kartu kontak vCard (`send_contact_card`). Seluruh pengiriman keluar tetap terpusat melalui `ResponseHandler` dengan `risk: 'external'` dan pelacakan `deliveryStatus`.
+- **Inspeksi Grup & Status Sesi Terisolasi Scope:** `get_group_info` hanya tersedia pada workspace grup (`@g.us`) dengan ringkasan peserta terikat batas; `check_whatsapp_number` dan `get_waha_session_status` dibatasi hanya untuk DM personal pemilik.
+- **Hardening Transport, Keamanan & Kehadiran WAHA:** Verifikasi webhook token dan opsional HMAC-SHA512 menggunakan `crypto.timingSafeEqual` sebelum parsing JSON penuh, monitor status `session.status` (`WahaSessionMonitor`) terhubung ke `/ready` dan `/status`, pengiriman media asinkron (`fs.promises.readFile`), redaksi kredensial di log Pino, typing keepalive berkala, serta reply-quote di grup.
+
 ---
 
 ## 6. Struktur Direktori Proyek
@@ -121,7 +126,7 @@ bubu/
 │   └── smoke-tool-calling.js               # Uji smoke tool calling
 ├── src/
 │   ├── agent/                              # Orkestrasi agen (Runtime, PromptBuilder, CommandHandler, MessageProcessor, ModelRouter, ApprovalManager, ToolRegistry)
-│   ├── channels/                           # Transport & formatting WhatsApp (ResponseHandler, WhatsAppFormatter, WAHA Client & Normalizer)
+│   ├── channels/                           # Transport & formatting WhatsApp (ResponseHandler, WhatsAppFormatter, WAHA Client, Normalizer, SessionMonitor & Tools)
 │   ├── config/                             # Konfigurasi environment & default produksi (env.js)
 │   ├── db/                                 # DatabaseStore, migrasi v1–v9 (migrations.js), dan 7 repository SQLite per domain (repositories/)
 │   ├── documents/                          # Layanan & tools dokumen (DocumentService, DocumentTools, parsers/, generators/)
@@ -136,7 +141,7 @@ bubu/
 │   └── index.js                            # Bootstrap aplikasi & graceful shutdown
 ├── storage/                                # Penyimpanan privat dokumen & media sementara (isi gitignored)
 └── test/
-    ├── contracts/                          # Kontrak regresi lintas-fase (phase1 & phase2)
+    ├── contracts/                          # Kontrak regresi lintas-fase (phase1, phase2, & phase4)
     ├── integration/                        # Tes integrasi SQLite & migrasi (database.test.js)
     └── unit/                               # Unit test terorganisir per domain (agent, channels, config, documents, media, memory, utils, web, workers)
 ```

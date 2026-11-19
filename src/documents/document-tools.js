@@ -5,8 +5,17 @@ const { ResponseHandler } = require('../channels/response-handler');
 const { readDocumentPages, searchDocumentSnippets } = require('./parsers/page-search');
 const { analyzeSpreadsheetText, compareDocumentTexts } = require('./parsers/spreadsheet-analyzer');
 
-function createDocumentTools({ db, documentService, approvalManager, waha, responseHandler = null }) {
-  const delivery = responseHandler || new ResponseHandler({ waha, logger: null });
+function isPathWithinDir(rootDir, targetPath) {
+  if (!rootDir || !targetPath) return false;
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedTarget = path.resolve(targetPath);
+  const relative = path.relative(resolvedRoot, resolvedTarget);
+  return Boolean(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function createDocumentTools({ db, documentService, approvalManager, waha, responseHandler = null, logger = null }) {
+  const log = logger || responseHandler?.logger || documentService?.logger || null;
+  const delivery = responseHandler || new ResponseHandler({ waha, logger: log });
   const tools = [];
 
   tools.push({
@@ -153,7 +162,6 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
         documentId: doc.id,
         filename: doc.filename,
         question: question || null,
-        extractedRows: doc.extracted_text,
         analysis
       };
     }
@@ -234,12 +242,10 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
       throw new Error('Dokumen tidak ditemukan pada workspace grup asal; pengiriman dibatalkan.');
     }
 
-    const storageRoot = path.resolve(documentService.storageDir);
-    const storedPath = path.resolve(stored.file_path);
-    const relativePath = path.relative(storageRoot, storedPath);
-    if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    if (!isPathWithinDir(documentService?.storageDir, stored.file_path)) {
       throw new Error('Lokasi file berada di luar storage Bubu; pengiriman dibatalkan.');
     }
+    const storedPath = path.resolve(stored.file_path);
 
     const stat = await fsp.stat(storedPath);
     if (!stat.isFile() || stat.size <= 0 || stat.size > documentService.maxFileBytes) {
@@ -268,7 +274,13 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
         messageId,
         message: 'File berhasil dibuat, disimpan di workspace grup, dan dikirim ke grup asal.'
       };
-    } catch {
+    } catch (error) {
+      log?.warn?.({
+        documentId: record.id,
+        chatId: ctx.chatId,
+        filename: stored.filename,
+        error: error?.message || 'Unknown WAHA delivery error'
+      }, 'Group document delivery failed');
       return {
         created: true,
         documentId: record.id,
@@ -461,10 +473,16 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
       if (typeof db.deleteDocument === 'function') {
         const removed = db.deleteDocument(documentId, ctx.scope, ownerId, chatId);
         if (!removed) throw new Error('Dokumen tidak ditemukan pada workspace ini.');
-        if (removed.file_path) {
-          await fsp.rm(removed.file_path, { force: true }).catch(() => {});
+        let fileRemoved = false;
+        if (isPathWithinDir(documentService?.storageDir, removed.file_path)) {
+          try {
+            await fsp.rm(path.resolve(removed.file_path), { force: true });
+            fileRemoved = true;
+          } catch (err) {
+            log?.warn?.({ documentId: removed.id, error: err.message }, 'Fallback document file removal failed');
+          }
         }
-        return { deleted: true, documentId: removed.id, filename: removed.filename, scope: removed.scope };
+        return { deleted: true, documentId: removed.id, filename: removed.filename, scope: removed.scope, fileRemoved };
       }
       throw new Error('Fitur penghapusan dokumen belum tersedia pada database runtime.');
     }

@@ -31,7 +31,10 @@ function timeout(promise, ms, label) {
   let timer;
   return Promise.race([
     promise,
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms); })
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+      timer.unref?.();
+    })
   ]).finally(() => clearTimeout(timer));
 }
 
@@ -45,7 +48,7 @@ class AgentRuntime {
     this.logger = logger;
   }
 
-  async run({ text, chatId, requesterId, scope, history = [], memories = [], projects = [], captionContext = null, voiceInstruction = null, attachmentEvidence = null, quoteContext = null, sourceEventId = null }) {
+  async run({ text, chatId, requesterId, scope, history = [], memories = [], projects = [], captionContext = null, voiceInstruction = null, attachmentEvidence = null, quoteContext = null, sourceEventId = null, incomingMessageId = null }) {
     const taskId = stableTaskId(sourceEventId, text);
     const existingTask = this.db.getTask(taskId);
     if (existingTask?.status === 'completed') {
@@ -65,6 +68,16 @@ class AgentRuntime {
         toolCalls: existingTask.tool_calls || 0, awaitingApproval: true, replayed: true
       };
     }
+    if (existingTask?.status === 'uncertain') {
+      const notice = 'Status tindakan sebelumnya belum dapat dipastikan. Bubu tidak akan mengulang tindakan otomatis untuk mencegah duplikasi. Periksa statusnya terlebih dahulu.';
+      this.db.queueTaskResponse(taskId, notice);
+      return { taskId, task: classifyTask(text), tier: existingTask.model_tier, text: notice, toolCalls: existingTask.tool_calls || 0, uncertain: true, replayed: true };
+    }
+    if (existingTask?.status === 'cancelled') {
+      const notice = 'Task sebelumnya sudah dibatalkan atau persetujuannya kedaluwarsa. Kirim instruksi baru jika ingin memulai kembali.';
+      this.db.queueTaskResponse(taskId, notice);
+      return { taskId, task: classifyTask(text), tier: existingTask.model_tier, text: notice, toolCalls: existingTask.tool_calls || 0, replayed: true };
+    }
     const orphanedApproval = this.db.getPendingApprovalForTask(taskId);
     if (orphanedApproval) {
       const message = formatApprovalPrompt({
@@ -79,16 +92,6 @@ class AgentRuntime {
         text: message, awaitingApproval: true, replayed: true
       };
     }
-    if (existingTask?.status === 'uncertain') {
-      const notice = 'Status tindakan sebelumnya belum dapat dipastikan. Bubu tidak akan mengulang tindakan otomatis untuk mencegah duplikasi. Periksa statusnya terlebih dahulu.';
-      this.db.queueTaskResponse(taskId, notice);
-      return { taskId, task: classifyTask(text), tier: existingTask.model_tier, text: notice, toolCalls: existingTask.tool_calls || 0, uncertain: true, replayed: true };
-    }
-    if (existingTask?.status === 'cancelled') {
-      const notice = 'Task sebelumnya sudah dibatalkan atau persetujuannya kedaluwarsa. Kirim instruksi baru jika ingin memulai kembali.';
-      this.db.queueTaskResponse(taskId, notice);
-      return { taskId, task: classifyTask(text), tier: existingTask.model_tier, text: notice, toolCalls: existingTask.tool_calls || 0, replayed: true };
-    }
 
     const task = classifyTask([text, captionContext, voiceInstruction].filter(Boolean).join('\n'));
     const hasVisualImages = Array.isArray(attachmentEvidence?.visualImages) && attachmentEvidence.visualImages.length > 0;
@@ -96,8 +99,11 @@ class AgentRuntime {
       task,
       hasVisualImages ? { needsTools: true, needsVision: true } : { needsTools: true }
     );
-    const context = { taskId, chatId, requesterId, scope };
+    const context = { taskId, chatId, requesterId, scope, incomingMessageId };
     this.db.createTask({ id: taskId, sourceEventId, chatId, requesterId, scope, requestText: text });
+    if (existingTask?.status === 'failed') {
+      this.db.updateTask(taskId, { status: 'running', error: null });
+    }
 
     const pendingApprovals = this.db.getPendingApprovalsForChat
       ? this.db.getPendingApprovalsForChat(chatId)
@@ -133,8 +139,7 @@ class AgentRuntime {
 
     let calls = 0;
     let step = this.db.countTaskSteps(taskId);
-    let lastInvalidToolSignature = null;
-    let repeatedInvalidToolCalls = 0;
+    const consecutiveSchemaErrorsByTool = new Map();
     let visionFallbackApplied = false;
     const started = Date.now();
     const deadline = started + this.config.agent.taskTimeoutMs;
@@ -157,11 +162,10 @@ class AgentRuntime {
             maxTokens: this.config.agent.maxOutputTokens || 4096
           }), remainingMs, 'Model request');
         } catch (providerError) {
-          const status = providerError?.response?.status;
-          const canFallbackToOcr = round === 0 &&
-            hasVisualImages &&
+          const status = providerError?.status || providerError?.statusCode || providerError?.response?.status;
+          const canFallbackToOcr = hasVisualImages &&
             !visionFallbackApplied &&
-            (status === 400 || status === 415 || status === 422 || /visual|image_url|multimodal/i.test(providerError.message || ''));
+            (status === 400 || status === 413 || status === 415 || status === 422 || /visual|image_url|multimodal/i.test(providerError.message || ''));
           if (!canFallbackToOcr) throw providerError;
           visionFallbackApplied = true;
           this.logger.warn({
@@ -261,13 +265,16 @@ class AgentRuntime {
           }
 
           const name = call.function?.name;
+          const toolKey = name || 'unknown';
           const tool = this.tools.get(name);
           const startedTool = Date.now();
           let result;
+          let currentToolSchemaErrors = 0;
 
           let idempotencyKey = null;
           if (!tool || !tool.scopes.includes(scope)) {
             result = { error: 'Tool is not available in this workspace' };
+            consecutiveSchemaErrorsByTool.delete(toolKey);
           } else {
             try {
               const args = tool.schema.parse(parseArguments(call.function.arguments));
@@ -290,7 +297,7 @@ class AgentRuntime {
                   result = await timeout(tool.execute(args, context), toolBudget, `Tool ${name}`);
                   this.db.completeToolExecution(idempotencyKey, result);
                 } catch (error) {
-                  const uncertain = tool.risk === 'external';
+                  const uncertain = tool.risk === 'external' && error?.deliveryStatus !== 'failed';
                   this.db.failToolExecution(idempotencyKey, error.message, uncertain);
                   if (uncertain) {
                     const notice = 'Pengiriman/permintaan eksternal mengalami hasil yang tidak pasti. Bubu tidak akan mengulang tindakan otomatis. Periksa WhatsApp sebelum mencoba lagi.';
@@ -301,23 +308,21 @@ class AgentRuntime {
                   throw error;
                 }
               }
+              consecutiveSchemaErrorsByTool.delete(toolKey);
             } catch (error) {
               result = { error: error.message || 'Tool execution failed' };
 
               // Model-generated schema errors are not transient tool failures.
-              // If the model repeats the exact invalid call, stop the loop and
-              // return a useful response instead of retrying the webhook forever.
+              // If the model repeats invalid calls for the same tool, stop the loop
+              // and return a useful response instead of retrying the webhook forever.
               const isSchemaError = error?.name === 'ZodError' ||
-                /invalid_type|Required|Expected .*received/i.test(error.message || '');
+                error?.message === 'Tool arguments were not valid JSON' ||
+                /Tool arguments were not valid JSON|invalid_type|Required|Expected .*received|Unrecognized key|Expected (?:string|number|boolean|null|array|object|one of)|Invalid union/i.test(error?.message || '');
               if (isSchemaError) {
-                const rawArgs = String(call.function?.arguments || '{}');
-                const signature = crypto.createHash('sha256')
-                  .update(`${name || 'unknown'}|${rawArgs}`).digest('hex');
-                if (signature === lastInvalidToolSignature) repeatedInvalidToolCalls++;
-                else {
-                  lastInvalidToolSignature = signature;
-                  repeatedInvalidToolCalls = 1;
-                }
+                currentToolSchemaErrors = (consecutiveSchemaErrorsByTool.get(toolKey) || 0) + 1;
+                consecutiveSchemaErrorsByTool.set(toolKey, currentToolSchemaErrors);
+              } else {
+                consecutiveSchemaErrorsByTool.delete(toolKey);
               }
             }
           }
@@ -330,13 +335,16 @@ class AgentRuntime {
             durationMs: Date.now() - startedTool
           });
           this.db.audit({
-            chatId, actorId: requesterId, action: `tool:${name || 'unknown'}`,
+            chatId, actorId: requesterId, action: `tool:${toolKey}`,
             outcome: result?.error ? 'failed' : 'completed',
             details: { taskId, scope }
           });
 
-          if (repeatedInvalidToolCalls >= 2) {
-            const notice = 'Bubu belum dapat membuat dokumen karena model mengirim parameter tool yang tidak lengkap berulang kali. Tidak ada file yang dibuat. Silakan ulangi permintaan dengan menyebutkan jenis dokumen dan informasi utamanya, atau coba beberapa saat lagi.';
+          if (currentToolSchemaErrors >= 2) {
+            const isDocTool = ['create_document', 'create_pdf', 'create_spreadsheet'].includes(name);
+            const notice = isDocTool
+              ? 'Bubu belum dapat membuat dokumen karena model mengirim parameter tool yang tidak lengkap berulang kali. Tidak ada file yang dibuat. Silakan ulangi permintaan dengan menyebutkan jenis dokumen dan informasi utamanya, atau coba beberapa saat lagi.'
+              : `Bubu belum dapat menjalankan tindakan (${toolKey}) karena model mengirim parameter tool yang tidak lengkap berulang kali. Tidak ada tindakan yang dijalankan. Silakan ulangi permintaan dengan informasi yang lebih spesifik, atau coba beberapa saat lagi.`;
             this.db.updateTask(taskId, {
               status: 'completed', result_text: notice,
               model_tier: selected.tier, tool_calls: calls
@@ -344,7 +352,7 @@ class AgentRuntime {
             this.db.queueTaskResponse(taskId, notice);
             this.logger.warn({
               taskId, toolName: name,
-              repeatedInvalidToolCalls,
+              repeatedInvalidToolCalls: currentToolSchemaErrors,
               argumentBytes: Buffer.byteLength(String(call.function?.arguments || '{}'))
             }, 'Stopping repeated invalid tool-call loop');
             return { taskId, task, tier: selected.tier, model: completion.model, text: notice, toolCalls: calls, toolValidationLoop: true };
@@ -360,7 +368,8 @@ class AgentRuntime {
             return { taskId, task, tier: selected.tier, model: completion.model, text: message, toolCalls: calls, awaitingApproval: true };
           }
 
-          const toolContent = JSON.stringify(result).slice(0, this.config.agent.maxToolResultChars);
+          const serializedResult = JSON.stringify(result === undefined ? null : result) ?? 'null';
+          const toolContent = serializedResult.slice(0, this.config.agent.maxToolResultChars);
           messages.push({ role: 'tool', tool_call_id: call.id, content: toolContent });
         }
       }

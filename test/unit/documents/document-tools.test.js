@@ -193,3 +193,120 @@ test('group file delivery refuses non-group targets before generating a file', a
   assert.equal(h.generated.docx, 0);
   assert.equal(h.sendCalls.length, 0);
 });
+
+test('analyze_spreadsheet omits redundant raw extracted_text so analysis survives 12KB truncation', async (t) => {
+  const h = harness();
+  t.after(h.cleanup);
+  const rows = ['Item,Nominal'];
+  for (let i = 1; i <= 1500; i++) {
+    rows.push(`Item-${String(i).padStart(4, '0')},${i * 1000}`);
+  }
+  const bigCsv = rows.join('\n');
+  assert.ok(bigCsv.length > 20000);
+
+  const docId = '33333333-3333-4333-8333-333333333333';
+  const tools = createDocumentTools({
+    db: {
+      getDocument: () => ({
+        id: docId,
+        filename: 'big.csv',
+        extracted_text: bigCsv
+      })
+    },
+    documentService: { storageDir: h.storageDir, maxFileBytes: 5 * 1024 * 1024 },
+    approvalManager: { create: async () => ({}) },
+    waha: { sendFile: async () => ({}) }
+  });
+
+  const analyzeTool = tools.find((item) => item.name === 'analyze_spreadsheet');
+  const result = await analyzeTool.execute(
+    { documentId: docId, question: 'Berapa total Nominal?' },
+    { scope: 'personal', requesterId: 'owner@c.us', chatId: 'owner@c.us' }
+  );
+
+  assert.equal('extractedRows' in result, false);
+  const truncated = JSON.parse(JSON.stringify(result).slice(0, 12000) + '');
+  assert.equal(typeof result.analysis, 'object');
+  assert.equal(result.analysis.totalRows, 1500);
+  const nominalCol = result.analysis.columns.find((c) => c.name === 'Nominal');
+  assert.equal(nominalCol.numericStats.count, 1500);
+  const serialized = JSON.stringify(result);
+  assert.ok(serialized.indexOf('"analysis"') < 200);
+  assert.ok(serialized.slice(0, 12000).includes('"numericStats"'));
+  assert.ok(truncated.documentId === docId);
+});
+
+test('delete_document fallback enforces storageDir containment and group WAHA errors are logged', async (t) => {
+  const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-doc-tools-hardening-'));
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-doc-tools-outside-'));
+  t.after(() => {
+    fs.rmSync(storageDir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  const outsideFile = path.join(outsideDir, 'secret.txt');
+  fs.writeFileSync(outsideFile, 'keep-me');
+  const insideFile = path.join(storageDir, 'inside.txt');
+  fs.writeFileSync(insideFile, 'delete-me');
+
+  const warnLogs = [];
+  const docMap = new Map([
+    ['44444444-4444-4444-8444-444444444444', { id: '44444444-4444-4444-8444-444444444444', scope: 'personal', filename: 'outside.txt', file_path: outsideFile }],
+    ['55555555-5555-4555-8555-555555555555', { id: '55555555-5555-4555-8555-555555555555', scope: 'personal', filename: 'inside.txt', file_path: insideFile }]
+  ]);
+
+  const tools = createDocumentTools({
+    db: {
+      deleteDocument: (id) => {
+        const rec = docMap.get(id) || null;
+        docMap.delete(id);
+        return rec;
+      },
+      saveDocument: (doc) => ({ id: doc.id, scope: doc.scope, filename: doc.filename }),
+      getDocumentFile: (id) => ({
+        id, scope: 'group', chat_id: '120363000000000000@g.us',
+        filename: 'doc.docx', mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        file_path: insideFile, file_size: 9
+      })
+    },
+    documentService: {
+      storageDir,
+      maxFileBytes: 1024 * 1024,
+      createDocx: async () => Buffer.from('docx-data'),
+      persistGenerated: async ({ buffer, filename, mimeType }) => {
+        const fp = path.join(storageDir, filename);
+        fs.writeFileSync(fp, buffer);
+        return { id: '66666666-6666-4666-8666-666666666666', filePath: fp, filename, mimeType, fileSize: buffer.length };
+      }
+    },
+    approvalManager: { create: async () => ({}) },
+    waha: {
+      sendFile: async () => { throw new Error('WAHA upload timed out'); }
+    },
+    logger: { warn: (meta, msg) => warnLogs.push({ meta, msg }) }
+  });
+
+  const deleteTool = tools.find((item) => item.name === 'delete_document');
+  const outsideRes = await deleteTool.execute(
+    { documentId: '44444444-4444-4444-8444-444444444444' },
+    { scope: 'personal', requesterId: 'owner@c.us', chatId: 'owner@c.us' }
+  );
+  assert.equal(outsideRes.fileRemoved, false);
+  assert.equal(fs.existsSync(outsideFile), true);
+
+  const insideRes = await deleteTool.execute(
+    { documentId: '55555555-5555-4555-8555-555555555555' },
+    { scope: 'personal', requesterId: 'owner@c.us', chatId: 'owner@c.us' }
+  );
+  assert.equal(insideRes.fileRemoved, true);
+  assert.equal(fs.existsSync(insideFile), false);
+
+  fs.writeFileSync(insideFile, 'docx-data');
+  const createTool = tools.find((item) => item.name === 'create_document');
+  const groupRes = await createTool.execute(
+    { title: 'Tes Log', content: 'Isi dokumen' },
+    { taskId: 't1', scope: 'group', chatId: '120363000000000000@g.us', requesterId: 'member@c.us' }
+  );
+  assert.equal(groupRes.deliveryStatus, 'uncertain');
+  assert.equal(warnLogs.some((entry) => /Group document delivery failed/.test(entry.msg)), true);
+});

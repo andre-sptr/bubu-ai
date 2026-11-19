@@ -195,13 +195,15 @@ test('transcribeAudio invokes FFmpeg normalization and configured Silero VAD bef
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stt-vad-'));
   const input = path.join(dir, 'voice.ogg');
   fs.writeFileSync(input, 'fixture');
+  const model = path.join(dir, 'ggml-base.bin');
+  fs.writeFileSync(model, 'model-fixture');
   const vad = path.join(dir, 'silero.bin');
   fs.writeFileSync(vad, 'vad-fixture');
   const calls = [];
   const service = new MediaIntelligenceService({
     wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
     storageDir: dir,
-    whisperModelPath: '/models/ggml-base.bin',
+    whisperModelPath: model,
     whisperVadModelPath: vad,
     commandRunner: async (command, args) => {
       calls.push({ command, args });
@@ -235,12 +237,14 @@ test('transcribeAudio returns empty string when VAD produces no speech segments'
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stt-silent-'));
   const input = path.join(dir, 'silent.wav');
   fs.writeFileSync(input, 'fixture');
+  const model = path.join(dir, 'ggml-base.bin');
+  fs.writeFileSync(model, 'model-fixture');
   const vad = path.join(dir, 'silero.bin');
   fs.writeFileSync(vad, 'vad-fixture');
   const service = new MediaIntelligenceService({
     wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
     storageDir: dir,
-    whisperModelPath: '/models/ggml-base.bin',
+    whisperModelPath: model,
     whisperVadModelPath: vad,
     commandRunner: async (command, args) => {
       if (command === 'ffprobe') return { stdout: '8' };
@@ -262,10 +266,12 @@ test('transcribeAudio fails closed when VAD model path is missing', async () => 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stt-no-vad-'));
   const input = path.join(dir, 'voice.wav');
   fs.writeFileSync(input, 'fixture');
+  const model = path.join(dir, 'ggml-base.bin');
+  fs.writeFileSync(model, 'model-fixture');
   const service = new MediaIntelligenceService({
     wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
     storageDir: dir,
-    whisperModelPath: '/models/ggml-base.bin',
+    whisperModelPath: model,
     whisperVadModelPath: ''
   });
   try {
@@ -297,4 +303,153 @@ test('processAudio marks VAD-empty result as noSpeech instead of inventing a tra
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('transcribeAudio fails closed when whisperModelPath file does not exist', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stt-missing-model-'));
+  const input = path.join(dir, 'voice.wav');
+  const vad = path.join(dir, 'silero.bin');
+  fs.writeFileSync(input, 'fixture');
+  fs.writeFileSync(vad, 'vad-fixture');
+  const service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    whisperModelPath: path.join(dir, 'missing-model.bin'),
+    whisperVadModelPath: vad
+  });
+  try {
+    await assert.rejects(
+      () => service.transcribeAudio(input, dir),
+      /Model Whisper tidak ditemukan/
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('synthesizeSpeech validates piperModelPath, non-empty text, and non-empty OGG output', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-tts-validate-'));
+  const piperModel = path.join(dir, 'id.onnx');
+  fs.writeFileSync(piperModel, 'onnx-fixture');
+  try {
+    const missingModelService = new MediaIntelligenceService({
+      wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+      storageDir: dir,
+      piperModelPath: path.join(dir, 'missing.onnx')
+    });
+    await assert.rejects(
+      () => missingModelService.synthesizeSpeech('Halo', dir),
+      /Model Piper TTS tidak ditemukan/
+    );
+
+    const emptyOutputService = new MediaIntelligenceService({
+      wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+      storageDir: dir,
+      piperModelPath: piperModel,
+      commandRunner: async () => ({ stdout: '', stderr: '' })
+    });
+    await assert.rejects(
+      () => emptyOutputService.synthesizeSpeech('   \n  ', dir),
+      /kosong/
+    );
+    await assert.rejects(
+      () => emptyOutputService.synthesizeSpeech('Halo Bubu', dir),
+      /kosong atau tidak valid/
+    );
+
+    const okService = new MediaIntelligenceService({
+      wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+      storageDir: dir,
+      piperModelPath: piperModel,
+      commandRunner: async (cmd, args) => {
+        if (cmd === 'ffmpeg') fs.writeFileSync(args[args.length - 1], 'OggS-audio');
+        return { stdout: '', stderr: '' };
+      }
+    });
+    const voice = await okService.synthesizeSpeech('Halo Bubu', dir);
+    assert.equal(voice.filename, 'bubu-voice.ogg');
+    assert.equal(fs.existsSync(voice.filePath), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('MediaIntelligenceService.download sanitizes AxiosError credentials while preserving status and code', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-media-axios-sanitize-'));
+  const axios = require('axios');
+  const service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000', apiKey: 'secret-waha-key' },
+    storageDir: dir,
+    httpClient: {
+      get: async () => {
+        throw new axios.AxiosError(
+          'Request failed with status code 401',
+          'ERR_BAD_REQUEST',
+          { headers: { 'X-Api-Key': 'secret-waha-key' } },
+          { socket: true },
+          { status: 401, config: { headers: { 'X-Api-Key': 'secret-waha-key' } } }
+        );
+      }
+    }
+  });
+  try {
+    await assert.rejects(
+      () => service.download({ url: '/api/files/photo.jpg', filename: 'photo.jpg', mimetype: 'image/jpeg' }),
+      (err) => {
+        assert.equal(err.status, 401);
+        assert.equal(err.response?.status, 401);
+        assert.equal(err.code, 'ERR_BAD_REQUEST');
+        assert.equal(err.config, undefined);
+        assert.equal(err.request, undefined);
+        assert.equal(JSON.stringify(err).includes('secret-waha-key'), false);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('processIncoming cleans up empty inbound hex subdirectories safely', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-inbound-cleanup-'));
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xd9]);
+  const service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    visionEnabled: false,
+    httpClient: {
+      get: async () => ({
+        status: 200,
+        data: jpeg,
+        headers: { 'content-type': 'image/jpeg', 'content-length': String(jpeg.length) }
+      })
+    },
+    commandRunner: async () => ({ stdout: 'OCR text', stderr: '' })
+  });
+  try {
+    await service.processIncoming({
+      media: { url: '/api/files/photo.jpg', filename: 'photo.jpg', mimetype: 'image/jpeg' }
+    });
+    const inboundDir = path.join(dir, 'inbound');
+    assert.deepEqual(fs.readdirSync(inboundDir), []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('validateMediaSignature avoids copying Buffer and handles Uint8Array inputs', () => {
+  const origFrom = Buffer.from;
+  let bufferFromCalls = 0;
+  Buffer.from = (...args) => {
+    bufferFromCalls++;
+    return origFrom(...args);
+  };
+  try {
+    const jpeg = origFrom([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+    assert.equal(validateMediaSignature(jpeg, '.jpg', 'image'), true);
+    assert.equal(bufferFromCalls, 0);
+  } finally {
+    Buffer.from = origFrom;
+  }
+  assert.equal(validateMediaSignature(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), '.jpg', 'image'), true);
 });

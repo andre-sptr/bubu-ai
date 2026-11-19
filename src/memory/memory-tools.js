@@ -12,22 +12,31 @@ function createMemoryTools({ db, memoryService }) {
         properties: { content: { type: 'string' }, kind: { type: 'string' } },
         required: ['content']
       },
-      execute: async ({ content, kind }, ctx) => memoryService
-        ? memoryService.remember({
+      execute: async ({ content, kind }, ctx) => {
+        const noteKind = String(kind || 'note').trim() || 'note';
+        if (memoryService) {
+          return memoryService.remember({
             scope: ctx.scope,
             ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
             chatId: ctx.scope === 'group' ? ctx.chatId : null,
-            content, title: null, memoryType: 'fact', source: 'save_note_tool'
+            content,
+            title: null,
+            kind: noteKind,
+            memoryType: noteKind,
+            source: 'save_note_tool'
+          });
+        }
+        return {
+          saved: true,
+          noteId: db.saveMemory({
+            scope: ctx.scope,
+            ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
+            chatId: ctx.scope === 'group' ? ctx.chatId : null,
+            content,
+            kind: noteKind
           })
-        : ({
-            saved: true,
-            noteId: db.saveMemory({
-              scope: ctx.scope,
-              ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-              chatId: ctx.scope === 'group' ? ctx.chatId : null,
-              content, kind
-            })
-          })
+        };
+      }
     },
     {
       name: 'search_notes',

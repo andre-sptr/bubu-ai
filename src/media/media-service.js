@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { runCommand } = require('../utils/process-runner');
 const {
   safeFilename,
+  sanitizeAxiosError,
   normalizeMediaUrl,
   normalizeMimeType,
   validateResponseMime
@@ -22,6 +23,18 @@ const {
   resolveMediaExtension,
   formatTimestampSeconds
 } = require('./media-validator');
+
+async function cleanupInboundFile(filePath, storageDir) {
+  if (!filePath) return;
+  await fsp.rm(filePath, { force: true }).catch(() => {});
+  if (!storageDir) return;
+  const inboundRoot = path.resolve(storageDir, 'inbound');
+  const parentDir = path.resolve(path.dirname(filePath));
+  const rel = path.relative(inboundRoot, parentDir);
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+    await fsp.rmdir(parentDir).catch(() => {});
+  }
+}
 
 class MediaIntelligenceService {
   constructor({
@@ -73,14 +86,19 @@ class MediaIntelligenceService {
       filename = `${path.basename(filename, path.extname(filename))}${ext}`;
     }
     const axios = this.httpClient || require('axios');
-    const response = await axios.get(url.toString(), {
-      responseType: 'arraybuffer',
-      timeout: 45000,
-      maxContentLength: this.maxFileBytes,
-      maxBodyLength: this.maxFileBytes,
-      maxRedirects: 0,
-      headers: this.wahaConfig.apiKey ? { 'X-Api-Key': this.wahaConfig.apiKey } : {}
-    });
+    let response;
+    try {
+      response = await axios.get(url.toString(), {
+        responseType: 'arraybuffer',
+        timeout: 45000,
+        maxContentLength: this.maxFileBytes,
+        maxBodyLength: this.maxFileBytes,
+        maxRedirects: 0,
+        headers: this.wahaConfig.apiKey ? { 'X-Api-Key': this.wahaConfig.apiKey } : {}
+      });
+    } catch (error) {
+      throw sanitizeAxiosError(error);
+    }
 
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Unduhan media ditolak dengan HTTP ${response.status}. Redirect tidak diikuti.`);
@@ -115,8 +133,7 @@ class MediaIntelligenceService {
     try {
       await fsp.writeFile(filePath, buffer, { mode: 0o600, flag: 'wx' });
     } catch (error) {
-      await fsp.rm(filePath, { force: true }).catch(() => {});
-      await fsp.rmdir(folder).catch(() => {});
+      await cleanupInboundFile(filePath, this.storageDir);
       throw error;
     }
 
@@ -147,6 +164,9 @@ class MediaIntelligenceService {
   async transcribeAudio(filePath, workDir) {
     if (!this.whisperModelPath) {
       throw new Error('Transkripsi suara belum aktif. Isi WHISPER_MODEL_PATH pada .env.');
+    }
+    if (!fs.existsSync(this.whisperModelPath)) {
+      throw new Error('Model Whisper tidak ditemukan pada WHISPER_MODEL_PATH.');
     }
     if (!this.whisperVadModelPath) {
       throw new Error('Silero VAD belum dikonfigurasi. Isi WHISPER_VAD_MODEL_PATH pada .env.');
@@ -309,7 +329,7 @@ class MediaIntelligenceService {
     };
   }
 
-  async processVideo(file, workDir, { declaredDurationSeconds = null } = {}) {
+  async processVideo(file, workDir, { declaredDurationSeconds = null, audioLockOwned = false } = {}) {
     const probedDuration = await this.getDuration(file.filePath).catch(() => null);
     const declaredDuration = Number.isFinite(Number(declaredDurationSeconds)) && Number(declaredDurationSeconds) > 0
       ? Number(declaredDurationSeconds)
@@ -380,15 +400,33 @@ class MediaIntelligenceService {
 
     let transcript = '';
     const audioPath = path.join(workDir, 'video-audio.wav');
-    await this.commandRunner(this.ffmpegBin, [
-      '-nostdin', '-y', '-i', file.filePath, '-vn', '-t', String(this.maxVideoSeconds),
-      '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', audioPath
-    ], { timeoutMs: 90000, maxOutput: 100000 }).catch(() => null);
-    if (fs.existsSync(audioPath) && this.whisperModelPath) {
-      transcript = await this.transcribeAudio(audioPath, workDir).catch((error) => {
-        this.logger?.warn({ error: error.message }, 'Video audio transcription failed');
-        return '';
-      });
+    if (this.whisperModelPath && this.whisperVadModelPath &&
+        fs.existsSync(this.whisperModelPath) && fs.existsSync(this.whisperVadModelPath)) {
+      let acquiredAudioLock = false;
+      if (!audioLockOwned) {
+        if (this.audioBusy) {
+          this.logger?.warn?.('Audio processor busy; skipping video soundtrack transcription');
+        } else {
+          this.audioBusy = true;
+          acquiredAudioLock = true;
+        }
+      }
+      if (audioLockOwned || acquiredAudioLock) {
+        try {
+          await this.commandRunner(this.ffmpegBin, [
+            '-nostdin', '-y', '-i', file.filePath, '-vn', '-t', String(this.maxVideoSeconds),
+            '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', audioPath
+          ], { timeoutMs: 90000, maxOutput: 100000 }).catch(() => null);
+          if (fs.existsSync(audioPath)) {
+            transcript = await this.transcribeAudio(audioPath, workDir).catch((error) => {
+              this.logger?.warn({ error: error.message }, 'Video audio transcription failed');
+              return '';
+            });
+          }
+        } finally {
+          if (acquiredAudioLock) this.audioBusy = false;
+        }
+      }
     }
 
     const hasVisualFrames = visualImages.length > 0;
@@ -443,40 +481,57 @@ class MediaIntelligenceService {
     const isAudio = file.kind === 'audio';
     const isVideo = file.kind === 'video';
     if (isAudio && this.audioBusy) {
-      await fsp.rm(file.filePath, { force: true }).catch(() => {});
+      await cleanupInboundFile(file.filePath, this.storageDir);
       throw new Error('Audio processing sedang sibuk. Silakan coba kembali beberapa saat lagi.');
     }
     if (isVideo && (this.videoBusy || (this.whisperModelPath && this.audioBusy))) {
-      await fsp.rm(file.filePath, { force: true }).catch(() => {});
+      await cleanupInboundFile(file.filePath, this.storageDir);
       throw new Error('Video processing sedang sibuk. Silakan coba kembali beberapa saat lagi.');
     }
-    if (isAudio) this.audioBusy = true;
+    const locksAudio = isAudio || (isVideo && Boolean(this.whisperModelPath));
+    if (locksAudio) this.audioBusy = true;
     if (isVideo) this.videoBusy = true;
     try {
       workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'bubu-p3-'));
       let result;
       if (file.kind === 'image') result = await this.processImage(file, workDir);
       else if (file.kind === 'audio') result = await this.processAudio(file, workDir);
-      else if (file.kind === 'video') result = await this.processVideo(file, workDir, { declaredDurationSeconds: media?.durationSeconds ?? media?.duration });
+      else if (file.kind === 'video') {
+        result = await this.processVideo(file, workDir, {
+          declaredDurationSeconds: media?.durationSeconds ?? media?.duration,
+          audioLockOwned: locksAudio
+        });
+      }
       return { ...result, mediaId: file.id, fileSize: file.fileSize };
     } finally {
       if (workDir) await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
-      await fsp.rm(file.filePath, { force: true }).catch(() => {});
-      if (isAudio) this.audioBusy = false;
+      await cleanupInboundFile(file.filePath, this.storageDir);
+      if (locksAudio) this.audioBusy = false;
       if (isVideo) this.videoBusy = false;
     }
   }
 
   async synthesizeSpeech(text, workDir) {
     if (!this.piperModelPath) throw new Error('Voice response belum aktif. Isi PIPER_MODEL_PATH pada .env.');
+    if (!fs.existsSync(this.piperModelPath)) {
+      throw new Error('Model Piper TTS tidak ditemukan pada PIPER_MODEL_PATH.');
+    }
+    const cleanText = String(text ?? '').trim();
+    if (!cleanText) {
+      throw new Error('Teks respons suara tidak boleh kosong.');
+    }
     const wavPath = path.join(workDir, 'reply.wav');
     const oggPath = path.join(workDir, 'reply.ogg');
     await this.commandRunner(this.piperBin, ['--model', this.piperModelPath, '--output_file', wavPath], {
-      input: String(text).slice(0, 5000), timeoutMs: 90000, maxOutput: 100000
+      input: cleanText.slice(0, 5000), timeoutMs: 90000, maxOutput: 100000
     });
     await this.commandRunner(this.ffmpegBin, [
       '-nostdin', '-y', '-i', wavPath, '-c:a', 'libopus', '-b:a', '32k', '-ar', '48000', '-ac', '1', oggPath
     ], { timeoutMs: 60000, maxOutput: 100000 });
+    const stat = await fsp.stat(oggPath).catch(() => null);
+    if (!stat || !stat.isFile() || stat.size <= 0) {
+      throw new Error('Hasil sintesis audio kosong atau tidak valid.');
+    }
     return { filePath: oggPath, filename: 'bubu-voice.ogg', mimetype: 'audio/ogg; codecs=opus' };
   }
 

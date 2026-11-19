@@ -5,11 +5,19 @@ function parseBool(value, fallback = false) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
 }
 
+function parsePositiveInt(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const parsed = Number(String(value).trim());
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
 function loadConfig(env = process.env) {
   const required = ['SUMOPOD_API_KEY', 'WAHA_BASE_URL', 'WAHA_SESSION', 'OWNER_JID'];
   const missing = required.filter((k) => !String(env[k] || '').trim());
   if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
-  if ((env.NODE_ENV || 'development') === 'production' && !env.WAHA_WEBHOOK_TOKEN) {
+  const webhookToken = String(env.WAHA_WEBHOOK_TOKEN || '').trim();
+  if ((env.NODE_ENV || 'development') === 'production' && !webhookToken) {
     throw new Error('WAHA_WEBHOOK_TOKEN is required in production');
   }
 
@@ -41,7 +49,7 @@ function loadConfig(env = process.env) {
   return Object.freeze({
     nodeEnv: env.NODE_ENV || 'development',
     host: env.HOST || '127.0.0.1',
-    port: Number(env.PORT || 3088),
+    port: parsePositiveInt(env.PORT, 3088),
     logLevel: env.LOG_LEVEL || 'info',
     databasePath: path.resolve(env.DATABASE_PATH || './data/bubu.sqlite'),
     storageDir: path.resolve(env.STORAGE_DIR || './storage'),
@@ -52,34 +60,38 @@ function loadConfig(env = process.env) {
     groupMediaRequireMention: parseBool(env.GROUP_MEDIA_REQUIRE_MENTION, false),
     groupProactiveEnabled: parseBool(env.GROUP_PROACTIVE_ENABLED, false),
     waha: {
-      baseUrl: String(env.WAHA_BASE_URL).replace(/\/+$/, ''),
-      session: env.WAHA_SESSION,
-      apiKey: env.WAHA_API_KEY || '',
-      webhookToken: env.WAHA_WEBHOOK_TOKEN || '',
-      webhookHeader: (env.WAHA_WEBHOOK_HEADER || 'x-webhook-token').toLowerCase()
+      baseUrl: String(env.WAHA_BASE_URL).trim().replace(/\/+$/, ''),
+      session: String(env.WAHA_SESSION).trim(),
+      apiKey: String(env.WAHA_API_KEY || '').trim(),
+      webhookToken,
+      webhookHeader: (String(env.WAHA_WEBHOOK_HEADER || 'x-webhook-token').trim() || 'x-webhook-token').toLowerCase(),
+      webhookHmacSecret: String(env.WAHA_WEBHOOK_HMAC_SECRET || '').trim(),
+      timeoutMs: parsePositiveInt(env.WAHA_TIMEOUT_MS, 15000),
+      mediaTimeoutMs: parsePositiveInt(env.WAHA_MEDIA_TIMEOUT_MS, 60000),
+      typingKeepaliveMs: parsePositiveInt(env.WAHA_TYPING_KEEPALIVE_MS, 12000)
     },
     search: {
       tavilyApiKey: env.TAVILY_API_KEY || '',
-      maxResults: Math.min(10, Math.max(1, Number(env.WEB_SEARCH_MAX_RESULTS || 5)))
+      maxResults: Math.min(10, Math.max(1, parsePositiveInt(env.WEB_SEARCH_MAX_RESULTS, 5)))
     },
     documents: {
-      maxFileBytes: Math.min(30 * 1024 * 1024, Math.max(1024 * 1024, Number(env.MAX_DOCUMENT_BYTES || 15 * 1024 * 1024))),
-      maxExtractChars: Math.min(100000, Math.max(5000, Number(env.MAX_DOCUMENT_CHARS || 50000))),
+      maxFileBytes: Math.min(30 * 1024 * 1024, Math.max(1024 * 1024, parsePositiveInt(env.MAX_DOCUMENT_BYTES, 15 * 1024 * 1024))),
+      maxExtractChars: Math.min(100000, Math.max(5000, parsePositiveInt(env.MAX_DOCUMENT_CHARS, 50000))),
       ocrEnabled: parseBool(env.DOCUMENT_OCR_ENABLED, true),
-      maxPdfOcrPages: Math.min(25, Math.max(1, Number(env.MAX_PDF_OCR_PAGES || 10))),
-      pdfRenderDpi: Math.min(300, Math.max(72, Number(env.PDF_RENDER_DPI || 150))),
+      maxPdfOcrPages: Math.min(25, Math.max(1, parsePositiveInt(env.MAX_PDF_OCR_PAGES, 10))),
+      pdfRenderDpi: Math.min(300, Math.max(72, parsePositiveInt(env.PDF_RENDER_DPI, 150))),
       pdftoppmBin: env.PDFTOPPM_BIN || 'pdftoppm',
       ghostscriptBin: env.GHOSTSCRIPT_BIN || 'gs'
     },
     media: {
       enabled: parseBool(env.MEDIA_INTELLIGENCE_ENABLED, true),
       visionEnabled: parseBool(env.MEDIA_VISION_ENABLED, true),
-      maxFileBytes: Math.min(50 * 1024 * 1024, Math.max(1024 * 1024, Number(env.MAX_MEDIA_BYTES || 25 * 1024 * 1024))),
-      maxVisionBytes: Math.min(10 * 1024 * 1024, Math.max(256 * 1024, Number(env.MAX_VISION_IMAGE_BYTES || 4 * 1024 * 1024))),
-      maxVisionDimension: Math.min(2048, Math.max(256, Number(env.MAX_VISION_IMAGE_DIMENSION || 1280))),
-      maxAudioSeconds: Math.min(1800, Math.max(30, Number(env.MAX_AUDIO_SECONDS || 900))),
-      maxVideoSeconds: Math.min(300, Math.max(10, Number(env.MAX_VIDEO_SECONDS || 180))),
-      maxVideoFrames: Math.min(12, Math.max(1, Number(env.MAX_VIDEO_FRAMES || 8))),
+      maxFileBytes: Math.min(50 * 1024 * 1024, Math.max(1024 * 1024, parsePositiveInt(env.MAX_MEDIA_BYTES, 25 * 1024 * 1024))),
+      maxVisionBytes: Math.min(10 * 1024 * 1024, Math.max(256 * 1024, parsePositiveInt(env.MAX_VISION_IMAGE_BYTES, 4 * 1024 * 1024))),
+      maxVisionDimension: Math.min(2048, Math.max(256, parsePositiveInt(env.MAX_VISION_IMAGE_DIMENSION, 1280))),
+      maxAudioSeconds: Math.min(1800, Math.max(30, parsePositiveInt(env.MAX_AUDIO_SECONDS, 900))),
+      maxVideoSeconds: Math.min(300, Math.max(10, parsePositiveInt(env.MAX_VIDEO_SECONDS, 180))),
+      maxVideoFrames: Math.min(12, Math.max(1, parsePositiveInt(env.MAX_VIDEO_FRAMES, 8))),
       tesseractBin: env.TESSERACT_BIN || 'tesseract',
       ffmpegBin: env.FFMPEG_BIN || 'ffmpeg',
       ffprobeBin: env.FFPROBE_BIN || 'ffprobe',
@@ -94,26 +106,26 @@ function loadConfig(env = process.env) {
     sumopod: {
       baseUrl: (env.SUMOPOD_BASE_URL || 'https://ai.sumopod.com/v1').replace(/\/+$/, ''),
       apiKey: env.SUMOPOD_API_KEY,
-      timeoutMs: Number(env.SUMOPOD_TIMEOUT_MS || 60000),
+      timeoutMs: parsePositiveInt(env.SUMOPOD_TIMEOUT_MS, 60000),
       models
     },
     inbox: {
-      pollMs: Math.min(5000, Math.max(100, Number(env.INBOX_POLL_MS || 500))),
-      maxAttempts: Math.min(10, Math.max(1, Number(env.INBOX_MAX_ATTEMPTS || 5))),
-      staleMs: Math.min(600000, Math.max(30000, Number(env.INBOX_STALE_MS || 120000)))
+      pollMs: Math.min(5000, Math.max(100, parsePositiveInt(env.INBOX_POLL_MS, 500))),
+      maxAttempts: Math.min(10, Math.max(1, parsePositiveInt(env.INBOX_MAX_ATTEMPTS, 5))),
+      staleMs: Math.min(600000, Math.max(30000, parsePositiveInt(env.INBOX_STALE_MS, 120000)))
     },
     agent: {
       enabled: parseBool(env.AGENT_ENABLED, true),
-      maxRounds: Number(env.AGENT_MAX_ROUNDS || 5),
-      maxToolCalls: Number(env.AGENT_MAX_TOOL_CALLS || 8),
-      maxToolResultChars: Number(env.AGENT_MAX_TOOL_RESULT_CHARS || 12000),
-      maxOutputTokens: Math.min(8192, Math.max(1024, Number(env.AGENT_MAX_OUTPUT_TOKENS || 4096))),
-      taskTimeoutMs: Number(env.AGENT_TASK_TIMEOUT_MS || 90000),
-      toolTimeoutMs: Number(env.AGENT_TOOL_TIMEOUT_MS || 15000),
-      maxConcurrentJobs: Number(env.AGENT_MAX_CONCURRENT_JOBS || 1),
-      messageRateLimit: Number(env.MESSAGE_RATE_LIMIT || 10),
-      messageRateWindowMs: Number(env.MESSAGE_RATE_WINDOW_MS || 60000),
-      approvalTtlMinutes: Number(env.APPROVAL_TTL_MINUTES || 5)
+      maxRounds: parsePositiveInt(env.AGENT_MAX_ROUNDS, 5),
+      maxToolCalls: parsePositiveInt(env.AGENT_MAX_TOOL_CALLS, 8),
+      maxToolResultChars: parsePositiveInt(env.AGENT_MAX_TOOL_RESULT_CHARS, 12000),
+      maxOutputTokens: Math.min(8192, Math.max(1024, parsePositiveInt(env.AGENT_MAX_OUTPUT_TOKENS, 4096))),
+      taskTimeoutMs: parsePositiveInt(env.AGENT_TASK_TIMEOUT_MS, 90000),
+      toolTimeoutMs: parsePositiveInt(env.AGENT_TOOL_TIMEOUT_MS, 15000),
+      maxConcurrentJobs: parsePositiveInt(env.AGENT_MAX_CONCURRENT_JOBS, 1),
+      messageRateLimit: parsePositiveInt(env.MESSAGE_RATE_LIMIT, 10),
+      messageRateWindowMs: parsePositiveInt(env.MESSAGE_RATE_WINDOW_MS, 60000),
+      approvalTtlMinutes: parsePositiveInt(env.APPROVAL_TTL_MINUTES, 5)
     }
   });
 }
@@ -123,8 +135,9 @@ function normalizeJid(value) {
   if (!raw) return '';
   if (/^\d+(?::\d+)?@c\.us$/.test(raw)) return `${raw.split('@')[0].split(':')[0]}@c.us`;
   if (/^\d+(?::\d+)?@s\.whatsapp\.net$/.test(raw)) return `${raw.split('@')[0].split(':')[0]}@c.us`;
+  if (/^[^:@\s]+(?::\d+)?@lid$/.test(raw)) return `${raw.split('@')[0].split(':')[0]}@lid`;
   if (/^\d{8,15}$/.test(raw)) return `${raw}@c.us`;
   return raw;
 }
 
-module.exports = { loadConfig, normalizeJid, parseBool };
+module.exports = { loadConfig, normalizeJid, parseBool, parsePositiveInt };

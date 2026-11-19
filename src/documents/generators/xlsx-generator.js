@@ -1,3 +1,17 @@
+const BLOCKED_FORMULA_FUNCTIONS = /\b(?:HYPERLINK|WEBSERVICE|RTD|DDE|CALL|REGISTER\.ID|EXEC|IMAGE|IMPORTDATA|IMPORTXML|IMPORTHTML|IMPORTRANGE|INFO|CELL)\s*\(/i;
+const EXTERNAL_WORKBOOK_REFERENCE = /\[[^\]]+\]/;
+const DDE_FORMULA = /\b(?:cmd|powershell|bash|sh)\s*\|/i;
+
+function validateFormulaCell(cell, rawFormula) {
+  const formula = String(rawFormula || '').replace(/^=/, '').trim();
+  if (!/^[A-Z]{1,3}[1-9]\d{0,6}$/i.test(cell) || !formula || formula.length > 500 ||
+      BLOCKED_FORMULA_FUNCTIONS.test(formula) || EXTERNAL_WORKBOOK_REFERENCE.test(formula) ||
+      DDE_FORMULA.test(formula)) {
+    throw new Error(`Formula ditolak atau alamat cell tidak valid pada ${cell}.`);
+  }
+  return formula;
+}
+
 async function buildXlsxBuffer({ title, headers = [], rows = [], formulas = {}, columnFormats = {}, sheets = [], freezeRows = 1 }) {
   const definitions = Array.isArray(sheets) && sheets.length
     ? sheets
@@ -12,17 +26,9 @@ async function buildXlsxBuffer({ title, headers = [], rows = [], formulas = {}, 
   const totalRows = definitions.reduce((sum, item) => sum + 1 + (item.rows?.length || 0), 0);
   if (totalRows > 5000) throw new Error('Workbook maksimal memiliki 5.000 baris data termasuk header.');
 
-  const blockedFormulaFunctions = /\b(?:HYPERLINK|WEBSERVICE|RTD|DDE|CALL|REGISTER\.ID|EXEC)\s*\(/i;
-  const externalWorkbookReference = /\[[^\]]+\]/;
-  const ddeFormula = /\b(?:cmd|powershell|bash|sh)\s*\|/i;
   for (const definition of definitions) {
     for (const [cell, rawFormula] of Object.entries(definition.formulas || {})) {
-      const formula = String(rawFormula || '').replace(/^=/, '').trim();
-      if (!/^[A-Z]{1,3}[1-9]\d{0,6}$/i.test(cell) || !formula || formula.length > 500 ||
-          blockedFormulaFunctions.test(formula) || externalWorkbookReference.test(formula) ||
-          ddeFormula.test(formula)) {
-        throw new Error(`Formula ditolak atau alamat cell tidak valid pada ${cell}.`);
-      }
+      validateFormulaCell(cell, rawFormula);
     }
   }
 
@@ -43,13 +49,7 @@ async function buildXlsxBuffer({ title, headers = [], rows = [], formulas = {}, 
 
     const sheetFormulas = definition.formulas || {};
     for (const [cell, rawFormula] of Object.entries(sheetFormulas)) {
-      if (!/^[A-Z]{1,3}[1-9]\d{0,6}$/i.test(cell)) throw new Error(`Alamat formula tidak valid: ${cell}`);
-      const formula = String(rawFormula || '').replace(/^=/, '').trim();
-      if (!formula || formula.length > 500 ||
-          blockedFormulaFunctions.test(formula) ||
-          externalWorkbookReference.test(formula) || ddeFormula.test(formula)) {
-        throw new Error(`Formula ditolak pada ${cell}.`);
-      }
+      const formula = validateFormulaCell(cell, rawFormula);
       sheet.getCell(cell).value = { formula };
     }
 
