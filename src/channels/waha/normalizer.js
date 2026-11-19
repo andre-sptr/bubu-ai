@@ -237,6 +237,17 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
   };
 }
 
+function normalizeBotLid(value) {
+  const raw = extractIdString(value).toLowerCase();
+  if (!raw) return '';
+  if (raw.includes('@')) {
+    const normalized = normalizeJid(raw);
+    return normalized.endsWith('@lid') ? normalized : '';
+  }
+  const bare = raw.split(':')[0].trim();
+  return bare && !/\s/.test(bare) ? `${bare}@lid` : '';
+}
+
 function normalizeIncoming(body = {}) {
   const payload = body.payload || body.data || body;
   const data = payload._data || {};
@@ -334,6 +345,11 @@ function normalizeIncoming(body = {}) {
     extractIdString(data.ID) || '';
   const fromMe = payload.fromMe === true || info.IsFromMe === true || body.me === true;
   const eventType = body.event || body.type || 'message';
+  const rawBotId = extractIdString(
+    body?.me?.id ?? body?.me?._serialized ?? payload?.me?.id ?? payload?.me?._serialized
+  );
+  const botId = rawBotId ? normalizeJid(rawBotId) : '';
+  const botLid = normalizeBotLid(body?.me?.lid ?? payload?.me?.lid ?? '');
   return {
     chatId,
     senderId,
@@ -347,6 +363,8 @@ function normalizeIncoming(body = {}) {
     eventId,
     fromMe,
     eventType,
+    botId,
+    botLid,
     raw: payload
   };
 }
@@ -370,10 +388,76 @@ function normalizeSessionStatus(body = {}) {
   };
 }
 
+function normalizePollVote(body) {
+  if (!body || typeof body !== 'object') return null;
+  const event = String(body.event || body.type || '').trim().toLowerCase();
+  if (event && event !== 'poll.vote') return null;
+
+  const payload = (body.payload && typeof body.payload === 'object' ? body.payload : null) ||
+    (body.data && typeof body.data === 'object' ? body.data : null) ||
+    body;
+  if (!payload || typeof payload !== 'object') return null;
+
+  const pollMessageId = extractIdString(payload.pollMessageId) ||
+    extractIdString(payload.poll?.id) ||
+    extractIdString(payload.poll?.messageId) ||
+    (typeof payload.poll === 'string' ? payload.poll.trim() : '') ||
+    extractIdString(payload.pollKey?.id) ||
+    extractIdString(payload.vote?.pollId) ||
+    extractIdString(payload.vote?.parentMessageId) ||
+    extractIdString(payload._data?.pollCreationMessageKey?.id);
+
+  if (!pollMessageId) return null;
+
+  const session = extractIdString(body.session) ||
+    extractIdString(payload.session) ||
+    extractIdString(body.name) ||
+    extractIdString(payload.name) ||
+    'default';
+
+  const rawVoterId = extractIdString(payload.voterId) ||
+    extractIdString(payload.voter) ||
+    extractIdString(payload.vote?.from) ||
+    extractIdString(payload.vote?.voter) ||
+    extractIdString(payload.vote?.participant) ||
+    extractIdString(payload.vote?.author) ||
+    extractIdString(payload.vote?.sender) ||
+    extractIdString(payload.author) ||
+    extractIdString(payload.participant) ||
+    extractIdString(payload.from) ||
+    extractIdString(payload._data?.Info?.Sender);
+  const voterId = rawVoterId ? normalizeJid(rawVoterId) : '';
+
+  const rawOptions = payload.vote?.selectedOptions ??
+    payload.selectedOptions ??
+    payload.vote?.options ??
+    payload.options ??
+    [];
+  const selectedOptions = Array.isArray(rawOptions)
+    ? rawOptions
+      .map((opt) => {
+        if (typeof opt === 'string') return opt.trim();
+        if (opt && typeof opt === 'object') {
+          return String(opt.name ?? opt.optionName ?? opt.text ?? opt.title ?? opt.value ?? '').trim();
+        }
+        return '';
+      })
+      .filter(Boolean)
+    : [];
+
+  return {
+    session,
+    pollMessageId,
+    voterId,
+    selectedOptions
+  };
+}
+
 module.exports = {
   collectMentionIds,
   unwrapQuotedMessage,
   extractQuoteContext,
   normalizeIncoming,
-  normalizeSessionStatus
+  normalizeSessionStatus,
+  normalizePollVote
 };

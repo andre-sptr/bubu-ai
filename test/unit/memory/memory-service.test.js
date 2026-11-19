@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { cosineSimilarity } = require('../../../src/utils/vector');
-const { MemoryService, DURABLE_SIGNAL } = require('../../../src/memory/memory-service');
+const { MemoryService, DURABLE_SIGNAL, extractJsonObject } = require('../../../src/memory/memory-service');
 
 test('cosine similarity handles matching, orthogonal and invalid vectors', () => {
   assert.equal(cosineSimilarity([1,0],[1,0]), 1);
@@ -110,4 +110,124 @@ test('embedding failures activate a temporary circuit breaker', async () => {
   assert.equal(await service.embed('first query'), null);
   assert.equal(await service.embed('second query'), null);
   assert.equal(calls, 1);
+});
+
+test('extractJsonObject parses balanced JSON objects surrounded by prose, braces, and code fences', () => {
+  assert.deepEqual(
+    extractJsonObject('Here is output {ignore me} and {broken:\n```json\n{"memories":[{"title":"Code {x}","content":"Escaped \\"quote\\" and } brace"}]}\n```\nTrailing {note}'),
+    { memories: [{ title: 'Code {x}', content: 'Escaped "quote" and } brace' }] }
+  );
+  assert.equal(extractJsonObject('No json payload here'), null);
+  assert.equal(extractJsonObject('[1, 2, 3]'), null);
+});
+
+test('embed skips inputs shorter than 2 trimmed chars and coalesces concurrent identical requests', async () => {
+  let calls = 0;
+  let release;
+  const barrier = new Promise((resolve) => { release = resolve; });
+  const service = new MemoryService({
+    db: {},
+    provider: {
+      embed: async ({ input }) => {
+        calls++;
+        await barrier;
+        return [input.length, 1];
+      }
+    },
+    router: {}, logger: { warn: () => {} }
+  });
+
+  assert.equal(await service.embed(''), null);
+  assert.equal(await service.embed(' a '), null);
+  assert.equal(calls, 0);
+
+  const p1 = service.embed('hello world');
+  const p2 = service.embed('  hello world  ');
+  release();
+  const [v1, v2] = await Promise.all([p1, p2]);
+  assert.deepEqual(v1, [11, 1]);
+  assert.deepEqual(v2, [11, 1]);
+  assert.equal(calls, 1);
+  assert.equal(service._embedInFlight.size, 0);
+});
+
+test('MemoryService remember(supersedeId), update, forget, backfillEmbeddings, and consolidateWorkspace', async () => {
+  const calls = { supersede: null, updated: null, deleted: null, embeddedSet: [] };
+  const db = {
+    getProject: () => ({ id: 'p-1' }),
+    getMemory: ({ id }) => (id === 5 ? { id: 5, title: 'Old title', content: 'Old content' } : null),
+    supersedeMemory: (arg) => { calls.supersede = arg; return { superseded: true, oldId: arg.oldId, newId: 9 }; },
+    updateMemory: (arg) => { calls.updated = arg; return { id: arg.id, ...arg.fields }; },
+    deleteMemory: (arg) => { calls.deleted = arg; return { deleted: true, id: arg.id, mode: arg.hard ? 'hard' : 'archived' }; },
+    listUnembeddedMemories: () => [{ id: 10, title: 'T', content: 'Unembedded fact' }],
+    setMemoryEmbedding: (id, vec) => { calls.embeddedSet.push({ id, vec }); return true; },
+    consolidateWorkspaceMemories: () => ({ deduplicatedCount: 2, archivedStaleCount: 1 })
+  };
+
+  const service = new MemoryService({
+    db,
+    provider: { embed: async () => [0.3, 0.7] },
+    router: {}, logger: { warn: () => {} }
+  });
+
+  const supRes = await service.remember({
+    scope: 'personal', ownerId: 'owner',
+    content: 'New content', title: 'New title', supersedeId: 5
+  });
+  assert.deepEqual(supRes, {
+    saved: true, memoryId: 9, supersededId: 5, memoryType: 'fact', embedded: true
+  });
+  assert.equal(calls.supersede.oldId, 5);
+
+  const updRes = await service.update({
+    id: 5, scope: 'personal', ownerId: 'owner', content: 'Updated content', importance: 5
+  });
+  assert.equal(updRes.content, 'Updated content');
+  assert.equal(calls.updated.fields.embedding_json, JSON.stringify([0.3, 0.7]));
+
+  assert.equal(await service.update({ id: 999, scope: 'personal', ownerId: 'owner', content: 'x' }), null);
+
+  const forgetRes = await service.forget({ id: 5, scope: 'personal', ownerId: 'owner', hard: true });
+  assert.deepEqual(forgetRes, { deleted: true, id: 5, mode: 'hard' });
+
+  const backfillRes = await service.backfillEmbeddings({ scope: 'personal', ownerId: 'owner', limit: 5 });
+  assert.deepEqual(backfillRes, { attempted: 1, backfilled: 1 });
+  assert.deepEqual(calls.embeddedSet, [{ id: 10, vec: [0.3, 0.7] }]);
+
+  const consRes = await service.consolidateWorkspace({ scope: 'personal', ownerId: 'owner', backfillLimit: 5 });
+  assert.deepEqual(consRes, { deduplicatedCount: 2, archivedStaleCount: 1, backfilledCount: 1 });
+});
+
+test('captureFromTurn extracts JSON from prose and forwards valid workspace supersedesId only', async () => {
+  const remembered = [];
+  const db = {
+    hasMemoryExtraction: () => false,
+    recordMemoryExtraction: () => {},
+    getMemory: ({ id, ownerId }) => (id === 7 && ownerId === 'owner' ? { id: 7 } : null),
+    supersedeMemory: (args) => { remembered.push({ superseded: args.oldId, ...args.newMemory }); return { oldId: args.oldId, newId: 20 }; },
+    saveMemory: (args) => { remembered.push({ superseded: null, ...args }); return 21; }
+  };
+  const service = new MemoryService({
+    db,
+    provider: {
+      embed: async () => [1, 0],
+      chat: async () => ({
+        message: {
+          content: 'Sure {here}: {"memories":[{"title":"Drink","content":"Now drinks tea","memoryType":"preference","importance":4,"supersedesId":7},{"title":"Food","content":"Likes nasi goreng","memoryType":"fact","importance":3,"supersedesId":999}]}'
+        }
+      })
+    },
+    router: { select: () => ({ model: 'summary' }) },
+    logger: { warn: () => {} }
+  });
+
+  const res = await service.captureFromTurn({
+    scope: 'personal', ownerId: 'owner',
+    userText: 'Ingat mulai sekarang saya minum teh saja',
+    assistantText: 'Dicatat!',
+    sourceEventId: 'evt-sup-1'
+  });
+  assert.equal(res.captured, 2);
+  assert.equal(remembered[0].superseded, 7);
+  assert.equal(remembered[1].superseded, null);
 });

@@ -336,6 +336,47 @@ class WahaClient {
     return this.request('POST', '/api/sendContactVcard', body);
   }
 
+  sendLinkCustomPreview(chatId, { text = '', url, title = '', description = '', replyTo, mentions } = {}) {
+    const body = {
+      session: this.session,
+      chatId,
+      text,
+      preview: {
+        url,
+        title: title ?? '',
+        description: description ?? ''
+      }
+    };
+    if (replyTo) body.reply_to = replyTo;
+    if (mentions?.length) body.mentions = mentions;
+    return this.request('POST', '/api/sendLinkCustomPreview', body);
+  }
+
+  editMessage(chatId, messageId, text, { mentions } = {}) {
+    const body = { text };
+    if (mentions?.length) body.mentions = mentions;
+    return this.request(
+      'PUT',
+      `/api/${encodeURIComponent(this.session)}/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
+      body
+    );
+  }
+
+  deleteMessage(chatId, messageId) {
+    return this.request(
+      'DELETE',
+      `/api/${encodeURIComponent(this.session)}/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`
+    );
+  }
+
+  forwardMessage(chatId, messageId) {
+    return this.request('POST', '/api/forwardMessage', {
+      session: this.session,
+      chatId,
+      messageId
+    });
+  }
+
   checkNumberStatus(phone) {
     return this._withRetry(() =>
       this.request('GET', '/api/contacts/check-exists', undefined, {
@@ -429,6 +470,12 @@ class WahaClient {
   async sessionStatus() {
     return this._withRetry(() =>
       this.request('GET', `/api/sessions/${encodeURIComponent(this.session)}`)
+    );
+  }
+
+  async getMe() {
+    return this._withRetry(() =>
+      this.request('GET', `/api/sessions/${encodeURIComponent(this.session)}/me`)
     );
   }
 }

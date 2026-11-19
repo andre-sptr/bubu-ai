@@ -1,5 +1,13 @@
 const { z } = require('../utils/zod-loader');
 
+function workspaceOf(ctx) {
+  return {
+    scope: ctx.scope,
+    ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
+    chatId: ctx.scope === 'group' ? ctx.chatId : null
+  };
+}
+
 function createMemoryTools({ db, memoryService }) {
   return [
     {
@@ -14,11 +22,10 @@ function createMemoryTools({ db, memoryService }) {
       },
       execute: async ({ content, kind }, ctx) => {
         const noteKind = String(kind || 'note').trim() || 'note';
+        const ws = workspaceOf(ctx);
         if (memoryService) {
           return memoryService.remember({
-            scope: ctx.scope,
-            ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-            chatId: ctx.scope === 'group' ? ctx.chatId : null,
+            ...ws,
             content,
             title: null,
             kind: noteKind,
@@ -29,9 +36,7 @@ function createMemoryTools({ db, memoryService }) {
         return {
           saved: true,
           noteId: db.saveMemory({
-            scope: ctx.scope,
-            ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-            chatId: ctx.scope === 'group' ? ctx.chatId : null,
+            ...ws,
             content,
             kind: noteKind
           })
@@ -47,32 +52,26 @@ function createMemoryTools({ db, memoryService }) {
         type: 'object', additionalProperties: false,
         properties: { query: { type: 'string' } }, required: ['query']
       },
-      execute: async ({ query }, ctx) => ({
-        notes: memoryService
-          ? await memoryService.retrieve({
-              scope: ctx.scope,
-              ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-              chatId: ctx.scope === 'group' ? ctx.chatId : null,
-              query, limit: 8
-            })
-          : db.searchMemories({
-              scope: ctx.scope,
-              ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-              chatId: ctx.scope === 'group' ? ctx.chatId : null,
-              query, limit: 8
-            })
-      })
+      execute: async ({ query }, ctx) => {
+        const ws = workspaceOf(ctx);
+        return {
+          notes: memoryService
+            ? await memoryService.retrieve({ ...ws, query, limit: 8 })
+            : db.searchMemories({ ...ws, query, limit: 8 })
+        };
+      }
     },
     {
       name: 'remember_fact',
-      description: 'Save durable facts, preferences, goals or project context in the current workspace so Bubu can recall them in future conversations. In group scope, save only shared group information, not an individual member personal details.',
+      description: 'Save durable facts, preferences, goals or project context in the current workspace so Bubu can recall them in future conversations. Pass supersedeId when replacing an outdated memory. In group scope, save only shared group information, not an individual member personal details.',
       scopes: ['personal', 'group'],
       schema: z.object({
         title: z.string().max(160).optional(),
         content: z.string().min(3).max(1500),
         memoryType: z.enum(['fact', 'preference', 'goal', 'project']).optional(),
         importance: z.number().int().min(1).max(5).optional(),
-        projectId: z.string().uuid().optional()
+        projectId: z.string().uuid().optional(),
+        supersedeId: z.number().int().positive().optional()
       }).strict(),
       parameters: {
         type: 'object', additionalProperties: false,
@@ -80,18 +79,53 @@ function createMemoryTools({ db, memoryService }) {
           title: { type: 'string' }, content: { type: 'string' },
           memoryType: { type: 'string', enum: ['fact', 'preference', 'goal', 'project'] },
           importance: { type: 'integer', minimum: 1, maximum: 5 },
-          projectId: { type: 'string', description: 'Optional project UUID in this workspace' }
+          projectId: { type: 'string', description: 'Optional project UUID in this workspace' },
+          supersedeId: { type: 'integer', minimum: 1, description: 'Optional existing memory ID in this workspace to mark superseded' }
         }, required: ['content']
       },
-      execute: async ({ title, content, memoryType, importance, projectId }, ctx) =>
-        memoryService.remember({
-          scope: ctx.scope,
-          ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-          chatId: ctx.scope === 'group' ? ctx.chatId : null,
-          title, content, memoryType: memoryType || 'fact',
-          importance: importance || 3, projectId,
+      execute: async ({ title, content, memoryType, importance, projectId, supersedeId }, ctx) => {
+        const ws = workspaceOf(ctx);
+        const type = memoryType || 'fact';
+        if (memoryService) {
+          return memoryService.remember({
+            ...ws,
+            title,
+            content,
+            memoryType: type,
+            importance: importance || 3,
+            projectId,
+            supersedeId: supersedeId ?? null,
+            source: 'agent_tool'
+          });
+        }
+        if (supersedeId != null) {
+          const res = db.supersedeMemory({
+            oldId: supersedeId,
+            ...ws,
+            newMemory: {
+              title: title ?? null,
+              content,
+              memoryType: type,
+              kind: type,
+              importance: importance || 3,
+              projectId: projectId ?? null,
+              source: 'agent_tool'
+            }
+          });
+          return { saved: true, memoryId: res.newId, supersededId: res.oldId, memoryType: type, embedded: false };
+        }
+        const id = db.saveMemory({
+          ...ws,
+          title: title ?? null,
+          content,
+          memoryType: type,
+          kind: type,
+          importance: importance || 3,
+          projectId: projectId ?? null,
           source: 'agent_tool'
-        })
+        });
+        return { saved: true, memoryId: id, memoryType: type, embedded: false };
+      }
     },
     {
       name: 'search_memory',
@@ -110,14 +144,147 @@ function createMemoryTools({ db, memoryService }) {
           limit: { type: 'integer', minimum: 1, maximum: 15 }
         }, required: ['query']
       },
-      execute: async ({ query, projectId, limit }, ctx) => ({
-        memories: await memoryService.retrieve({
-          scope: ctx.scope,
-          ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-          chatId: ctx.scope === 'group' ? ctx.chatId : null,
-          query, projectId, limit: limit || 8
+      execute: async ({ query, projectId, limit }, ctx) => {
+        const ws = workspaceOf(ctx);
+        return {
+          memories: memoryService
+            ? await memoryService.retrieve({ ...ws, query, projectId, limit: limit || 8 })
+            : db.searchMemoriesSemantic({ ...ws, query, projectId, limit: limit || 8 })
+        };
+      }
+    },
+    {
+      name: 'list_memories',
+      description: 'List memories in the current workspace, optionally filtered by memoryType, projectId, or lifecycle status.',
+      scopes: ['personal', 'group'],
+      schema: z.object({
+        memoryType: z.string().min(1).max(40).optional(),
+        projectId: z.string().uuid().optional(),
+        status: z.enum(['active', 'superseded', 'archived']).nullable().optional(),
+        limit: z.number().int().min(1).max(50).optional()
+      }).strict(),
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          memoryType: { type: 'string' },
+          projectId: { type: 'string' },
+          status: { type: ['string', 'null'], enum: ['active', 'superseded', 'archived', null] },
+          limit: { type: 'integer', minimum: 1, maximum: 50 }
+        }
+      },
+      execute: async ({ memoryType, projectId, status, limit }, ctx) => ({
+        memories: db.listMemories({
+          ...workspaceOf(ctx),
+          memoryType: memoryType ?? null,
+          projectId: projectId ?? null,
+          status: status === undefined ? 'active' : status,
+          limit: limit || 20
         })
       })
+    },
+    {
+      name: 'update_memory',
+      description: 'Update the title, content, memoryType, importance, projectId or status of an existing memory in the current workspace.',
+      scopes: ['personal', 'group'],
+      schema: z.object({
+        memoryId: z.number().int().positive(),
+        title: z.string().max(160).nullable().optional(),
+        content: z.string().min(1).max(5000).optional(),
+        memoryType: z.enum(['fact', 'preference', 'goal', 'project']).optional(),
+        importance: z.number().int().min(1).max(5).optional(),
+        projectId: z.string().uuid().nullable().optional(),
+        status: z.enum(['active', 'superseded', 'archived']).optional()
+      }).strict().refine((value) => Object.keys(value).some((key) => key !== 'memoryId'), {
+        message: 'At least one field to update is required'
+      }),
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          memoryId: { type: 'integer', minimum: 1 },
+          title: { type: ['string', 'null'] },
+          content: { type: 'string' },
+          memoryType: { type: 'string', enum: ['fact', 'preference', 'goal', 'project'] },
+          importance: { type: 'integer', minimum: 1, maximum: 5 },
+          projectId: { type: ['string', 'null'] },
+          status: { type: 'string', enum: ['active', 'superseded', 'archived'] }
+        },
+        required: ['memoryId']
+      },
+      execute: async ({ memoryId, title, content, memoryType, importance, projectId, status }, ctx) => {
+        const ws = workspaceOf(ctx);
+        const memory = memoryService
+          ? await memoryService.update({
+              id: memoryId,
+              ...ws,
+              title,
+              content,
+              memoryType,
+              importance,
+              projectId,
+              status
+            })
+          : db.updateMemory({
+              id: memoryId,
+              ...ws,
+              fields: {
+                ...(title !== undefined ? { title } : {}),
+                ...(content !== undefined ? { content } : {}),
+                ...(memoryType !== undefined ? { memory_type: memoryType, kind: memoryType } : {}),
+                ...(importance !== undefined ? { importance } : {}),
+                ...(projectId !== undefined ? { project_id: projectId } : {}),
+                ...(status !== undefined ? { status } : {})
+              }
+            });
+        if (!memory) throw new Error('Memori tidak ditemukan pada workspace ini.');
+        return { updated: true, memory };
+      }
+    },
+    {
+      name: 'forget_memory',
+      description: 'Archive (soft-delete by default) or permanently delete a memory in the current workspace.',
+      scopes: ['personal', 'group'],
+      schema: z.object({
+        memoryId: z.number().int().positive(),
+        hard: z.boolean().optional()
+      }).strict(),
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          memoryId: { type: 'integer', minimum: 1 },
+          hard: { type: 'boolean', description: 'Permanently delete when true; default false (archive)' }
+        },
+        required: ['memoryId']
+      },
+      execute: async ({ memoryId, hard = false }, ctx) => {
+        const ws = workspaceOf(ctx);
+        const result = memoryService
+          ? await memoryService.forget({ id: memoryId, ...ws, hard: Boolean(hard) })
+          : db.deleteMemory({ id: memoryId, ...ws, hard: Boolean(hard) });
+        return result;
+      }
+    },
+    {
+      name: 'consolidate_memories',
+      description: 'Deduplicate active memories, archive stale low-importance memories, and backfill missing semantic embeddings for the current workspace.',
+      scopes: ['personal', 'group'],
+      schema: z.object({
+        backfillLimit: z.number().int().min(0).max(30).optional()
+      }).strict(),
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          backfillLimit: { type: 'integer', minimum: 0, maximum: 30 }
+        }
+      },
+      execute: async ({ backfillLimit }, ctx) => {
+        const ws = workspaceOf(ctx);
+        const limit = backfillLimit === undefined ? 10 : backfillLimit;
+        if (memoryService) {
+          return memoryService.consolidateWorkspace({ ...ws, backfillLimit: limit });
+        }
+        const consolidated = db.consolidateWorkspaceMemories(ws);
+        return { ...consolidated, backfilledCount: 0 };
+      }
     },
     {
       name: 'create_project',
@@ -135,9 +302,7 @@ function createMemoryTools({ db, memoryService }) {
       execute: async ({ name, description }, ctx) => ({
         created: true,
         project: await memoryService.createProject({
-          scope: ctx.scope,
-          ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-          chatId: ctx.scope === 'group' ? ctx.chatId : null,
+          ...workspaceOf(ctx),
           name, description
         })
       })
@@ -159,9 +324,7 @@ function createMemoryTools({ db, memoryService }) {
       },
       execute: async ({ status, limit }, ctx) => ({
         projects: db.listProjects({
-          scope: ctx.scope,
-          ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-          chatId: ctx.scope === 'group' ? ctx.chatId : null,
+          ...workspaceOf(ctx),
           status: status === undefined ? 'active' : status,
           limit: limit || 20
         })
@@ -188,9 +351,7 @@ function createMemoryTools({ db, memoryService }) {
       execute: async ({ projectId, ...fields }, ctx) => {
         const project = db.updateProject({
           id: projectId,
-          scope: ctx.scope,
-          ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-          chatId: ctx.scope === 'group' ? ctx.chatId : null,
+          ...workspaceOf(ctx),
           fields
         });
         if (!project) throw new Error('Project tidak ditemukan pada workspace ini.');
@@ -208,9 +369,7 @@ function createMemoryTools({ db, memoryService }) {
       },
       execute: async ({ limit }, ctx) => ({
         events: db.listMemoryEvents({
-          scope: ctx.scope,
-          ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-          chatId: ctx.scope === 'group' ? ctx.chatId : null,
+          ...workspaceOf(ctx),
           limit: limit || 15
         })
       })

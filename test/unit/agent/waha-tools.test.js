@@ -13,8 +13,9 @@ const { buildAgentMessages, SYSTEM_PROMPT } = require('../../../src/agent/prompt
 const { createProductivityTools } = require('../../../src/productivity/productivity-tools');
 const { DatabaseStore } = require('../../../src/db/database');
 
-function makeWahaHarness({ sessionMonitor = null } = {}) {
+function makeWahaHarness({ sessionMonitor = null, approvalManager = null } = {}) {
   const calls = [];
+  const approvals = [];
   const waha = {
     session: 'default',
     sendReaction: async (chatId, messageId, reaction) => {
@@ -33,6 +34,18 @@ function makeWahaHarness({ sessionMonitor = null } = {}) {
       calls.push({ method: 'sendContactVcard', chatId, contacts, options });
       return { id: 'contact-msg-1' };
     },
+    sendLinkCustomPreview: async (chatId, payload) => {
+      calls.push({ method: 'sendLinkCustomPreview', chatId, payload });
+      return { id: 'link-msg-1' };
+    },
+    editMessage: async (chatId, messageId, text, options) => {
+      calls.push({ method: 'editMessage', chatId, messageId, text, options });
+      return { id: messageId };
+    },
+    deleteMessage: async (chatId, messageId) => {
+      calls.push({ method: 'deleteMessage', chatId, messageId });
+      return { id: messageId };
+    },
     getGroupInfo: async (chatId) => {
       calls.push({ method: 'getGroupInfo', chatId });
       return { id: chatId, subject: 'Tim Produk', description: 'Diskusi mingguan' };
@@ -49,25 +62,43 @@ function makeWahaHarness({ sessionMonitor = null } = {}) {
       calls.push({ method: 'checkNumberStatus', phone });
       return { numberExists: true, chatId: `${phone}@c.us` };
     },
+    getChatMessages: async (chatId, options) => {
+      calls.push({ method: 'getChatMessages', chatId, options });
+      return [
+        { id: { _serialized: 'false_6281@c.us_M1' }, fromMe: false, timestamp: 1700000001, body: 'Pesan masuk', hasMedia: false },
+        { id: 'true_6281@c.us_M2', fromMe: true, timestamp: 1700000002, body: 'Balasan Bubu', hasMedia: true }
+      ];
+    },
     sessionStatus: async () => {
       calls.push({ method: 'sessionStatus' });
       return { name: 'default', status: 'WORKING', me: { id: '628999@c.us', pushName: 'Bubu' } };
     }
   };
+  const effectiveApprovalManager = approvalManager || {
+    create: async (item) => {
+      approvals.push(item);
+      return { pendingApproval: true, approvalId: `ap-${approvals.length}`, prompt: `Approve ${item.toolName}` };
+    }
+  };
   const responseHandler = new ResponseHandler({ waha, logger: { info: () => {}, warn: () => {}, error: () => {} } });
-  const tools = createWahaTools({ waha, responseHandler, sessionMonitor });
+  const tools = createWahaTools({
+    waha,
+    responseHandler,
+    approvalManager: effectiveApprovalManager,
+    sessionMonitor
+  });
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
-  return { waha, responseHandler, tools, byName, calls };
+  return { waha, responseHandler, approvalManager: effectiveApprovalManager, tools, byName, calls, approvals };
 }
 
-test('registerAllTools includes all 7 Phase 4 WAHA tools while keeping createCoreTools intact', () => {
+test('registerAllTools includes all 14 Phase 4 WAHA tools while keeping createCoreTools intact', () => {
   const core = createCoreTools({ db: {}, approvalManager: {}, memoryService: null });
   assert.deepEqual([...core.tools.keys()], ['save_note', 'search_notes', 'create_reminder', 'send_whatsapp_message']);
 
-  const { waha, responseHandler } = makeWahaHarness();
+  const { waha, responseHandler, approvalManager } = makeWahaHarness();
   const registry = registerAllTools({
     db: {},
-    approvalManager: {},
+    approvalManager,
     waha,
     responseHandler,
     sessionMonitor: new WahaSessionMonitor(),
@@ -81,9 +112,16 @@ test('registerAllTools includes all 7 Phase 4 WAHA tools while keeping createCor
     'send_poll',
     'send_location',
     'send_contact_card',
+    'send_link_preview',
+    'edit_bot_message',
+    'delete_bot_message',
+    'send_whatsapp_poll',
+    'send_whatsapp_location',
+    'send_whatsapp_contact',
     'get_group_info',
     'check_whatsapp_number',
-    'get_waha_session_status'
+    'get_waha_session_status',
+    'list_recent_chat_messages'
   ]) {
     assert.ok(registry.get(name), `Expected ${name} to be registered`);
   }
@@ -92,9 +130,17 @@ test('registerAllTools includes all 7 Phase 4 WAHA tools while keeping createCor
   assert.equal(personalNames.includes('get_group_info'), false);
   assert.equal(personalNames.includes('check_whatsapp_number'), true);
   assert.equal(personalNames.includes('get_waha_session_status'), true);
+  assert.equal(personalNames.includes('list_recent_chat_messages'), true);
+  assert.equal(personalNames.includes('send_whatsapp_poll'), true);
+  assert.equal(personalNames.includes('send_whatsapp_location'), true);
+  assert.equal(personalNames.includes('send_whatsapp_contact'), true);
   assert.equal(groupNames.includes('get_group_info'), true);
   assert.equal(groupNames.includes('check_whatsapp_number'), false);
   assert.equal(groupNames.includes('get_waha_session_status'), false);
+  assert.equal(groupNames.includes('list_recent_chat_messages'), false);
+  assert.equal(groupNames.includes('send_whatsapp_poll'), false);
+  assert.equal(groupNames.includes('send_whatsapp_location'), false);
+  assert.equal(groupNames.includes('send_whatsapp_contact'), false);
 });
 
 test('Phase 4 outbound tools enforce strict Zod schemas, target ctx.chatId, and route via ResponseHandler', async () => {
@@ -389,6 +435,7 @@ test('MessageProcessor uses typingKeepalive when available, gates group slashes 
   });
   assert.equal(rateCalls.length, 1);
   assert.match(sentResponses[0].text, /WAHA session \(default\): WORKING/);
+  assert.match(sentResponses[0].text, /Bot JID: 628999@c\.us/);
   assert.deepEqual(events, [
     'seen:120363@g.us',
     'keepalive:start:120363@g.us',
@@ -507,6 +554,10 @@ test('quote document resolution prioritizes quotedMessageId against source_event
 
 test('prompt-builder includes group sender attribution and Phase 4 WAHA guidance while productivity-tools guards invalid dates', async () => {
   assert.match(SYSTEM_PROMPT, /react_to_message/);
+  assert.match(SYSTEM_PROMPT, /send_link_preview/);
+  assert.match(SYSTEM_PROMPT, /edit_bot_message/);
+  assert.match(SYSTEM_PROMPT, /delete_bot_message/);
+  assert.match(SYSTEM_PROMPT, /list_recent_chat_messages/);
   assert.match(SYSTEM_PROMPT, /get_group_info/);
   assert.match(SYSTEM_PROMPT, /check_whatsapp_number/);
   assert.match(SYSTEM_PROMPT, /get_waha_session_status/);
@@ -532,6 +583,152 @@ test('prompt-builder includes group sender attribution and Phase 4 WAHA guidance
     /Due date must be in the future/
   );
   const sendMsg = tools.find((t) => t.name === 'send_whatsapp_message');
-  const parsed = sendMsg.schema.parse({ targetId: '6282@c.us', message: 'Halo', replyTo: 'orig-1' });
+  const parsed = sendMsg.schema.parse({
+    targetId: '6282@c.us',
+    message: 'Halo',
+    replyTo: 'orig-1',
+    mentions: ['6283@c.us']
+  });
   assert.equal(parsed.replyTo, 'orig-1');
+  assert.deepEqual(parsed.mentions, ['6283@c.us']);
+});
+
+test('Stage 2 Phase 4 tools (send_link_preview, edit_bot_message, delete_bot_message, cross-chat approval tools, list_recent_chat_messages) validate and execute cleanly', async () => {
+  const h = makeWahaHarness();
+
+  // 1. send_link_preview routes through ResponseHandler and blocks private/SSRF URLs
+  assert.throws(() => h.byName.send_link_preview.schema.parse({ url: 'ftp://example.com' }));
+  await assert.rejects(
+    () => h.byName.send_link_preview.execute(
+      { url: 'http://127.0.0.1:3000/internal', title: 'Private' },
+      { chatId: '123@g.us', scope: 'group' }
+    ),
+    (err) => err.deliveryStatus === 'failed' && /host/i.test(err.message)
+  );
+  const linkRes = await h.byName.send_link_preview.execute(
+    h.byName.send_link_preview.schema.parse({
+      url: 'https://example.com/docs',
+      text: 'Baca **panduan** ini',
+      title: '**Dokumentasi**',
+      description: 'Ringkasan',
+      replyToCurrent: true,
+      mentions: ['6281@c.us']
+    }),
+    { chatId: '123@g.us', scope: 'group', incomingMessageId: 'in-link-1' }
+  );
+  assert.equal(linkRes.sent, true);
+  assert.equal(linkRes.messageId, 'link-msg-1');
+  assert.equal(h.calls[0].method, 'sendLinkCustomPreview');
+  assert.equal(h.calls[0].payload.replyTo, 'in-link-1');
+  assert.deepEqual(h.calls[0].payload.mentions, ['6281@c.us']);
+
+  // 2. edit_bot_message and delete_bot_message enforce same-chat and reject inbound false_* messageIds
+  await assert.rejects(
+    () => h.byName.edit_bot_message.execute(
+      { messageId: 'false_123@g.us_USERMSG', text: 'Hijack' },
+      { chatId: '123@g.us', scope: 'group' }
+    ),
+    (err) => err.deliveryStatus === 'failed' && /own outbound/i.test(err.message)
+  );
+  await assert.rejects(
+    () => h.byName.edit_bot_message.execute(
+      { messageId: 'true_999@c.us_OTHERCHAT', text: 'Cross chat' },
+      { chatId: '123@g.us', scope: 'group' }
+    ),
+    (err) => err.deliveryStatus === 'failed' && /different WhatsApp chat/i.test(err.message)
+  );
+  const editRes = await h.byName.edit_bot_message.execute(
+    h.byName.edit_bot_message.schema.parse({
+      messageId: 'true_123@g.us_BOTMSG1',
+      text: '**Koreksi** jawaban',
+      mentions: ['6282@c.us']
+    }),
+    { chatId: '123@g.us', scope: 'group' }
+  );
+  assert.equal(editRes.edited, true);
+  assert.equal(h.calls[1].method, 'editMessage');
+  assert.equal(h.calls[1].text, '*Koreksi* jawaban');
+
+  await assert.rejects(
+    () => h.byName.delete_bot_message.execute(
+      { messageId: 'false_123@g.us_USERMSG' },
+      { chatId: '123@g.us', scope: 'group' }
+    ),
+    (err) => err.deliveryStatus === 'failed' && /own outbound/i.test(err.message)
+  );
+  const delRes = await h.byName.delete_bot_message.execute(
+    h.byName.delete_bot_message.schema.parse({ messageId: 'true_123@g.us_BOTMSG1' }),
+    { chatId: '123@g.us', scope: 'group' }
+  );
+  assert.equal(delRes.deleted, true);
+  assert.equal(h.calls[2].method, 'deleteMessage');
+
+  // 3. Cross-chat owner-approved tools (send_whatsapp_poll, send_whatsapp_location, send_whatsapp_contact)
+  for (const toolName of ['send_whatsapp_poll', 'send_whatsapp_location', 'send_whatsapp_contact']) {
+    await assert.rejects(
+      () => h.byName[toolName].execute({}, { chatId: '123@g.us', scope: 'group' }),
+      /personal/i
+    );
+  }
+  const pollApproval = await h.byName.send_whatsapp_poll.execute(
+    h.byName.send_whatsapp_poll.schema.parse({
+      targetId: '120363@g.us',
+      question: 'Vote menu?',
+      options: ['Sate', 'Soto'],
+      multipleAnswers: false
+    }),
+    { taskId: 't1', chatId: '6281@c.us', requesterId: '6281@c.us', scope: 'personal' }
+  );
+  assert.equal(pollApproval.pendingApproval, true);
+  assert.equal(h.approvals[0].toolName, 'send_whatsapp_poll');
+
+  const locApproval = await h.byName.send_whatsapp_location.execute(
+    h.byName.send_whatsapp_location.schema.parse({
+      targetId: '120363@g.us',
+      latitude: -6.2,
+      longitude: 106.8,
+      title: 'Kantor'
+    }),
+    { taskId: 't2', chatId: '6281@c.us', requesterId: '6281@c.us', scope: 'personal' }
+  );
+  assert.equal(locApproval.pendingApproval, true);
+  assert.equal(h.approvals[1].toolName, 'send_whatsapp_location');
+
+  const contactApproval = await h.byName.send_whatsapp_contact.execute(
+    h.byName.send_whatsapp_contact.schema.parse({
+      targetId: '120363@g.us',
+      fullName: 'Dewi',
+      phoneNumber: '+62811223344',
+      organization: 'Tim Bubu'
+    }),
+    { taskId: 't3', chatId: '6281@c.us', requesterId: '6281@c.us', scope: 'personal' }
+  );
+  assert.equal(contactApproval.pendingApproval, true);
+  assert.equal(h.approvals[2].toolName, 'send_whatsapp_contact');
+
+  // 4. list_recent_chat_messages: personal-only, downloadMedia: false, sanitized & untrusted: true
+  await assert.rejects(
+    () => h.byName.list_recent_chat_messages.execute({}, { chatId: '123@g.us', scope: 'group' }),
+    /personal/i
+  );
+  assert.throws(() => h.byName.list_recent_chat_messages.schema.parse({ limit: 20 }));
+  const recentRes = await h.byName.list_recent_chat_messages.execute(
+    h.byName.list_recent_chat_messages.schema.parse({ limit: 5 }),
+    { chatId: '6281@c.us', scope: 'personal' }
+  );
+  assert.equal(recentRes.untrusted, true);
+  assert.equal(recentRes.count, 2);
+  assert.deepEqual(h.calls[3], {
+    method: 'getChatMessages',
+    chatId: '6281@c.us',
+    options: { limit: 5, downloadMedia: false }
+  });
+  assert.deepEqual(recentRes.messages[0], {
+    id: 'false_6281@c.us_M1',
+    fromMe: false,
+    timestamp: 1700000001,
+    body: 'Pesan masuk',
+    hasMedia: false,
+    untrusted: true
+  });
 });

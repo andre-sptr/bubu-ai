@@ -261,3 +261,84 @@ test('foreign-origin media URL is rejected before download or processing', async
   assert.equal(f.mediaCalls, 0);
   assert.equal(f.agentCalls, 0);
 });
+
+test('hasBotMention accepts single JID or array of JIDs/LIDs and MessageProcessor auto-discovers bot identity from webhook me', async () => {
+  const { WahaSessionMonitor } = require('../../../src/channels/waha/session-monitor');
+
+  assert.equal(hasBotMention({ text: 'Halo', mentions: ['987654321:0@lid'] }, ['628999999999@c.us', '987654321@lid']), true);
+  assert.equal(hasBotMention({ text: 'Halo @987654321 tolong cek', mentions: [] }, ['', '987654321@lid']), true);
+  assert.equal(hasBotMention({ text: 'Halo', mentions: ['111222333@lid'] }, ['628999999999@c.us', '987654321@lid']), false);
+
+  const f = fixture({ botJid: '' });
+  const monitor = new WahaSessionMonitor({ session: 'default' });
+  f.processor.sessionMonitor = monitor;
+
+  // First group webhook carries me: { id, lid } and mentions the bot's LID
+  await f.processor.process({
+    event: 'message',
+    me: { id: '628777888999:1@s.whatsapp.net', lid: '555666777:0@lid' },
+    payload: {
+      id: 'group-lid-mention-1',
+      from: '120363000000000000@g.us',
+      author: '628111111111@c.us',
+      body: 'Tolong cek ini',
+      mentionedIds: ['555666777@lid']
+    }
+  });
+  assert.equal(f.agentCalls, 1);
+  assert.deepEqual(monitor.getBotIdentities(), {
+    botJid: '628777888999@c.us',
+    botLid: '555666777@lid'
+  });
+
+  // Subsequent group webhook without me metadata still matches the discovered botJid stored in sessionMonitor
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      id: 'group-discovered-jid-2',
+      from: '120363000000000000@g.us',
+      author: '628111111111@c.us',
+      body: 'Halo @628777888999'
+    }
+  });
+  assert.equal(f.agentCalls, 2);
+});
+
+test('MessageProcessor passes targeted sendSeen options with messageIds and group participant when eventId is present', async () => {
+  const seenCalls = [];
+  const f = fixture();
+  f.processor.waha.sendSeen = async (...args) => { seenCalls.push(args); };
+
+  // Group message with eventId and senderId
+  await f.processor.process(groupPayload('grp-msg-99', 'Bubu halo'));
+  assert.deepEqual(seenCalls[0], [
+    '120363000000000000@g.us',
+    { messageIds: ['grp-msg-99'], participant: '628111111111@c.us' }
+  ]);
+
+  // DM message with eventId (no participant field)
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      id: 'dm-msg-55',
+      from: '628111111111@c.us',
+      author: '628111111111@c.us',
+      body: 'Halo DM'
+    }
+  });
+  assert.deepEqual(seenCalls[1], [
+    '628111111111@c.us',
+    { messageIds: ['dm-msg-55'] }
+  ]);
+
+  // Message without eventId calls sendSeen(chatId) with 1 argument
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      from: '628111111111@c.us',
+      author: '628111111111@c.us',
+      body: 'Halo tanpa ID'
+    }
+  });
+  assert.deepEqual(seenCalls[2], ['628111111111@c.us']);
+});

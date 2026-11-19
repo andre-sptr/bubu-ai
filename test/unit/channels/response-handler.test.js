@@ -14,6 +14,10 @@ function harness(overrides = {}) {
     sendPoll: async (chatId, poll) => { calls.push({ type: 'poll', chatId, poll }); return { id: 'poll-1' }; },
     sendLocation: async (chatId, location) => { calls.push({ type: 'location', chatId, location }); return { id: 'loc-1' }; },
     sendContactVcard: async (chatId, contacts, options) => { calls.push({ type: 'contact', chatId, contacts, options }); return { id: 'contact-1' }; },
+    sendLinkCustomPreview: async (chatId, payload) => { calls.push({ type: 'link_preview', chatId, payload }); return { id: 'link-1' }; },
+    editMessage: async (chatId, messageId, text, options) => { calls.push({ type: 'edit', chatId, messageId, text, options }); return { id: messageId }; },
+    deleteMessage: async (chatId, messageId) => { calls.push({ type: 'delete', chatId, messageId }); return { id: messageId }; },
+    forwardMessage: async (chatId, messageId) => { calls.push({ type: 'forward', chatId, messageId }); return { id: 'fwd-1' }; },
     ...overrides
   };
   const mediaService = { createVoiceReply: async (text) => Buffer.from(`audio:${text}`) };
@@ -247,5 +251,171 @@ test('Phase 4 outbound methods (reaction, poll, location, contact) format inputs
   await assert.rejects(
     () => h.handler.sendLocation('chat@c.us', { latitude: 120, longitude: 106.8 }),
     /Valid latitude and longitude/
+  );
+});
+
+test('sendText chunks long messages sequentially with replyTo/mentions on chunk 1 only and preserves single-chunk receipts', async () => {
+  let seq = 0;
+  const calls = [];
+  const waha = {
+    sendText: async (text, chatId, options) => {
+      seq++;
+      calls.push({ type: 'text', text, chatId, options });
+      return { id: `chunk-${seq}` };
+    }
+  };
+  const handler = new ResponseHandler({ waha });
+
+  // Single chunk retains exact existing shape (no messageIds / chunks properties)
+  const single = await handler.sendText('Short message', 'chat@c.us', { maxChunkChars: 50 });
+  assert.deepEqual(single, {
+    ok: true,
+    type: 'text',
+    chatId: 'chat@c.us',
+    messageId: 'chunk-1',
+    response: { id: 'chunk-1' }
+  });
+
+  // chunk: false disables splitting even when longer than maxChunkChars
+  calls.length = 0;
+  const unchunked = await handler.sendText('A'.repeat(40), 'chat@c.us', { maxChunkChars: 15, chunk: false });
+  assert.equal(calls.length, 1);
+  assert.equal(unchunked.chunks, undefined);
+
+  // Multi-chunk applies replyTo and mentions on chunk 1 only and uses config.waha.maxMessageChars
+  calls.length = 0;
+  seq = 0;
+  const configuredHandler = new ResponseHandler({
+    waha,
+    config: { waha: { maxMessageChars: 20 } }
+  });
+  const multi = await configuredHandler.sendText(
+    'Paragraf pertama.\n\nParagraf kedua.\n\nParagraf ketiga.',
+    'group@g.us',
+    { replyTo: 'orig-1', mentions: ['6281@c.us'] }
+  );
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0].options, { replyTo: 'orig-1', mentions: ['6281@c.us'] });
+  assert.deepEqual(calls[1].options, {});
+  assert.deepEqual(calls[2].options, {});
+  assert.deepEqual(multi, {
+    ok: true,
+    type: 'text',
+    chatId: 'group@g.us',
+    messageId: 'chunk-1',
+    messageIds: ['chunk-1', 'chunk-2', 'chunk-3'],
+    chunks: 3,
+    response: { id: 'chunk-1' }
+  });
+});
+
+test('sendText throws uncertain ResponseDeliveryError with sentTypes=[text] if chunk i > 0 fails', async () => {
+  let attempt = 0;
+  const h = harness({
+    sendText: async (text, chatId, options) => {
+      attempt++;
+      h.calls.push({ type: 'text', text, chatId, options });
+      if (attempt === 2) {
+        throw Object.assign(new Error('Bad request on chunk 2'), { response: { status: 400 } });
+      }
+      return { id: `chunk-${attempt}` };
+    }
+  });
+
+  await assert.rejects(
+    () => h.handler.sendText('Chunk one.\n\nChunk two.', 'chat@c.us', { maxChunkChars: 12 }),
+    (err) => err instanceof ResponseDeliveryError &&
+      err.deliveryStatus === 'uncertain' &&
+      Array.isArray(err.sentTypes) &&
+      err.sentTypes.includes('text')
+  );
+  assert.equal(attempt, 2);
+});
+
+test('Stage 1 Phase 4 outbound methods (link_preview, edit, delete, forward) validate, format, and dispatch via send()', async () => {
+  const h = harness();
+
+  // SSRF / URL validation before WAHA call
+  for (const badUrl of [
+    '',
+    'not-a-url',
+    'file:///etc/passwd',
+    'javascript:alert(1)',
+    'https://user:pass@example.com',
+    'http://localhost:3000/test',
+    'http://127.0.0.1/admin',
+    'http://10.0.0.5/internal',
+    'http://169.254.169.254/latest/meta-data',
+    'http://192.168.1.10/router',
+    'http://[::1]:8080/test'
+  ]) {
+    await assert.rejects(
+      () => h.handler.sendLinkPreview('chat@c.us', { text: 'Test', url: badUrl }),
+      /URL|host/i
+    );
+  }
+  assert.equal(h.calls.length, 0);
+
+  const linkReceipt = await h.handler.send({
+    type: 'link_preview',
+    chatId: 'group@g.us',
+    text: 'Cek **artikel** https://example.com/guide',
+    url: 'https://example.com/guide',
+    title: '**Panduan**',
+    description: 'Ringkasan *singkat*',
+    replyTo: 'm0',
+    mentions: ['6281@c.us']
+  });
+  assert.equal(linkReceipt.ok, true);
+  assert.equal(linkReceipt.type, 'link_preview');
+  assert.equal(linkReceipt.messageId, 'link-1');
+  assert.deepEqual(h.calls[0], {
+    type: 'link_preview',
+    chatId: 'group@g.us',
+    payload: {
+      text: 'Cek *artikel* https://example.com/guide',
+      url: 'https://example.com/guide',
+      title: '*Panduan*',
+      description: 'Ringkasan _singkat_',
+      replyTo: 'm0',
+      mentions: ['6281@c.us']
+    }
+  });
+
+  const editReceipt = await h.handler.send({
+    type: 'edit',
+    chatId: 'group@g.us',
+    messageId: 'm1',
+    text: '**Revisi**',
+    options: { mentions: ['6282@c.us'] }
+  });
+  assert.equal(editReceipt.type, 'edit');
+  assert.deepEqual(h.calls[1], {
+    type: 'edit',
+    chatId: 'group@g.us',
+    messageId: 'm1',
+    text: '*Revisi*',
+    options: { mentions: ['6282@c.us'] }
+  });
+
+  await h.handler.editMessage('chat@c.us', 'm2', '**Raw**', { format: false });
+  assert.equal(h.calls[2].text, '**Raw**');
+
+  const delReceipt = await h.handler.send({ type: 'delete', chatId: 'chat@c.us', messageId: 'm2' });
+  assert.equal(delReceipt.type, 'delete');
+  assert.deepEqual(h.calls[3], { type: 'delete', chatId: 'chat@c.us', messageId: 'm2' });
+
+  const fwdReceipt = await h.handler.send({ type: 'forward', chatId: 'chat@c.us', messageId: 'm3' });
+  assert.equal(fwdReceipt.type, 'forward');
+  assert.equal(fwdReceipt.messageId, 'fwd-1');
+  assert.deepEqual(h.calls[4], { type: 'forward', chatId: 'chat@c.us', messageId: 'm3' });
+
+  // Failures wrap in ResponseDeliveryError
+  const failing = harness({
+    editMessage: async () => { throw Object.assign(new Error('Gone'), { response: { status: 404 } }); }
+  });
+  await assert.rejects(
+    () => failing.handler.editMessage('chat@c.us', 'm9', 'New text'),
+    (err) => err instanceof ResponseDeliveryError && err.deliveryStatus === 'failed' && err.type === 'edit'
   );
 });

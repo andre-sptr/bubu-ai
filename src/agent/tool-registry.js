@@ -62,7 +62,7 @@ function registerAllTools({
     ...createProductivityTools({ db, approvalManager }),
     ...createWebTools({ webSearch, webFetch }),
     ...createDocumentTools({ db, documentService, approvalManager, waha, responseHandler }),
-    ...createWahaTools({ waha, responseHandler, sessionMonitor })
+    ...createWahaTools({ waha, responseHandler, approvalManager, sessionMonitor })
   ];
   for (const tool of domainTools) {
     registry.register(tool);

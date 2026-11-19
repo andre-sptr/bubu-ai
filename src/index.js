@@ -1,4 +1,7 @@
 require('dotenv').config();
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const pino = require('pino');
 const { loadConfig, normalizeJid } = require('./config/env');
 const { DatabaseStore } = require('./db/database');
@@ -20,6 +23,54 @@ const { WebSearchService, WebFetchService } = require('./web/web-service');
 const { MemoryService } = require('./memory/memory-service');
 const { MediaIntelligenceService } = require('./media/media-service');
 
+function cleanupStaleTempDirs({
+  tmpRoot = os.tmpdir(),
+  prefix = 'bubu-',
+  maxAgeMs = 3600000,
+  nowMs = Date.now(),
+  logger
+} = {}) {
+  let removed = 0;
+  let skipped = 0;
+  let errors = 0;
+  try {
+    if (!tmpRoot || !fs.existsSync(tmpRoot)) {
+      return { removed, skipped, errors };
+    }
+    const safePrefix = String(prefix || 'bubu-');
+    const safeMaxAge = Number.isFinite(Number(maxAgeMs)) && Number(maxAgeMs) >= 0 ? Number(maxAgeMs) : 3600000;
+    const entries = fs.readdirSync(tmpRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (!entry.name.startsWith(safePrefix)) continue;
+      if (entry.name.startsWith('bubu-db-')) {
+        skipped += 1;
+        continue;
+      }
+      const fullPath = path.join(tmpRoot, entry.name);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (nowMs - stat.mtimeMs < safeMaxAge) {
+          skipped += 1;
+          continue;
+        }
+        fs.rmSync(fullPath, { recursive: true, force: true });
+        removed += 1;
+      } catch (err) {
+        errors += 1;
+        logger?.warn?.({ dir: fullPath, error: err?.message }, 'Failed to clean up stale temp directory');
+      }
+    }
+    if (removed > 0) {
+      logger?.info?.({ removed, skipped, tmpRoot }, 'Cleaned up stale temporary directories');
+    }
+  } catch (err) {
+    errors += 1;
+    logger?.warn?.({ tmpRoot, error: err?.message }, 'Temp directory sweep failed');
+  }
+  return { removed, skipped, errors };
+}
+
 async function main() {
   const config = loadConfig();
   const logger = pino({
@@ -39,8 +90,18 @@ async function main() {
   db.recoverStaleApprovals();
   db.recoverStaleToolExecutions();
   db.recoverStaleTaskResponses();
+  cleanupStaleTempDirs({ logger });
   const waha = new WahaClient(config.waha);
-  const sessionMonitor = new WahaSessionMonitor({ session: config.waha.session });
+  const sessionMonitor = new WahaSessionMonitor({ session: config.waha.session, botJid: config.botJid });
+  const syncResult = await sessionMonitor.syncFromWaha(waha, { logger });
+  if (syncResult?.ok) {
+    logger.info({
+      wahaSession: syncResult.snapshot.session,
+      wahaStatus: syncResult.snapshot.status,
+      botJid: syncResult.snapshot.botJid || config.botJid || null,
+      botLid: syncResult.snapshot.botLid || null
+    }, 'WAHA session synchronized at startup');
+  }
   const provider = new SumopodProvider(config.sumopod);
   const router = new ModelRouter(config.sumopod.models);
   router.assertReady();
@@ -115,6 +176,7 @@ async function main() {
     pollMs: config.inbox.pollMs,
     maxAttempts: config.inbox.maxAttempts,
     staleMs: config.inbox.staleMs,
+    maxConcurrentJobs: config.agent.maxConcurrentJobs,
     onDeadLetter: async ({ event, message, category }) => {
       const incoming = normalizeIncoming(event.payload || {});
       const chatId = normalizeJid(event.chat_id || incoming.chatId);
@@ -130,6 +192,7 @@ async function main() {
       await responseHandler.sendAssistantResponse(message, chatId, mode);
     }
   }).start();
+  processor.worker = worker;
   const reminderWorker = new ReminderWorker({ db, waha, responseHandler, logger });
   reminderWorker.start();
 
@@ -164,7 +227,11 @@ async function main() {
   process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-main().catch((error) => {
-  console.error('Bubu startup failed:', error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error('Bubu startup failed:', error);
+    process.exit(1);
+  });
+}
+
+module.exports = { main, cleanupStaleTempDirs };

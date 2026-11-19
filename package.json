@@ -16,7 +16,10 @@
     "backup": "node scripts/backup.js",
     "test:phase1": "bash scripts/phase1-regression.sh",
     "test:phase2": "bash scripts/phase2-regression.sh",
-    "test:phase3": "bash scripts/phase3-regression.sh"
+    "test:phase3": "bash scripts/phase3-regression.sh",
+    "test:phase4": "bash scripts/phase4-regression.sh",
+    "test:phase5": "bash scripts/phase5-regression.sh",
+    "test:phase6": "bash scripts/phase6-regression.sh"
   },
   "engines": {
     "node": ">=22.0.0"

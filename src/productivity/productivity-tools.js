@@ -204,14 +204,21 @@ function createProductivityTools({ db, approvalManager }) {
     schema: z.object({
       targetId: z.string().min(5).max(100),
       message: z.string().min(1).max(4000),
-      replyTo: z.string().min(1).max(200).optional()
+      replyTo: z.string().min(1).max(200).optional(),
+      mentions: z.array(z.string().min(5).max(100)).max(20).optional()
     }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         targetId: { type: 'string' },
         message: { type: 'string' },
-        replyTo: { type: 'string', description: 'Optional WhatsApp message ID to reply to' }
+        replyTo: { type: 'string', description: 'Optional WhatsApp message ID to reply to' },
+        mentions: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 20,
+          description: 'Optional list of WhatsApp JIDs to mention'
+        }
       },
       required: ['targetId', 'message']
     },

@@ -15,21 +15,52 @@ function escapePdfString(value) {
     .replace(/\)/g, '\\)');
 }
 
+function splitOversizedToken(token, maxChars) {
+  const str = String(token ?? '');
+  const limit = Math.max(1, Math.floor(Number(maxChars) || 1));
+  if (str.length <= limit) return [str];
+
+  const chunks = [];
+  let start = 0;
+  const minSplit = Math.max(1, Math.floor(limit * 0.5));
+  while (start < str.length) {
+    if (str.length - start <= limit) {
+      chunks.push(str.slice(start));
+      break;
+    }
+    const slice = str.slice(start, start + limit);
+    let splitLen = limit;
+    for (let i = slice.length - 1; i >= minSplit; i--) {
+      if ('/-_?&=.:'.includes(slice[i])) {
+        splitLen = i + 1;
+        break;
+      }
+    }
+    chunks.push(str.slice(start, start + splitLen));
+    start += splitLen;
+  }
+  return chunks;
+}
+
 function wrapTextToWidth(text, maxChars) {
+  const limit = Math.max(1, Math.floor(Number(maxChars) || 1));
   const clean = String(text || '').replace(/\s+/g, ' ').trim();
   if (!clean) return [''];
-  if (clean.length <= maxChars) return [clean];
+  if (clean.length <= limit) return [clean];
   const words = clean.split(' ');
   const lines = [];
   let current = '';
   for (const word of words) {
-    if (!current) {
-      current = word;
-    } else if (current.length + 1 + word.length <= maxChars) {
-      current += ` ${word}`;
-    } else {
-      lines.push(current);
-      current = word;
+    const pieces = word.length > limit ? splitOversizedToken(word, limit) : [word];
+    for (const piece of pieces) {
+      if (!current) {
+        current = piece;
+      } else if (current.length + 1 + piece.length <= limit) {
+        current += ` ${piece}`;
+      } else {
+        lines.push(current);
+        current = piece;
+      }
     }
   }
   if (current) lines.push(current);
@@ -113,8 +144,13 @@ function buildPdf14Buffer({ title, content, documentType = 'general', subtitle =
         index++;
       }
 
-      const rowHeight = 20;
+      const maxCellChars = Math.max(6, Math.floor((colWidth - 8) / 5.4));
       for (let r = 0; r < tableRows.length; r++) {
+        const wrappedCells = tableRows[r].map((cell) =>
+          wrapTextToWidth(String(cell ?? ''), maxCellChars).slice(0, 4)
+        );
+        const maxCellLines = Math.max(1, ...wrappedCells.map((lines) => lines.length));
+        const rowHeight = Math.max(20, maxCellLines * 11 + 8);
         ensureSpace(rowHeight + 4);
         const rowTop = cursorY + 11;
         const rowBottom = rowTop - rowHeight;
@@ -128,12 +164,16 @@ function buildPdf14Buffer({ title, content, documentType = 'general', subtitle =
         currentOps.push('0.82 0.86 0.92 RG 0.5 w');
         currentOps.push(`${marginX} ${rowBottom.toFixed(2)} ${contentWidth.toFixed(2)} ${rowHeight} re S`);
 
-        const maxCellChars = Math.max(6, Math.floor(colWidth / 5.4));
         for (let c = 0; c < colCount; c++) {
           const cellX = marginX + c * colWidth + 5;
-          const cellText = String(tableRows[r][c] ?? '').slice(0, maxCellChars);
+          const cellLines = wrappedCells[c] || [''];
           currentOps.push(r === 0 ? '1 1 1 rg' : '0.13 0.13 0.13 rg');
-          currentOps.push(`BT /${r === 0 ? 'F2' : 'F1'} 9 Tf ${cellX.toFixed(2)} ${(rowBottom + 6).toFixed(2)} Td (${escapePdfString(cellText)}) Tj ET`);
+          for (let lineIdx = 0; lineIdx < cellLines.length; lineIdx++) {
+            const lineY = rowTop - 14 - lineIdx * 11;
+            currentOps.push(
+              `BT /${r === 0 ? 'F2' : 'F1'} 9 Tf ${cellX.toFixed(2)} ${lineY.toFixed(2)} Td (${escapePdfString(cellLines[lineIdx])}) Tj ET`
+            );
+          }
         }
         cursorY -= rowHeight;
       }
@@ -268,6 +308,7 @@ function buildPdf14Buffer({ title, content, documentType = 'general', subtitle =
 
 module.exports = {
   escapePdfString,
+  splitOversizedToken,
   wrapTextToWidth,
   buildPdf14Buffer
 };

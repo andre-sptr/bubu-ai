@@ -95,10 +95,34 @@ class AgentRuntime {
 
     const task = classifyTask([text, captionContext, voiceInstruction].filter(Boolean).join('\n'));
     const hasVisualImages = Array.isArray(attachmentEvidence?.visualImages) && attachmentEvidence.visualImages.length > 0;
-    const selected = this.router.select(
+    let selected = this.router.select(
       task,
       hasVisualImages ? { needsTools: true, needsVision: true } : { needsTools: true }
     );
+    const memoryToolsAvailable = Boolean(this.tools?.get?.('consolidate_memories'));
+    let escalatedFromTier = null;
+    const maybeEscalateTier = () => {
+      if (selected.tier !== 'fast' || typeof this.router?.select !== 'function') return;
+      try {
+        const candidate = this.router.select('general_chat', {
+          needsTools: true,
+          needsVision: hasVisualImages
+        });
+        if (candidate?.model && candidate.tier && candidate.tier !== selected.tier) {
+          escalatedFromTier = selected.tier;
+          this.logger?.info?.({
+            taskId,
+            fromTier: selected.tier,
+            toTier: candidate.tier,
+            fromModel: selected.model,
+            toModel: candidate.model
+          }, 'Escalating agent model tier for follow-up tool synthesis');
+          selected = candidate;
+        }
+      } catch {
+        // Keep fast tier when no higher tier supports tools/vision.
+      }
+    };
     const context = { taskId, chatId, requesterId, scope, incomingMessageId };
     this.db.createTask({ id: taskId, sourceEventId, chatId, requesterId, scope, requestText: text });
     if (existingTask?.status === 'failed') {
@@ -146,6 +170,9 @@ class AgentRuntime {
 
     try {
       for (let round = 0; round < this.config.agent.maxRounds; round++) {
+        if (round >= 1 && selected.tier === 'fast') {
+          maybeEscalateTier();
+        }
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) throw new Error('Agent task timed out');
         const requestStarted = Date.now();
@@ -246,7 +273,16 @@ class AgentRuntime {
             model_tier: selected.tier, tool_calls: calls
           });
           this.db.queueTaskResponse(taskId, answer);
-          return { taskId, task, tier: selected.tier, model: completion.model, text: answer, toolCalls: calls };
+          return {
+            taskId,
+            task,
+            tier: selected.tier,
+            model: completion.model,
+            text: answer,
+            toolCalls: calls,
+            memoryToolsAvailable,
+            ...(escalatedFromTier ? { escalatedFromTier } : {})
+          };
         }
 
         messages.push(assistantMessage);
@@ -261,7 +297,17 @@ class AgentRuntime {
             });
             this.db.queueTaskResponse(taskId, notice);
             this.logger.warn({ taskId, maxToolCalls: this.config.agent.maxToolCalls }, 'Agent tool-call limit reached');
-            return { taskId, task, tier: selected.tier, model: completion.model, text: notice, toolCalls: calls - 1, toolLimitReached: true };
+            return {
+              taskId,
+              task,
+              tier: selected.tier,
+              model: completion.model,
+              text: notice,
+              toolCalls: calls - 1,
+              toolLimitReached: true,
+              memoryToolsAvailable,
+              ...(escalatedFromTier ? { escalatedFromTier } : {})
+            };
           }
 
           const name = call.function?.name;
@@ -288,7 +334,17 @@ class AgentRuntime {
                   const notice = 'Status tindakan eksternal sebelumnya belum dapat dipastikan. Bubu menghentikan task dan tidak akan mengirim ulang otomatis untuk mencegah duplikasi.';
                   this.db.updateTask(taskId, { status: 'uncertain', error: prior.error || notice, model_tier: selected.tier, tool_calls: calls });
                   this.db.queueTaskResponse(taskId, notice);
-                  return { taskId, task, tier: selected.tier, model: selected.model, text: notice, toolCalls: calls, uncertain: true };
+                  return {
+                    taskId,
+                    task,
+                    tier: selected.tier,
+                    model: selected.model,
+                    text: notice,
+                    toolCalls: calls,
+                    uncertain: true,
+                    memoryToolsAvailable,
+                    ...(escalatedFromTier ? { escalatedFromTier } : {})
+                  };
                 }
                 result = { error: 'Previous execution status is uncertain; automatic replay is blocked.' };
               } else {
@@ -303,7 +359,17 @@ class AgentRuntime {
                     const notice = 'Pengiriman/permintaan eksternal mengalami hasil yang tidak pasti. Bubu tidak akan mengulang tindakan otomatis. Periksa WhatsApp sebelum mencoba lagi.';
                     this.db.updateTask(taskId, { status: 'uncertain', error: error.message, model_tier: selected.tier, tool_calls: calls });
                     this.db.queueTaskResponse(taskId, notice);
-                    return { taskId, task, tier: selected.tier, model: completion.model, text: notice, toolCalls: calls, uncertain: true };
+                    return {
+                      taskId,
+                      task,
+                      tier: selected.tier,
+                      model: completion.model,
+                      text: notice,
+                      toolCalls: calls,
+                      uncertain: true,
+                      memoryToolsAvailable,
+                      ...(escalatedFromTier ? { escalatedFromTier } : {})
+                    };
                   }
                   throw error;
                 }
@@ -355,7 +421,17 @@ class AgentRuntime {
               repeatedInvalidToolCalls: currentToolSchemaErrors,
               argumentBytes: Buffer.byteLength(String(call.function?.arguments || '{}'))
             }, 'Stopping repeated invalid tool-call loop');
-            return { taskId, task, tier: selected.tier, model: completion.model, text: notice, toolCalls: calls, toolValidationLoop: true };
+            return {
+              taskId,
+              task,
+              tier: selected.tier,
+              model: completion.model,
+              text: notice,
+              toolCalls: calls,
+              toolValidationLoop: true,
+              memoryToolsAvailable,
+              ...(escalatedFromTier ? { escalatedFromTier } : {})
+            };
           }
 
           if (result?.pendingApproval) {
@@ -365,12 +441,26 @@ class AgentRuntime {
               tool_calls: calls, result_text: message
             });
             this.db.queueTaskResponse(taskId, message);
-            return { taskId, task, tier: selected.tier, model: completion.model, text: message, toolCalls: calls, awaitingApproval: true };
+            return {
+              taskId,
+              task,
+              tier: selected.tier,
+              model: completion.model,
+              text: message,
+              toolCalls: calls,
+              awaitingApproval: true,
+              memoryToolsAvailable,
+              ...(escalatedFromTier ? { escalatedFromTier } : {})
+            };
           }
 
           const serializedResult = JSON.stringify(result === undefined ? null : result) ?? 'null';
           const toolContent = serializedResult.slice(0, this.config.agent.maxToolResultChars);
           messages.push({ role: 'tool', tool_call_id: call.id, content: toolContent });
+        }
+
+        if (selected.tier === 'fast') {
+          maybeEscalateTier();
         }
       }
 
@@ -397,7 +487,17 @@ class AgentRuntime {
         model_tier: selected.tier, tool_calls: calls
       });
       this.db.queueTaskResponse(taskId, finalAnswer);
-      return { taskId, task, tier: selected.tier, model: finalCompletion.model || selected.model, text: finalAnswer, toolCalls: calls, finalizedAfterRoundLimit: true };
+      return {
+        taskId,
+        task,
+        tier: selected.tier,
+        model: finalCompletion.model || selected.model,
+        text: finalAnswer,
+        toolCalls: calls,
+        finalizedAfterRoundLimit: true,
+        memoryToolsAvailable,
+        ...(escalatedFromTier ? { escalatedFromTier } : {})
+      };
     } catch (error) {
       this.db.updateTask(taskId, {
         status: 'failed', error: error.message, model_tier: selected.tier, tool_calls: calls

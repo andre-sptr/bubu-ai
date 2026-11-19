@@ -321,3 +321,141 @@ test('WahaClient createTypingKeepalive starts immediately, refreshes periodicall
     client.close();
   }
 });
+
+test('WahaClient getMe retries on transient errors and hits /api/sessions/:session/me', async () => {
+  let attempts = 0;
+  const requests = [];
+  const client = new WahaClient({
+    baseUrl: 'http://127.0.0.1:3000',
+    session: 'bubu prod',
+    apiKey: 'secret-key',
+    retryBaseDelayMs: 0,
+    axiosInstance: {
+      request: async (cfg) => {
+        attempts++;
+        requests.push(cfg);
+        if (attempts < 3) {
+          const err = new Error('transient');
+          err.response = { status: attempts === 1 ? 503 : 429 };
+          throw err;
+        }
+        return { data: { id: '628999@c.us', lid: '12345@lid', pushName: 'Bubu' } };
+      }
+    }
+  });
+
+  try {
+    const me = await client.getMe();
+    assert.deepEqual(me, { id: '628999@c.us', lid: '12345@lid', pushName: 'Bubu' });
+    assert.equal(attempts, 3);
+    assert.equal(requests[0].method, 'GET');
+    assert.equal(requests[0].url, '/api/sessions/bubu%20prod/me');
+  } finally {
+    client.close();
+  }
+});
+
+test('WahaClient Stage 1 Phase 4 outbound methods hit expected routes/payloads and never auto-retry', async () => {
+  const requests = [];
+  const client = new WahaClient({
+    baseUrl: 'http://127.0.0.1:3000',
+    session: 'bubu/main',
+    apiKey: 'top-secret-key',
+    retryBaseDelayMs: 0,
+    axiosInstance: {
+      request: async (cfg) => {
+        requests.push(cfg);
+        return { data: { id: `resp-${requests.length}` } };
+      }
+    }
+  });
+
+  try {
+    await client.sendLinkCustomPreview('123@g.us', {
+      text: 'Lihat https://example.com',
+      url: 'https://example.com',
+      title: 'Example',
+      description: 'Summary',
+      replyTo: 'm0',
+      mentions: ['6281@c.us']
+    });
+    await client.sendLinkCustomPreview('6281@c.us', {
+      text: 'Minimal https://example.org',
+      url: 'https://example.org'
+    });
+    await client.editMessage('123@g.us', 'msg/1', 'Edited text', { mentions: ['6282@c.us'] });
+    await client.editMessage('6281@c.us', 'msg-2', 'Plain edit');
+    await client.deleteMessage('123@g.us', 'msg/1');
+    await client.forwardMessage('6281@c.us', 'msg-9');
+
+    assert.equal(requests.length, 6);
+    assert.equal(requests[0].method, 'POST');
+    assert.equal(requests[0].url, '/api/sendLinkCustomPreview');
+    assert.deepEqual(requests[0].data, {
+      session: 'bubu/main',
+      chatId: '123@g.us',
+      text: 'Lihat https://example.com',
+      preview: { url: 'https://example.com', title: 'Example', description: 'Summary' },
+      reply_to: 'm0',
+      mentions: ['6281@c.us']
+    });
+
+    assert.deepEqual(requests[1].data, {
+      session: 'bubu/main',
+      chatId: '6281@c.us',
+      text: 'Minimal https://example.org',
+      preview: { url: 'https://example.org', title: '', description: '' }
+    });
+
+    assert.equal(requests[2].method, 'PUT');
+    assert.equal(requests[2].url, '/api/bubu%2Fmain/chats/123%40g.us/messages/msg%2F1');
+    assert.deepEqual(requests[2].data, { text: 'Edited text', mentions: ['6282@c.us'] });
+
+    assert.equal(requests[3].method, 'PUT');
+    assert.equal(requests[3].url, '/api/bubu%2Fmain/chats/6281%40c.us/messages/msg-2');
+    assert.deepEqual(requests[3].data, { text: 'Plain edit' });
+
+    assert.equal(requests[4].method, 'DELETE');
+    assert.equal(requests[4].url, '/api/bubu%2Fmain/chats/123%40g.us/messages/msg%2F1');
+    assert.equal(requests[4].data, undefined);
+
+    assert.equal(requests[5].method, 'POST');
+    assert.equal(requests[5].url, '/api/forwardMessage');
+    assert.deepEqual(requests[5].data, {
+      session: 'bubu/main',
+      chatId: '6281@c.us',
+      messageId: 'msg-9'
+    });
+
+    // Verify none of the new outbound methods retry on transient 503 and sanitize apiKey
+    const failingCalls = [];
+    client.http = {
+      request: async (cfg) => {
+        failingCalls.push(cfg.url);
+        const err = new Error('Server unavailable with top-secret-key');
+        err.response = { status: 503, data: { message: 'Leak top-secret-key' } };
+        err.config = { headers: { 'X-Api-Key': 'top-secret-key' } };
+        throw err;
+      }
+    };
+
+    const outboundOps = [
+      () => client.sendLinkCustomPreview('6281@c.us', { text: 'hi', url: 'https://example.com' }),
+      () => client.editMessage('6281@c.us', 'm1', 'hi'),
+      () => client.deleteMessage('6281@c.us', 'm1'),
+      () => client.forwardMessage('6281@c.us', 'm1')
+    ];
+    for (const op of outboundOps) {
+      const before = failingCalls.length;
+      await assert.rejects(op, (err) => {
+        assert.equal(err.status, 503);
+        assert.equal(err.message.includes('top-secret-key'), false);
+        assert.equal(Object.hasOwn(err, 'config'), false);
+        return true;
+      });
+      assert.equal(failingCalls.length - before, 1);
+    }
+  } finally {
+    client.close();
+  }
+});

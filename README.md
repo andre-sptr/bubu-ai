@@ -12,9 +12,9 @@ Rebuild bersih (tanpa kode atau data Bubu v1) untuk asisten AI WhatsApp hybrid (
 | **Phase 1** | Core Reliability & Response Control (Task 1.1–1.9) | **Selesai & Disetujui** | Antrean durable SQLite, idempotensi, unified `ResponseHandler`, isolasi DM/grup |
 | **Phase 2** | Full Multimodal WhatsApp (Task 2.1–2.8) | **Kode & Unit Test Selesai** | Pemahaman gambar/video ber-timestamp, STT + Silero VAD, Piper TTS & mode `/voice` |
 | **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Kode & Unit Test Selesai** | PDF hybrid + OCR, DOCX XML terstruktur, analitik spreadsheet, generasi DOCX/XLSX/PDF |
-| **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Kode & Unit Test Selesai** | Reaksi emoji, polling native, lokasi peta, kartu kontak vCard, info grup, cek nomor WhatsApp, & monitor sesi WAHA |
-| **Phase 5** | Advanced Agent & Memory Lifecycle (Task 5.1–5.8) | **Direncanakan** | Siklus hidup memori & orkestrasi agen lanjutan |
-| **Phase 6** | Queue Redesign & End-to-End Hardening (Task 6.1–6.8) | **Direncanakan** | Desain ulang antrean & pengerasan end-to-end |
+| **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Kode & Unit Test Selesai** | 14 tools native WAHA (reaksi, polling, lokasi, vCard, link preview, edit/delete pesan bot, persetujuan lintas-chat, info grup, cek nomor, riwayat DM, & monitor sesi/identitas bot) |
+| **Phase 5** | Advanced Agent & Memory Lifecycle (Task 5.1–5.8) | **Kode & Unit Test Selesai** | Siklus hidup memori (12 memory tools), migrasi v11, budget prompt JSON-aman, eskalasi tier dinamis, & perintah `/memory` |
+| **Phase 6** | Queue Redesign & End-to-End Hardening (Task 6.1–6.8) | **Kode & Unit Test Selesai** | Antrean prioritas + FIFO per-chat, konkurensi multi-slot terbatas, `/queue`, retensi & cleanup temp, backup terverifikasi `integrity_check`, PDF token/table wrapping, & normalisasi XLSX |
 
 ---
 
@@ -24,11 +24,11 @@ Informasi lingkungan produksi target:
 
 | Komponen | Spesifikasi / Lokasi di VPS | Catatan Operasional |
 |---|---|---|
-| **Direktori Proyek** | `/www/wwwroot/bot-project/bubu` | Dikelola dengan PM2 (`ecosystem.config.cjs`, proses `bubu`, `max_memory_restart: 512M`). |
-| **Kapasitas Server** | **2 vCPU**, **1,9 GiB RAM total**, **23,7 GiB disk bebas** | Dilindungi single-concurrency guard (`audioBusy` & `videoBusy`) pada `MediaIntelligenceService` dan `maxConcurrentJobs = 1`. |
+| **Direktori Proyek** | `/www/wwwroot/bot-project/bubu` | Dikelola dengan PM2 (`ecosystem.config.cjs`, proses `bubu`, `max_memory_restart: 1G`). |
+| **Kapasitas Server** | **2 vCPU**, **1,9 GiB RAM total**, **23,7 GiB disk bebas** | Dilindungi single-concurrency guard (`audioBusy` & `videoBusy`) pada `MediaIntelligenceService` dan `maxConcurrentJobs = 1` (dapat dikonfigurasi via `AGENT_MAX_CONCURRENT_JOBS` dengan serialisasi FIFO per chat). |
 | **Runtime Node.js** | **Node.js v24.22.1** (`engines: >=22.0.0`) | `better-sqlite3` v12+ menyediakan prebuilt binary Node.js 24 tanpa kompilasi C++ lokal. |
 | **Endpoint Layanan** | `http://127.0.0.1:3088` (`/webhook`, `/health`, `/ready`) | Readiness memverifikasi koneksi SQLite dan status worker. |
-| **Database** | SQLite (`./data/bubu.sqlite`), **Schema Version 9** | Mode WAL + Foreign Keys aktif; backup online melalui `npm run backup`. |
+| **Database** | SQLite (`./data/bubu.sqlite`), **Schema Version 12** | Mode WAL + Foreign Keys aktif; backup online terverifikasi `PRAGMA integrity_check` & rotasi retensi melalui `npm run backup`. |
 | **Storage Dokumen & Media** | `./storage` (`./storage/inbound`, `./storage/generated`) | Berada di luar public web root (`mode 0700`); file media masuk & direktori kerja sementara dihapus otomatis di blok `finally`. |
 | **WAHA Gateway** | **WAHA 2026.10.1 · CORE · GOWS · WORKING** | Event aktif: `message` dan `session.status`. Mendukung unduhan media lokal, pengiriman teks/file/gambar/video, `sendVoice`, serta presence (`sendSeen`, `startTyping`, `stopTyping`). |
 | **FFmpeg & FFprobe** | **v6.1.1** (`ffmpeg`, `ffprobe`, encoder `libopus` aktif) | Normalisasi gambar JPEG (`<=1280px`), ekstraksi frame video ber-timestamp, konversi audio WAV 16 kHz mono, dan encoding voice note OGG/Opus 48 kHz 32 kbps. |
@@ -76,7 +76,7 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 
 ---
 
-## 5. Kapabilitas Utama Saat Ini (Hingga Phase 4)
+## 5. Kapabilitas Utama Saat Ini (Hingga Phase 6)
 
 ### A. Keandalan Inti & Kontrol Respons (Phase 1)
 - **Antrean Inbox Durable (`InboxWorker`):** Deduplikasi event webhook, klaim atomik, retry eksponensial terbatas (`maxAttempts = 5`), transisi `dead`-letter dengan notifikasi aman, dan pemulihan event `stale` saat startup.
@@ -104,10 +104,27 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 - **Riset Web Aman:** `web_search` (opsional dengan `TAVILY_API_KEY`) dan `web_fetch` (memblokir IP privat/localhost dan kredensial URL).
 - **Memori Hibrida & Proyek:** Pencarian gabungan kemiripan kosinus + leksikal + signifikansi + kebaruan, ekstraksi memori konservatif berbasis sinyal eksplisit, serta manajemen task (`create_task`, `list_tasks`, `update_task`, `complete_task`) dan pengingat (`create_reminder`, `list_reminders`, `cancel_reminder`).
 
-### D. Fitur Native WhatsApp & Hardening Transport (Phase 4)
-- **Tools Native Outbound (`src/channels/waha/waha-tools.js`):** Mendukung reaksi emoji (`react_to_message`), polling native 2–12 opsi (`send_poll`), pin lokasi peta (`send_location`), serta kartu kontak vCard (`send_contact_card`). Seluruh pengiriman keluar tetap terpusat melalui `ResponseHandler` dengan `risk: 'external'` dan pelacakan `deliveryStatus`.
-- **Inspeksi Grup & Status Sesi Terisolasi Scope:** `get_group_info` hanya tersedia pada workspace grup (`@g.us`) dengan ringkasan peserta terikat batas; `check_whatsapp_number` dan `get_waha_session_status` dibatasi hanya untuk DM personal pemilik.
-- **Hardening Transport, Keamanan & Kehadiran WAHA:** Verifikasi webhook token dan opsional HMAC-SHA512 menggunakan `crypto.timingSafeEqual` sebelum parsing JSON penuh, monitor status `session.status` (`WahaSessionMonitor`) terhubung ke `/ready` dan `/status`, pengiriman media asinkron (`fs.promises.readFile`), redaksi kredensial di log Pino, typing keepalive berkala, serta reply-quote di grup.
+### D. Fitur Native WhatsApp & Hardening Transport (Phase 4 — Task 4.1–4.8)
+- **14 Tools Native Outbound & Read WAHA (`src/channels/waha/waha-tools.js`):**
+  - *Interaksi Chat Saat Ini (`personal` & `group`, `risk: 'external'`):* reaksi emoji (`react_to_message`), polling native 2–12 opsi unik (`send_poll`), pin lokasi peta (`send_location`), kartu kontak vCard (`send_contact_card`), pratinjau tautan kustom berfilter SSRF (`send_link_preview`), serta koreksi/penghapusan pesan milik Bubu di chat yang sama (`edit_bot_message` & `delete_bot_message` dengan penolakan pesan pengguna masuk `false_*`).
+  - *Pengiriman Lintas-Chat Berpersetujuan Pemilik (`personal` DM, `requiresApproval: true`):* selain `send_whatsapp_message` (mendukung `replyTo` & `mentions`) dan `send_whatsapp_file`, kini tersedia `send_whatsapp_poll`, `send_whatsapp_location`, dan `send_whatsapp_contact` yang terintegrasi penuh dengan `/approve <id>` dan `/deny <id>` di `ApprovalManager`.
+  - *Inspeksi Terisolasi Scope (`risk: 'low'`):* `get_group_info` khusus workspace grup (`@g.us`) dengan batas maksimum 30 peserta; `check_whatsapp_number`, `get_waha_session_status`, dan `list_recent_chat_messages` (1–15 pesan terbaru tanpa unduh media, ditandai `untrusted: true`) khusus DM personal pemilik.
+- **Pemecahan Pesan Panjang Otomatis (`splitWhatsAppMessage`):** `ResponseHandler.sendText` otomatis memecah pesan panjang (`>3800` karakter) secara berurutan pada batas paragraf/baris/kata dengan menjaga keseimbangan blok kode ```` ``` ````, menyertakan `replyTo`/`mentions` hanya pada bagian pertama, serta menandai kegagalan pada bagian ke-`2..N` sebagai `deliveryStatus: 'uncertain'`.
+- **Auto-Discovery Identitas Bot (`botJid` & `botLid`) & Normalisasi Vote Polling:** `WahaSessionMonitor.syncFromWaha` menyinkronkan status sesi serta `botJid`/`botLid` saat startup (dengan fallback `getMe()`) secara non-fatal dan memperbaruinya dari payload `me` webhook terautentikasi. `hasBotMention` mengenali daftar JID dan `@lid` bot secara bersamaan, `/status` menampilkan `Bot JID` yang terdeteksi, dan `normalizePollVote` mengekstrak event `poll.vote`.
+- **Hardening Transport, Keamanan & Kehadiran WAHA:** Seluruh 13 metode pengiriman/mutasi keluar WAHA terpusat eksklusif di `ResponseHandler` tanpa `fs.readFileSync` pemblokir event-loop. Dilengkapi verifikasi webhook token & HMAC-SHA512 (`crypto.timingSafeEqual`), `sendSeen` terarah (`messageIds` + `participant` di grup), typing keepalive berkala, serta redaksi kredensial di log Pino.
+
+### E. Orkestrasi Agen & Siklus Hidup Memori Lanjutan (Phase 5 — Task 5.1–5.8)
+- **Migrasi Skema v11 & Siklus Hidup Memori (`src/db/migrations.js`, `src/db/database.js`, `src/db/repositories/memory.repository.js`):** Menambahkan kolom `status` (`active`, `superseded`, `archived`), `superseded_by`, dan indeks `idx_memories_active_scope`; de-duplikasi konten aktif saat `saveMemory`; pemfilteran status aktif pada pencarian tanpa menimpa `updated_at` saat baca; serta transaksi SQLite atomik pada `beginToolExecution`, `denyApproval`, dan `finishApproval`.
+- **12 Tools Memori Terisolasi Workspace (`src/memory/memory-tools.js`, `src/memory/memory-service.js`):** Menambah `list_memories`, `update_memory`, `forget_memory`, dan `consolidate_memories`, serta dukungan `supersedeId` pada `remember_fact` / `captureFromTurn`, parser JSON aman (`extractJsonObject`), deduplikasi permintaan embedding serentak, `backfillEmbeddings`, dan `consolidateWorkspace`.
+- **Budget Prompt JSON-Aman & Eskalasi Tier Dinamis (`src/agent/prompt-builder.js`, `src/agent/runtime.js`):** `fitJsonArrayToBudget` memastikan konteks dokumen (`<= 3000`), memori (`<= 6000`), dan proyek (`<= 3000`) selalu berupa JSON array yang valid; `trimHistoryToBudget` menjaga riwayat percakapan terbaru dalam batas karakter (`16000`) dengan mempertahankan atribusi pengirim grup; dan `AgentRuntime` menaikkan tier `fast` ke `balanced` saat putaran lanjutan membutuhkan sintesis hasil tool.
+- **Perintah `/memory` & Backfill Oportunistik (`src/agent/command-handler.js`, `src/agent/message-processor.js`):** Menyediakan `/memory status`, `/memory list`, dan `/memory sync` (khusus pemilik) beserta pembaruan `/help`, serta memicu `backfillEmbeddings` secara non-fatal setelah auto-capture memori berhasil.
+
+### F. Desain Ulang Antrean & Pengerasan End-to-End (Phase 6 — Task 6.1–6.8)
+- **Migrasi Skema v12 & Antrean Prioritas FIFO Per-Chat (`src/db/migrations.js`, `src/db/database.js`, `src/db/repositories/inbox.repository.js`, `src/app.js`):** Menambahkan kolom `priority` (`1..10`, default `5`) serta indeks `idx_inbox_priority_ready` dan `idx_inbox_chat_status` pada `inbox_events`. `classifyEventPriority` memberi prioritas `1` untuk perintah pemilik (`/approve`, `/deny`, `/status`, `/queue`), `2` untuk DM, dan `5` untuk grup, sementara `claimNextEvent()` atomik menjamin tidak ada dua event dari `chat_id` yang sama berjalan bersamaan.
+- **Manajemen Dead-Letter, Retensi Data, & Telemetri (`src/db/repositories/inbox.repository.js`, `src/db/repositories/telemetry.repository.js`):** Menyediakan `getQueueStats`, `listDeadEvents`, `requeueDeadEvent` (menolak requeue untuk event berstatus `uncertain` / `delivery_uncertain:` agar pengiriman ganda tetap terhindar), `pruneHistoryAndQueue` transaksional untuk event `completed`/`dead`, `model_usage`, dan `audit_logs`, serta `getTelemetrySummary`.
+- **Konkurensi Multi-Slot Terbatas, Pembersihan Temp, & Perintah `/queue` (`src/workers/inbox-worker.js`, `src/index.js`, `src/agent/command-handler.js`):** `InboxWorker` mendukung `maxConcurrentJobs` (`AGENT_MAX_CONCURRENT_JOBS`), pemangkasan berkala `pruneHistoryAndQueue` (`pruneIntervalMs`), dan `getStats()`; `cleanupStaleTempDirs` membersihkan direktori sementara `bubu-*` yang kedaluwarsa saat startup (melindungi `bubu-db-*` dan direktori baru); dan `/queue` (`/queue status`, `/queue dead`, `/queue retry <eventId>`, `/queue prune`) memberi kendali antrean bagi pemilik.
+- **Pengerasan Backup Produksi (`scripts/backup.js`):** `runBackup` memvalidasi keberadaan DB sumber, menolak jalur `backupDir` dan `storageDir` yang identik atau bersarang satu sama lain, membuka DB dengan `{ readonly: true, fileMustExist: true, timeout: 10000 }`, menulis ke `.tmp`, memverifikasi `PRAGMA integrity_check === 'ok'`, mengatur izin `0o600`, melakukan rename atomik, menyalin `storageDir`, dan memutar cadangan lama melalui `pruneOldBackups(backupDir, keepCount)`.
+- **Pembungkusan Token Panjang PDF & Normalisasi Sel XLSX/CSV (`src/documents/generators/pdf-generator.js`, `src/documents/document-service.js`):** `splitOversizedToken` dan `wrapTextToWidth` memastikan tidak ada baris/URL yang melebihi batas lebar, dan tabel Markdown `buildPdf14Buffer` membungkus sel hingga 4 baris dengan tinggi baris dinamis (`Math.max(20, maxCellLines * 11 + 8)`). Ekstraksi spreadsheet menormalisasi `richText`, `Date` (ISO), `error`, hasil formula, baris baru (`\r?\n`), dan karakter pipa (`|` → `│`) agar kolom `spreadsheet-analyzer.js` tetap presisi.
 
 ---
 
@@ -117,18 +134,21 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 bubu/
 ├── data/                                   # Database SQLite lokal (bubu.sqlite, WAL/SHM — gitignored)
 ├── scripts/                                # Skrip operasional, cek sintaks, & regresi otomatis
-│   ├── backup.js                           # Online backup SQLite + storage
+│   ├── backup.js                           # Online backup SQLite terverifikasi integrity_check + rotasi storage
 │   ├── check-syntax.js                     # Pemeriksaan sintaks seluruh file JS/CJS
 │   ├── list-models.js                      # Cek katalog model Sumopod
 │   ├── phase1-regression.sh                # Gate regresi otomatis Phase 1
 │   ├── phase2-regression.sh                # Gate regresi otomatis Phase 2
 │   ├── phase3-regression.sh                # Gate regresi otomatis Phase 3
+│   ├── phase4-regression.sh                # Gate regresi otomatis Phase 4
+│   ├── phase5-regression.sh                # Gate regresi otomatis Phase 5
+│   ├── phase6-regression.sh                # Gate regresi otomatis Phase 6
 │   └── smoke-tool-calling.js               # Uji smoke tool calling
 ├── src/
 │   ├── agent/                              # Orkestrasi agen (Runtime, PromptBuilder, CommandHandler, MessageProcessor, ModelRouter, ApprovalManager, ToolRegistry)
 │   ├── channels/                           # Transport & formatting WhatsApp (ResponseHandler, WhatsAppFormatter, WAHA Client, Normalizer, SessionMonitor & Tools)
 │   ├── config/                             # Konfigurasi environment & default produksi (env.js)
-│   ├── db/                                 # DatabaseStore, migrasi v1–v9 (migrations.js), dan 7 repository SQLite per domain (repositories/)
+│   ├── db/                                 # DatabaseStore, migrasi v1–v12 (migrations.js), dan 7 repository SQLite per domain (repositories/)
 │   ├── documents/                          # Layanan & tools dokumen (DocumentService, DocumentTools, parsers/, generators/)
 │   ├── media/                              # Layanan & validasi multimodal (MediaIntelligenceService, media-validator.js)
 │   ├── memory/                             # Memori semantik & proyek (MemoryService, memory-tools.js)
@@ -141,7 +161,7 @@ bubu/
 │   └── index.js                            # Bootstrap aplikasi & graceful shutdown
 ├── storage/                                # Penyimpanan privat dokumen & media sementara (isi gitignored)
 └── test/
-    ├── contracts/                          # Kontrak regresi lintas-fase (phase1, phase2, & phase4)
+    ├── contracts/                          # Kontrak regresi lintas-fase (phase1, phase2, phase4, phase5, & phase6)
     ├── integration/                        # Tes integrasi SQLite & migrasi (database.test.js)
     └── unit/                               # Unit test terorganisir per domain (agent, channels, config, documents, media, memory, utils, web, workers)
 ```
@@ -162,10 +182,13 @@ npm run test:unit
 npm run test:integration
 npm run test:contracts
 
-# 4. Jalankan gate regresi Phase 1, Phase 2, & Phase 3 di VPS
+# 4. Jalankan gate regresi Phase 1–6 di VPS
 npm run test:phase1
 npm run test:phase2
 npm run test:phase3
+npm run test:phase4
+npm run test:phase5
+npm run test:phase6
 
 # 5. Restart layanan melalui PM2 & cek kesehatan
 pm2 restart bubu

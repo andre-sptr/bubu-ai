@@ -85,3 +85,76 @@ test('rejects duplicate worksheet names and unsafe external formula references',
     }), /Formula ditolak/, `Expected ${fn} to be rejected`);
   }
 });
+
+test('extracts XLSX richText, Date, error, multi-line, and pipe cells without corrupting spreadsheet-analyzer columns', async () => {
+  const ExcelJS = require('exceljs');
+  const { analyzeSpreadsheetText, normalizeXlsxCellValue } = require('../../../src/documents/document-service');
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Transaksi');
+  sheet.addRow(['Tanggal', 'Deskripsi', 'Catatan', 'Nominal', 'Status']);
+  sheet.addRow([
+    new Date('2026-11-19T08:30:00.000Z'),
+    { richText: [{ text: 'Paket Server\n' }, { text: 'Tier A | Primary' }] },
+    'Baris 1\r\nBaris 2 | Catatan',
+    1500000,
+    { error: '#DIV/0!' }
+  ]);
+  sheet.addRow([
+    new Date('2026-11-20T09:00:00.000Z'),
+    'Bandwidth',
+    'Normal',
+    500000,
+    { formula: 'D2+D3', result: 2000000 }
+  ]);
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  const extracted = await service().extract({ buffer: Buffer.from(buffer), ext: '.xlsx' });
+
+  assert.equal(extracted.includes('[object Object]'), false);
+  assert.match(extracted, /2026-11-19T08:30:00\.000Z/);
+  assert.match(extracted, /Paket Server Tier A │ Primary/);
+  assert.match(extracted, /Baris 1 Baris 2 │ Catatan/);
+  assert.match(extracted, /#DIV\/0!/);
+  assert.match(extracted, /2000000/);
+
+  const analysis = analyzeSpreadsheetText(extracted, { filename: 'transaksi.xlsx' });
+  assert.equal(analysis.totalRows, 2);
+  assert.deepEqual(analysis.headers, ['Tanggal', 'Deskripsi', 'Catatan', 'Nominal', 'Status']);
+  const nominalCol = analysis.columns.find((c) => c.name === 'Nominal');
+  assert.equal(nominalCol.inferredType, 'numeric');
+  assert.equal(nominalCol.numericStats.sum, 2000000);
+  assert.equal(analysis.sampleRows[0].values.Deskripsi, 'Paket Server Tier A │ Primary');
+  assert.equal(analysis.sampleRows[0].values.Status, '#DIV/0!');
+
+  // Direct helper coverage for nested formula result objects
+  assert.equal(normalizeXlsxCellValue({ formula: 'TODAY()', result: new Date('2026-01-01T00:00:00.000Z') }), '2026-01-01T00:00:00.000Z');
+  assert.equal(normalizeXlsxCellValue({ formula: '1/0', result: { error: '#DIV/0!' } }), '#DIV/0!');
+
+  // CSV cell normalization preserves columns when quoted cells contain newlines or pipes
+  const csvBuffer = Buffer.from('"Nama","Catatan","Nominal"\n"Item A","Baris 1\nBaris 2 | Info","250000"\n', 'utf8');
+  const csvExtracted = await service().extract({ buffer: csvBuffer, ext: '.csv' });
+  const csvAnalysis = analyzeSpreadsheetText(csvExtracted, { filename: 'csv-pipe.csv' });
+  assert.equal(csvAnalysis.totalRows, 1);
+  assert.equal(csvAnalysis.sampleRows[0].values.Catatan, 'Baris 1 Baris 2 │ Info');
+  assert.equal(csvAnalysis.columns.find((c) => c.name === 'Nominal').numericStats.sum, 250000);
+});
+
+test('createPdf wraps oversized URLs and multi-line Markdown tables cleanly', async () => {
+  const longToken = 'https://example.com/a-very-long-unbroken-segment-exceeding-normal-column-width-for-pdf-wrapping';
+  const pdfBuffer = await service().createPdf({
+    title: 'Uji PDF Wrapping',
+    content: [
+      `URL: ${longToken}`,
+      '',
+      '| Kolom A | Kolom B |',
+      '|---|---|',
+      `| ${longToken} | Teks multi kata yang cukup panjang agar terbungkus menjadi beberapa baris di dalam sel tabel |`
+    ].join('\n')
+  });
+
+  const pdfText = pdfBuffer.toString('latin1');
+  assert.equal(pdfBuffer.subarray(0, 5).toString('latin1'), '%PDF-');
+  assert.match(pdfText, /re S/);
+  assert.match(pdfText, /beberapa baris/);
+});

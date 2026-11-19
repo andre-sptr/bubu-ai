@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { formatWhatsAppText } = require('../../../src/channels/whatsapp-formatter');
+const { formatWhatsAppText, splitWhatsAppMessage } = require('../../../src/channels/whatsapp-formatter');
 
 test('converts Markdown headings to WhatsApp bold', () => {
   assert.equal(
@@ -96,4 +96,65 @@ test('literal legacy placeholder sentinels in input text do not collide with int
     formatWhatsAppText(input),
     'Teks \u0001BUBU_MD_0\u0002 dengan *tebal* dan `kode` serta \u0001BUBU_MD_1\u0002.'
   );
+});
+
+test('splitWhatsAppMessage returns single-element array when text is within maxChars', () => {
+  assert.deepEqual(splitWhatsAppMessage(null), ['']);
+  assert.deepEqual(splitWhatsAppMessage(undefined), ['']);
+  assert.deepEqual(splitWhatsAppMessage('Halo Bubu', { maxChars: 20 }), ['Halo Bubu']);
+  const exact = 'a'.repeat(50);
+  assert.deepEqual(splitWhatsAppMessage(exact, { maxChars: 50 }), [exact]);
+});
+
+test('splitWhatsAppMessage prefers paragraph, line, then space boundaries and honors maxChars', () => {
+  const paraPreferred = 'First paragraph.\n\nSecond paragraph line one.\nSecond paragraph line two.';
+  const paraChunks = splitWhatsAppMessage(paraPreferred, { maxChars: 55 });
+  assert.deepEqual(paraChunks, [
+    'First paragraph.',
+    'Second paragraph line one.\nSecond paragraph line two.'
+  ]);
+
+  const linePreferred = 'Alpha line one\nBeta line two\nGamma line three';
+  const lineChunks = splitWhatsAppMessage(linePreferred, { maxChars: 30 });
+  assert.deepEqual(lineChunks, [
+    'Alpha line one\nBeta line two',
+    'Gamma line three'
+  ]);
+
+  const wordSplit = 'one two three four five six seven';
+  const wordChunks = splitWhatsAppMessage(wordSplit, { maxChars: 15 });
+  assert.deepEqual(wordChunks, ['one two three', 'four five six', 'seven']);
+  for (const chunk of wordChunks) {
+    assert.ok(chunk.length <= 15, `Expected chunk <= 15 chars, got ${chunk.length}`);
+  }
+
+  const unbroken = 'a'.repeat(25);
+  const hardChunks = splitWhatsAppMessage(unbroken, { maxChars: 10 });
+  assert.deepEqual(hardChunks, ['a'.repeat(10), 'a'.repeat(10), 'a'.repeat(5)]);
+});
+
+test('splitWhatsAppMessage preserves balanced fenced code blocks across chunks within maxChars', () => {
+  const formatted = [
+    'Ringkasan:',
+    '```',
+    'const alpha = 1111;',
+    'const beta = 2222;',
+    'const gamma = 3333;',
+    'const delta = 4444;',
+    '```',
+    'Selesai.'
+  ].join('\n');
+
+  const chunks = splitWhatsAppMessage(formatted, { maxChars: 55 });
+  assert.ok(chunks.length >= 2, 'Expected code block message to split into multiple chunks');
+  for (const chunk of chunks) {
+    assert.ok(chunk.length <= 55, `Chunk exceeded maxChars (got ${chunk.length}): ${chunk}`);
+    const fenceCount = (chunk.match(/```/g) || []).length;
+    assert.equal(fenceCount % 2, 0, `Unbalanced code fence in chunk:\n${chunk}`);
+    assert.equal(/```\s*```/.test(chunk), false, `Empty code block produced in chunk:\n${chunk}`);
+  }
+  const combined = chunks.join('\n');
+  for (const token of ['Ringkasan:', 'alpha = 1111;', 'beta = 2222;', 'gamma = 3333;', 'delta = 4444;', 'Selesai.']) {
+    assert.ok(combined.includes(token), `Missing token ${token}`);
+  }
 });

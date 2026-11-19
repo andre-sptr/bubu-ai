@@ -1,4 +1,28 @@
-const { formatWhatsAppText } = require('./whatsapp-formatter');
+const { formatWhatsAppText, splitWhatsAppMessage } = require('./whatsapp-formatter');
+const { isPrivateHost } = require('../web/web-service');
+
+function validateExternalPreviewUrl(url) {
+  const rawUrl = String(url ?? '').trim();
+  if (!rawUrl) {
+    throw new Error('A valid http:// or https:// URL is required for link preview delivery.');
+  }
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('Invalid link preview URL.');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Link preview URL must use http:// or https://.');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Link preview URL must not embed credentials.');
+  }
+  if (isPrivateHost(parsed.hostname)) {
+    throw new Error('Link preview URL host is not allowed.');
+  }
+  return rawUrl;
+}
 
 const DETERMINISTIC_FAILURE_CODES = new Set(['ENOENT', 'EACCES', 'EISDIR']);
 const DETERMINISTIC_FAILURE_STATUSES = new Set([400, 401, 403, 404, 413, 415, 422]);
@@ -74,13 +98,69 @@ class ResponseHandler {
     const outgoingText = options.format === false
       ? String(text ?? '')
       : formatWhatsAppText(text);
-    const { format: _format, ...wahaOptions } = options;
-    return this._deliver({
+    const {
+      format: _format,
+      chunk: shouldChunk,
+      maxChunkChars: explicitMaxChunkChars,
+      ...wahaOptions
+    } = options;
+
+    const configuredMax = Number(explicitMaxChunkChars || this.config?.waha?.maxMessageChars || 3800);
+    const maxChunkChars = Number.isFinite(configuredMax) && configuredMax >= 1
+      ? Math.floor(configuredMax)
+      : 3800;
+
+    const chunks = shouldChunk !== false && outgoingText.length > maxChunkChars
+      ? splitWhatsAppMessage(outgoingText, { maxChars: maxChunkChars })
+      : [outgoingText];
+
+    if (chunks.length <= 1) {
+      const singleText = chunks[0] ?? outgoingText;
+      return this._deliver({
+        type: 'text',
+        chatId,
+        sendFn: () => this.waha.sendText(singleText, chatId, wahaOptions),
+        errorMessage: 'WhatsApp text delivery could not be confirmed.'
+      });
+    }
+
+    const { replyTo: _replyTo, mentions: _mentions, ...followUpOptions } = wahaOptions;
+    const receipts = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkOptions = i === 0 ? wahaOptions : followUpOptions;
+      try {
+        const receipt = await this._deliver({
+          type: 'text',
+          chatId,
+          meta: { chunkIndex: i + 1, chunks: chunks.length },
+          sendFn: () => this.waha.sendText(chunks[i], chatId, chunkOptions),
+          errorMessage: 'WhatsApp text delivery could not be confirmed.'
+        });
+        receipts.push(receipt);
+      } catch (cause) {
+        if (i === 0) throw cause;
+        throw new ResponseDeliveryError(
+          `WhatsApp text delivery failed on chunk ${i + 1} of ${chunks.length}; earlier chunks were sent.`,
+          {
+            type: 'text',
+            chatId,
+            cause: cause.cause || cause,
+            sentTypes: ['text'],
+            deliveryStatus: 'uncertain'
+          }
+        );
+      }
+    }
+
+    return {
+      ok: true,
       type: 'text',
       chatId,
-      sendFn: () => this.waha.sendText(outgoingText, chatId, wahaOptions),
-      errorMessage: 'WhatsApp text delivery could not be confirmed.'
-    });
+      messageId: receipts[0].messageId,
+      messageIds: receipts.map((receipt) => receipt.messageId),
+      chunks: receipts.length,
+      response: receipts[0].response
+    };
   }
 
   async sendVoice(buffer, chatId, options = {}) {
@@ -229,6 +309,91 @@ class ResponseHandler {
     });
   }
 
+  async sendLinkPreview(chatId, { text, url, title = '', description = '', replyTo, mentions } = {}) {
+    if (!chatId) throw new Error('A target chatId is required for link preview delivery.');
+    if (typeof this.waha.sendLinkCustomPreview !== 'function') {
+      throw new Error('The configured WAHA client does not support link preview delivery.');
+    }
+    const validUrl = validateExternalPreviewUrl(url);
+    const formattedText = text !== undefined
+      ? (text ? formatWhatsAppText(text) : '')
+      : validUrl;
+    const formattedTitle = title ? formatWhatsAppText(title) : '';
+    const formattedDescription = description ? formatWhatsAppText(description) : '';
+    const payload = {
+      text: formattedText,
+      url: validUrl,
+      title: formattedTitle,
+      description: formattedDescription,
+      ...(replyTo ? { replyTo } : {}),
+      ...(Array.isArray(mentions) && mentions.length ? { mentions } : {})
+    };
+    return this._deliver({
+      type: 'link_preview',
+      chatId,
+      meta: { url: validUrl, title: formattedTitle },
+      sendFn: () => this.waha.sendLinkCustomPreview(chatId, payload),
+      errorMessage: 'WhatsApp link preview delivery could not be confirmed.'
+    });
+  }
+
+  async editMessage(chatId, messageId, text, options = {}) {
+    if (!chatId || !messageId) {
+      throw new Error('A target chatId and messageId are required to edit a message.');
+    }
+    if (typeof this.waha.editMessage !== 'function') {
+      throw new Error('The configured WAHA client does not support editing messages.');
+    }
+    const outgoingText = options?.format === false
+      ? String(text ?? '')
+      : formatWhatsAppText(text);
+    if (!outgoingText.trim()) {
+      throw new Error('Non-empty text is required to edit a message.');
+    }
+    const editOptions = Array.isArray(options?.mentions) && options.mentions.length > 0
+      ? { mentions: options.mentions }
+      : {};
+    return this._deliver({
+      type: 'edit',
+      chatId,
+      meta: { targetMessageId: messageId },
+      sendFn: () => this.waha.editMessage(chatId, messageId, outgoingText, editOptions),
+      errorMessage: 'WhatsApp message edit could not be confirmed.'
+    });
+  }
+
+  async deleteMessage(chatId, messageId) {
+    if (!chatId || !messageId) {
+      throw new Error('A target chatId and messageId are required to delete a message.');
+    }
+    if (typeof this.waha.deleteMessage !== 'function') {
+      throw new Error('The configured WAHA client does not support deleting messages.');
+    }
+    return this._deliver({
+      type: 'delete',
+      chatId,
+      meta: { targetMessageId: messageId },
+      sendFn: () => this.waha.deleteMessage(chatId, messageId),
+      errorMessage: 'WhatsApp message deletion could not be confirmed.'
+    });
+  }
+
+  async forwardMessage(chatId, messageId) {
+    if (!chatId || !messageId) {
+      throw new Error('A target chatId and messageId are required to forward a message.');
+    }
+    if (typeof this.waha.forwardMessage !== 'function') {
+      throw new Error('The configured WAHA client does not support forwarding messages.');
+    }
+    return this._deliver({
+      type: 'forward',
+      chatId,
+      meta: { targetMessageId: messageId },
+      sendFn: () => this.waha.forwardMessage(chatId, messageId),
+      errorMessage: 'WhatsApp message forward could not be confirmed.'
+    });
+  }
+
   async sendAssistantResponse(text, chatId, mode = 'text', options = {}) {
     const normalizedMode = ['text', 'voice', 'both'].includes(mode) ? mode : 'text';
     const textOptions = {};
@@ -243,6 +408,12 @@ class ResponseHandler {
     }
     if (options?.format === false) {
       textOptions.format = false;
+    }
+    if (options?.chunk !== undefined) {
+      textOptions.chunk = options.chunk;
+    }
+    if (options?.maxChunkChars !== undefined) {
+      textOptions.maxChunkChars = options.maxChunkChars;
     }
     const hasTextOptions = Object.keys(textOptions).length > 0;
     const hasVoiceOptions = Object.keys(voiceOptions).length > 0;
@@ -306,8 +477,11 @@ class ResponseHandler {
     latitude,
     longitude,
     title,
+    description,
+    url,
     contacts,
     replyTo,
+    mentions,
     options = {},
     mode = 'text'
   }) {
@@ -348,6 +522,34 @@ class ResponseHandler {
           contacts ?? options?.contacts,
           replyTo ? { replyTo } : (Array.isArray(options) ? {} : options)
         );
+      case 'link_preview': {
+        const opts = options && typeof options === 'object' && !Array.isArray(options) ? options : {};
+        return this.sendLinkPreview(chatId, {
+          text: text ?? opts.text,
+          url: url ?? opts.url,
+          title: title ?? opts.title,
+          description: description ?? opts.description,
+          replyTo: replyTo ?? opts.replyTo,
+          mentions: mentions ?? opts.mentions
+        });
+      }
+      case 'edit': {
+        const opts = options && typeof options === 'object' && !Array.isArray(options) ? options : {};
+        return this.editMessage(
+          chatId,
+          messageId ?? opts.messageId,
+          text ?? opts.text,
+          opts
+        );
+      }
+      case 'delete': {
+        const opts = options && typeof options === 'object' && !Array.isArray(options) ? options : {};
+        return this.deleteMessage(chatId, messageId ?? opts.messageId);
+      }
+      case 'forward': {
+        const opts = options && typeof options === 'object' && !Array.isArray(options) ? options : {};
+        return this.forwardMessage(chatId, messageId ?? opts.messageId);
+      }
       default:
         throw new Error(`Unsupported response type: ${type}`);
     }

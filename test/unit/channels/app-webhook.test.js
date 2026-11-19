@@ -321,3 +321,80 @@ test('GET /ready reports detailed checks when worker, sessionMonitor, or isShutt
     checks: { sqlite: true, worker: true, waha: true, draining: true }
   });
 });
+
+test('POST /webhook updates sessionMonitor bot identity from authenticated request.body.me only', async (t) => {
+  const monitor = new WahaSessionMonitor({ session: 'default' });
+  const { app, enqueued } = makeApp({ webhookToken: 'top-secret', sessionMonitor: monitor });
+  t.after(() => app.close());
+
+  // Unauthenticated request must not update bot identity
+  const unauth = await app.inject({
+    method: 'POST',
+    url: '/webhook',
+    headers: { 'x-webhook-token': 'wrong-token' },
+    payload: {
+      event: 'message',
+      me: { id: '628000000000@c.us', lid: '999999@lid' },
+      payload: { id: 'evt-unauth', from: '6281@c.us', body: 'Blocked' }
+    }
+  });
+  assert.equal(unauth.statusCode, 401);
+  assert.deepEqual(unauth.json(), { accepted: false });
+  assert.deepEqual(monitor.getBotIdentities(), { botJid: '', botLid: '' });
+
+  // Authenticated message webhook updates botJid and botLid while keeping exact JSON response
+  const authMsg = await app.inject({
+    method: 'POST',
+    url: '/webhook',
+    headers: { 'x-webhook-token': 'top-secret' },
+    payload: {
+      event: 'message',
+      me: { id: '628999111222:1@s.whatsapp.net', lid: '123456789:0@lid' },
+      payload: { id: 'evt-auth-me', from: '6281@c.us', body: 'Halo' }
+    }
+  });
+  assert.equal(authMsg.statusCode, 200);
+  assert.deepEqual(authMsg.json(), { accepted: true, duplicate: false });
+  assert.deepEqual(monitor.getBotIdentities(), {
+    botJid: '628999111222@c.us',
+    botLid: '123456789@lid'
+  });
+  assert.equal(enqueued.length, 1);
+
+  // Authenticated session.status webhook also updates bot identity and preserves response
+  const statusWithMe = await app.inject({
+    method: 'POST',
+    url: '/webhook',
+    headers: { 'x-webhook-token': 'top-secret' },
+    payload: {
+      event: 'session.status',
+      session: 'default',
+      me: { id: '628777666555@c.us', lid: '555666777@lid' },
+      payload: { name: 'default', status: 'WORKING' }
+    }
+  });
+  assert.equal(statusWithMe.statusCode, 200);
+  assert.deepEqual(statusWithMe.json(), { accepted: true, event: 'session.status', status: 'WORKING' });
+  assert.deepEqual(monitor.getBotIdentities(), {
+    botJid: '628777666555@c.us',
+    botLid: '555666777@lid'
+  });
+
+  // Legacy boolean me: true does not crash or modify bot identity
+  const legacyMeBool = await app.inject({
+    method: 'POST',
+    url: '/webhook',
+    headers: { 'x-webhook-token': 'top-secret' },
+    payload: {
+      event: 'message',
+      me: true,
+      payload: { id: 'evt-me-bool', from: '6281@c.us', body: 'Self' }
+    }
+  });
+  assert.equal(legacyMeBool.statusCode, 200);
+  assert.deepEqual(legacyMeBool.json(), { accepted: true, ignored: true });
+  assert.deepEqual(monitor.getBotIdentities(), {
+    botJid: '628777666555@c.us',
+    botLid: '555666777@lid'
+  });
+});

@@ -14,26 +14,32 @@ function eventKey(message) {
   return crypto.createHash('sha256').update(identity).digest('hex');
 }
 
-function hasBotMention(message, botJid = '') {
-  if (/\bbubu\b/i.test(String(message.text || ''))) return true;
-  if (!botJid) return false;
-
+function hasBotMention(message, botJidOrList = '') {
+  if (/\bbubu\b/i.test(String(message?.text || ''))) return true;
+  const rawList = Array.isArray(botJidOrList) ? botJidOrList : [botJidOrList];
   const normalize = (value) => normalizeJid(String(value || '').replace(/^@/, ''));
-  const expected = normalize(botJid);
-  if (!expected) return false;
+  const candidates = [...new Set(rawList.map(normalize).filter(Boolean))];
+  if (candidates.length === 0) return false;
 
-  const expectedNumber = expected.split('@')[0].split(':')[0];
-  for (const mention of message.mentions || []) {
-    const normalized = normalize(mention);
-    if (normalized === expected) return true;
-    const mentionedNumber = normalized.split('@')[0].split(':')[0];
-    if (expectedNumber && mentionedNumber === expectedNumber) return true;
+  const mentions = (message?.mentions || []).map(normalize).filter(Boolean);
+  const text = String(message?.text || '');
+
+  for (const expected of candidates) {
+    const expectedNumber = expected.split('@')[0].split(':')[0];
+    for (const normalized of mentions) {
+      if (normalized === expected) return true;
+      const mentionedNumber = normalized.split('@')[0].split(':')[0];
+      if (expectedNumber && mentionedNumber === expectedNumber) return true;
+    }
+
+    // Some webhook versions expose the rendered @number in body but omit
+    // structured mention metadata.
+    const minLen = expected.endsWith('@lid') ? 6 : 8;
+    if (expectedNumber.length >= minLen && text.includes(`@${expectedNumber}`)) {
+      return true;
+    }
   }
-
-  // Some webhook versions expose the rendered @number in body but omit
-  // structured mention metadata.
-  return expectedNumber.length >= 8 &&
-    String(message.text || '').includes(`@${expectedNumber}`);
+  return false;
 }
 
 class MessageProcessor {
@@ -73,6 +79,9 @@ class MessageProcessor {
 
   async process(payload) {
     const msg = normalizeIncoming(payload);
+    if (msg.botId || msg.botLid) {
+      this.sessionMonitor?.updateBotIdentity?.({ id: msg.botId, lid: msg.botLid });
+    }
     msg.chatId = normalizeJid(msg.chatId);
     if (!msg.chatId || (!msg.text && !msg.hasMedia && !msg.quote?.present && !msg.quote?.rejected) || msg.fromMe) return;
     if (msg.chatId.endsWith('@broadcast') || msg.chatId.endsWith('@newsletter')) return;
@@ -93,7 +102,11 @@ class MessageProcessor {
     let voiceInstruction = null;
     const quoteContext = msg.quote?.present || msg.quote?.rejected ? msg.quote : null;
     if (isGroup) {
-      const hasMention = hasBotMention(msg, this.config.botJid);
+      const snap = typeof this.sessionMonitor?.snapshot === 'function'
+        ? this.sessionMonitor.snapshot()
+        : null;
+      const botIdentities = [this.config.botJid, snap?.botJid, snap?.botLid, msg.botId, msg.botLid].filter(Boolean);
+      const hasMention = hasBotMention(msg, botIdentities);
       const isCommand = isRecognizedSlashCommand(text);
       const mediaOnly = msg.hasMedia && !currentMessageText;
       const mediaMayTriggerWithoutMention = mediaOnly && !this.config.groupMediaRequireMention;
@@ -143,7 +156,15 @@ class MessageProcessor {
     // Presence failures must never prevent the actual AI task from running.
     if (typeof this.waha?.sendSeen === 'function') {
       try {
-        await this.waha.sendSeen(msg.chatId);
+        const seenOpts = msg.eventId
+          ? {
+              messageIds: [msg.eventId],
+              ...(isGroup && msg.senderId ? { participant: msg.senderId } : {})
+            }
+          : undefined;
+        await (seenOpts
+          ? this.waha.sendSeen(msg.chatId, seenOpts)
+          : this.waha.sendSeen(msg.chatId));
       } catch (error) {
         this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA sendSeen failed');
       }
@@ -400,12 +421,15 @@ class MessageProcessor {
                   summary: `${memoryEligibleText.slice(0, 500)} => ${responseText.slice(0, 500)}`,
                   sourceEventId: eventId
                 });
-                await this.memoryService.captureFromTurn({
+                const captureResult = await this.memoryService.captureFromTurn({
                   ...memoryContext,
                   userText: memoryEligibleText,
                   assistantText: responseText,
                   sourceEventId: eventId
                 });
+                if (captureResult?.captured > 0) {
+                  await this.memoryService.backfillEmbeddings?.({ ...memoryContext, limit: 2 });
+                }
               } catch (memoryError) {
                 this.logger.warn({ error: memoryError.message }, 'Memory capture failed');
               }

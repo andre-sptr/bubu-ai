@@ -309,6 +309,19 @@ const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS idx_rate_limit_events_created_at
         ON rate_limit_events(created_at_ms);
     `
+  },
+  {
+    version: 11,
+    sql: 'CREATE INDEX IF NOT EXISTS idx_memories_active_scope ON memories(scope,owner_id,chat_id,status,importance DESC,id DESC);'
+  },
+  {
+    version: 12,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_inbox_priority_ready
+        ON inbox_events(status, available_at, priority ASC, created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_inbox_chat_status
+        ON inbox_events(chat_id, status);
+    `
   }
 ];
 

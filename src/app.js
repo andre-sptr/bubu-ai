@@ -2,8 +2,25 @@ const crypto = require('node:crypto');
 const Fastify = require('fastify');
 const helmet = require('@fastify/helmet');
 const { version } = require('../package.json');
+const { normalizeJid } = require('./config/env');
 const { normalizeIncoming, normalizeSessionStatus } = require('./channels/waha/normalizer');
 const { eventKey } = require('./agent/message-processor');
+
+const OWNER_PRIORITY_COMMANDS = new Set(['/approve', '/deny', '/status', '/queue']);
+
+function classifyEventPriority(message, ownerJid = '') {
+  const chatId = normalizeJid(message?.chatId || '');
+  const senderId = normalizeJid(message?.senderId || chatId);
+  const normalizedOwner = normalizeJid(ownerJid || '');
+  const isGroup = chatId.endsWith('@g.us');
+  const isOwner = Boolean(normalizedOwner) && senderId === normalizedOwner;
+  const text = String(message?.text || message?.bodyText || '').trim();
+  const cmd = text.startsWith('/') ? text.split(/\s+/, 1)[0].toLowerCase() : '';
+
+  if (isOwner && OWNER_PRIORITY_COMMANDS.has(cmd)) return 1;
+  if (isGroup) return 5;
+  return 2;
+}
 
 function extractHeaderString(value) {
   if (typeof value === 'string') return value;
@@ -141,6 +158,13 @@ function buildApp({ config, db, logger, worker = null, sessionMonitor = null, is
       }
 
       const rawBody = request.body || {};
+      if (sessionMonitor && rawBody.me && typeof rawBody.me === 'object') {
+        try {
+          sessionMonitor.updateBotIdentity?.(rawBody.me);
+        } catch (err) {
+          logger?.warn?.({ error: err?.message }, 'Failed to update WAHA bot identity from webhook');
+        }
+      }
       const explicitEvent = rawBody.event !== undefined && rawBody.event !== null
         ? String(rawBody.event).trim()
         : '';
@@ -179,11 +203,13 @@ function buildApp({ config, db, logger, worker = null, sessionMonitor = null, is
       }
 
       const id = eventKey(message);
+      const priority = classifyEventPriority(message, config?.ownerJid || '');
       const inserted = db.enqueueEvent({
         eventId: id,
         chatId: message.chatId,
         senderId: message.senderId || message.chatId,
-        payload: rawBody
+        payload: rawBody,
+        priority
       });
 
       reply.code(200);
@@ -194,4 +220,4 @@ function buildApp({ config, db, logger, worker = null, sessionMonitor = null, is
   return app;
 }
 
-module.exports = { buildApp };
+module.exports = { buildApp, classifyEventPriority };

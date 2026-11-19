@@ -38,6 +38,49 @@ const ALLOWED = new Map([
   ['.txt', ['text/plain']]
 ]);
 
+function sanitizeSpreadsheetCellText(value) {
+  return String(value ?? '')
+    .replace(/\u0000/g, '')
+    .replace(/\s*\r?\n+\s*/g, ' ')
+    .replace(/\|/g, '│')
+    .trim();
+}
+
+function normalizeXlsxCellValue(value) {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : '';
+  }
+  if (typeof value === 'object') {
+    if (Array.isArray(value.richText)) {
+      return sanitizeSpreadsheetCellText(
+        value.richText.map((part) => (part && typeof part.text === 'string' ? part.text : String(part?.text ?? ''))).join('')
+      );
+    }
+    if (value.error !== undefined) {
+      const errText = typeof value.error === 'object' && value.error !== null
+        ? (value.error.message || JSON.stringify(value.error))
+        : String(value.error);
+      return sanitizeSpreadsheetCellText(errText);
+    }
+    if (value.result !== undefined) {
+      return normalizeXlsxCellValue(value.result);
+    }
+    if (value.text !== undefined) {
+      return typeof value.text === 'object'
+        ? normalizeXlsxCellValue(value.text)
+        : sanitizeSpreadsheetCellText(value.text);
+    }
+    if (value.formula !== undefined || value.sharedFormula !== undefined) {
+      return '';
+    }
+    if (value.hyperlink !== undefined) {
+      return sanitizeSpreadsheetCellText(value.hyperlink);
+    }
+  }
+  return sanitizeSpreadsheetCellText(value);
+}
+
 function documentExtensionFromMime(mimetype) {
   const mime = normalizeMimeType(mimetype);
   const map = {
@@ -395,11 +438,8 @@ class DocumentService {
       workbook.eachSheet((sheet) => {
         sections.push(`SHEET: ${sheet.name}`);
         sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-          sections.push(`${rowNumber}: ${row.values.slice(1).map((v) => {
-            if (v && typeof v === 'object' && v.text) return v.text;
-            if (v && typeof v === 'object' && v.result !== undefined) return v.result;
-            return String(v ?? '');
-          }).join(' | ')}`);
+          const cells = Array.from(row.values.slice(1), (v) => normalizeXlsxCellValue(v));
+          sections.push(`${rowNumber}: ${cells.join(' | ')}`);
         });
       });
       text = sections.join('\n');
@@ -409,7 +449,7 @@ class DocumentService {
       if (parsedCsv.rows.length > 0) {
         text = [
           'SHEET: CSV',
-          ...parsedCsv.rows.map((row, idx) => `${idx + 1}: ${row.join(' | ')}`)
+          ...parsedCsv.rows.map((row, idx) => `${idx + 1}: ${row.map(sanitizeSpreadsheetCellText).join(' | ')}`)
         ].join('\n');
       } else {
         text = rawCsv;
@@ -539,6 +579,8 @@ class DocumentService {
 
 module.exports = {
   DocumentService,
+  sanitizeSpreadsheetCellText,
+  normalizeXlsxCellValue,
   validateExtension,
   normalizeMediaUrl,
   normalizeMimeType,

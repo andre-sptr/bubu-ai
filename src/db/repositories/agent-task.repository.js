@@ -12,19 +12,21 @@ const agentTaskRepository = {
 
   beginToolExecution({ idempotencyKey, taskId, toolName }) {
     const now = new Date().toISOString();
-    const result = this.db.prepare(`INSERT OR IGNORE INTO tool_executions
-      (idempotency_key,task_id,tool_name,status,created_at,updated_at)
-      VALUES(?,?,?,'executing',?,?)`).run(idempotencyKey, taskId, toolName, now, now);
-    if (result.changes === 1) return { state: 'claimed' };
-    const existing = this.db.prepare('SELECT * FROM tool_executions WHERE idempotency_key=?').get(idempotencyKey);
-    if (existing.status === 'completed') return { state: 'completed', output: JSON.parse(existing.output_json) };
-    if (existing.status === 'uncertain' || existing.status === 'executing') return { state: 'uncertain', error: existing.error };
-    if (existing.status === 'failed') {
-      const retry = this.db.prepare(`UPDATE tool_executions SET status='executing',error=NULL,updated_at=?
-        WHERE idempotency_key=? AND status='failed'`).run(now, idempotencyKey);
-      if (retry.changes) return { state: 'claimed' };
-    }
-    return { state: existing.status, error: existing.error };
+    return this.db.transaction(() => {
+      const result = this.db.prepare(`INSERT OR IGNORE INTO tool_executions
+        (idempotency_key,task_id,tool_name,status,created_at,updated_at)
+        VALUES(?,?,?,'executing',?,?)`).run(idempotencyKey, taskId, toolName, now, now);
+      if (result.changes === 1) return { state: 'claimed' };
+      const existing = this.db.prepare('SELECT * FROM tool_executions WHERE idempotency_key=?').get(idempotencyKey);
+      if (existing.status === 'completed') return { state: 'completed', output: JSON.parse(existing.output_json) };
+      if (existing.status === 'uncertain' || existing.status === 'executing') return { state: 'uncertain', error: existing.error };
+      if (existing.status === 'failed') {
+        const retry = this.db.prepare(`UPDATE tool_executions SET status='executing',error=NULL,updated_at=?
+          WHERE idempotency_key=? AND status='failed'`).run(now, idempotencyKey);
+        if (retry.changes) return { state: 'claimed' };
+      }
+      return { state: existing.status, error: existing.error };
+    })();
   },
 
   completeToolExecution(idempotencyKey, output) {
@@ -154,31 +156,38 @@ const agentTaskRepository = {
 
   denyApproval(id) {
     const now = new Date().toISOString();
-    const result = this.db.prepare(`UPDATE approvals SET status='denied',updated_at=?
-      WHERE id=? AND status='pending' AND expires_at>?`).run(now, id, now);
-    if (result.changes) {
-      const row = this.db.prepare('SELECT task_id FROM approvals WHERE id=?').get(id);
-      if (row?.task_id) this.updateTask(row.task_id, { status: 'cancelled', result_text: 'Owner denied the action.' });
-      return true;
-    }
-    this.db.prepare(`UPDATE approvals SET status='expired',updated_at=?
-      WHERE id=? AND status='pending' AND expires_at<=?`).run(now, id, now);
-    const row = this.db.prepare('SELECT task_id FROM approvals WHERE id=?').get(id);
-    if (row?.task_id) this.updateTask(row.task_id, { status: 'cancelled', result_text: 'Approval expired.' });
-    return false;
+    return this.db.transaction(() => {
+      const result = this.db.prepare(`UPDATE approvals SET status='denied',updated_at=?
+        WHERE id=? AND status='pending' AND expires_at>?`).run(now, id, now);
+      if (result.changes) {
+        const row = this.db.prepare('SELECT task_id FROM approvals WHERE id=?').get(id);
+        if (row?.task_id) this.updateTask(row.task_id, { status: 'cancelled', result_text: 'Owner denied the action.' });
+        return true;
+      }
+      const expired = this.db.prepare(`UPDATE approvals SET status='expired',updated_at=?
+        WHERE id=? AND status='pending' AND expires_at<=?`).run(now, id, now);
+      if (expired.changes) {
+        const row = this.db.prepare('SELECT task_id FROM approvals WHERE id=?').get(id);
+        if (row?.task_id) this.updateTask(row.task_id, { status: 'cancelled', result_text: 'Approval expired.' });
+      }
+      return false;
+    })();
   },
 
   finishApproval(id, status, error = null) {
-    this.db.prepare('UPDATE approvals SET status=?,execution_error=?,updated_at=? WHERE id=? AND status=?')
-      .run(status, error, new Date().toISOString(), id, 'executing');
-    const row = this.db.prepare('SELECT task_id FROM approvals WHERE id=?').get(id);
-    if (row?.task_id) {
-      this.updateTask(row.task_id, {
-        status: status === 'approved' ? 'completed' : status === 'uncertain' ? 'uncertain' : 'failed',
-        result_text: status === 'approved' ? 'Approved external action executed.' : null,
-        error: error || null
-      });
-    }
+    return this.db.transaction(() => {
+      const result = this.db.prepare('UPDATE approvals SET status=?,execution_error=?,updated_at=? WHERE id=? AND status=?')
+        .run(status, error, new Date().toISOString(), id, 'executing');
+      if (!result.changes) return;
+      const row = this.db.prepare('SELECT task_id FROM approvals WHERE id=?').get(id);
+      if (row?.task_id) {
+        this.updateTask(row.task_id, {
+          status: status === 'approved' ? 'completed' : status === 'uncertain' ? 'uncertain' : 'failed',
+          result_text: status === 'approved' ? 'Approved external action executed.' : null,
+          error: error || null
+        });
+      }
+    })();
   },
 
   recoverStaleApprovals(staleMs = 120000) {

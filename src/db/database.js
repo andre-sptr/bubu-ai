@@ -50,6 +50,26 @@ class DatabaseStore {
           this.db.exec("UPDATE memories SET updated_at=COALESCE(updated_at,created_at), last_accessed_at=COALESCE(last_accessed_at,created_at)");
           this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id,created_at)');
         }
+        if (migration.version === 11) {
+          const columns = (table) => new Set(
+            this.db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name)
+          );
+          const memoryColumns = columns('memories');
+          if (!memoryColumns.has('status')) {
+            this.db.exec("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded','archived'))");
+          }
+          if (!memoryColumns.has('superseded_by')) {
+            this.db.exec('ALTER TABLE memories ADD COLUMN superseded_by INTEGER');
+          }
+        }
+        if (migration.version === 12) {
+          const inboxColumns = new Set(
+            this.db.prepare('PRAGMA table_info(inbox_events)').all().map((c) => c.name)
+          );
+          if (!inboxColumns.has('priority')) {
+            this.db.exec('ALTER TABLE inbox_events ADD COLUMN priority INTEGER NOT NULL DEFAULT 5');
+          }
+        }
 
         this.db.exec(migration.sql);
         this.db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)')

@@ -539,3 +539,218 @@ test('runtime passes incomingMessageId in context, guards undefined tool results
   assert.match(res.text, /parameter tool yang tidak lengkap/);
   assert.match(res.text, /bad_tool/);
 });
+
+test('runtime dynamically escalates fast tier to balanced for follow-up tool synthesis rounds', async () => {
+  const modelsUsed = [];
+  const routerCalls = [];
+  const db = {
+    task: null,
+    steps: [],
+    createTask: (t) => { db.task = { ...t, status: 'running' }; return db.task; },
+    getTask: () => db.task,
+    getPendingApprovalForTask: () => null,
+    countTaskSteps: () => db.steps.length,
+    logModelUsage: () => {},
+    updateTask: (_id, f) => { db.update = f; db.task = { ...db.task, ...f }; },
+    queueTaskResponse: (_id, text) => { db.queuedResponse = text; },
+    audit: () => {},
+    addTaskStep: (s) => db.steps.push(s),
+    beginToolExecution: () => ({ state: 'claimed' }),
+    completeToolExecution: () => {},
+    failToolExecution: () => {}
+  };
+  const router = {
+    select: (task, opts) => {
+      routerCalls.push({ task, opts });
+      if (task === 'simple_question' || task === 'greeting') {
+        return { tier: 'fast', model: 'claude-haiku-5-5', supportsTools: true };
+      }
+      return { tier: 'balanced', model: 'claude-sonnet-5-5', supportsTools: true };
+    }
+  };
+  const tools = {
+    definitions: () => [{ type: 'function', function: { name: 'consolidate_memories', parameters: { type: 'object' } } }],
+    get: (name) => name === 'consolidate_memories' ? {
+      scopes: ['personal'],
+      schema: { parse: (v) => v },
+      execute: async () => ({ deduplicatedCount: 1, archivedStaleCount: 0, backfilledCount: 2 })
+    } : null
+  };
+  let callCount = 0;
+  const agent = new AgentRuntime({
+    provider: {
+      chat: async ({ model }) => {
+        modelsUsed.push(model);
+        callCount++;
+        if (callCount === 1) {
+          return {
+            message: {
+              role: 'assistant',
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 'consolidate_memories', arguments: '{}' } }]
+            },
+            model,
+            usage: {}
+          };
+        }
+        return { message: { role: 'assistant', content: 'Memori berhasil disinkronkan.' }, model, usage: {} };
+      }
+    },
+    router,
+    tools,
+    db,
+    config: { agent: { maxRounds: 3, maxToolCalls: 4, maxToolResultChars: 1000, taskTimeoutMs: 2000, toolTimeoutMs: 1000 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+
+  const res = await agent.run({
+    text: 'Cek memori saya?',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    scope: 'personal',
+    sourceEventId: 'escalate-fast-to-balanced'
+  });
+
+  assert.deepEqual(modelsUsed, ['claude-haiku-5-5', 'claude-sonnet-5-5']);
+  assert.equal(res.tier, 'balanced');
+  assert.equal(res.escalatedFromTier, 'fast');
+  assert.equal(res.memoryToolsAvailable, true);
+  assert.equal(res.toolCalls, 1);
+  assert.equal(routerCalls[1].task, 'general_chat');
+  assert.deepEqual(routerCalls[1].opts, { needsTools: true, needsVision: false });
+});
+
+test('runtime stays on fast tier when no tool calls happen or when balanced tier is unavailable', async () => {
+  const modelsUsed = [];
+  const db = {
+    task: null,
+    createTask: (t) => { db.task = { ...t, status: 'running' }; return db.task; },
+    getTask: () => db.task,
+    getPendingApprovalForTask: () => null,
+    countTaskSteps: () => 0,
+    logModelUsage: () => {},
+    updateTask: (_id, f) => { db.task = { ...db.task, ...f }; },
+    queueTaskResponse: () => {},
+    audit: () => {},
+    addTaskStep: () => {},
+    beginToolExecution: () => ({ state: 'claimed' }),
+    completeToolExecution: () => {},
+    failToolExecution: () => {}
+  };
+  const router = {
+    select: () => ({ tier: 'fast', model: 'only-fast-model', supportsTools: true })
+  };
+  const tools = {
+    definitions: () => [{ type: 'function', function: { name: 'noop_tool', parameters: { type: 'object' } } }],
+    get: (name) => name === 'noop_tool' ? {
+      scopes: ['personal'],
+      schema: { parse: (v) => v },
+      execute: async () => ({ ok: true })
+    } : null
+  };
+  let callCount = 0;
+  const agent = new AgentRuntime({
+    provider: {
+      chat: async ({ model }) => {
+        modelsUsed.push(model);
+        callCount++;
+        if (callCount === 1) {
+          return {
+            message: {
+              role: 'assistant',
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 'noop_tool', arguments: '{}' } }]
+            },
+            model,
+            usage: {}
+          };
+        }
+        return { message: { role: 'assistant', content: 'Selesai.' }, model, usage: {} };
+      }
+    },
+    router,
+    tools,
+    db,
+    config: { agent: { maxRounds: 3, maxToolCalls: 4, maxToolResultChars: 1000, taskTimeoutMs: 2000, toolTimeoutMs: 1000 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+
+  const res = await agent.run({
+    text: 'Halo',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    scope: 'personal',
+    sourceEventId: 'no-escalation-fast-only'
+  });
+
+  assert.deepEqual(modelsUsed, ['only-fast-model', 'only-fast-model']);
+  assert.equal(res.tier, 'fast');
+  assert.equal(res.escalatedFromTier, undefined);
+  assert.equal(res.memoryToolsAvailable, false);
+});
+
+test('runtime escalates before finalization when maxRounds is 1 and fast round returns tool calls', async () => {
+  const modelsUsed = [];
+  const db = {
+    task: null,
+    createTask: (t) => { db.task = { ...t, status: 'running' }; return db.task; },
+    getTask: () => db.task,
+    getPendingApprovalForTask: () => null,
+    countTaskSteps: () => 0,
+    logModelUsage: () => {},
+    updateTask: (_id, f) => { db.task = { ...db.task, ...f }; },
+    queueTaskResponse: () => {},
+    audit: () => {},
+    addTaskStep: () => {},
+    beginToolExecution: () => ({ state: 'claimed' }),
+    completeToolExecution: () => {},
+    failToolExecution: () => {}
+  };
+  let calls = 0;
+  const agent = new AgentRuntime({
+    provider: {
+      chat: async ({ model }) => {
+        modelsUsed.push(model);
+        calls++;
+        if (calls === 1) {
+          return {
+            message: {
+              role: 'assistant',
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 't1', arguments: '{}' } }]
+            },
+            model,
+            usage: {}
+          };
+        }
+        return { message: { role: 'assistant', content: 'Ringkasan akhir.' }, model, usage: {} };
+      }
+    },
+    router: {
+      select: (task) => task === 'greeting'
+        ? { tier: 'fast', model: 'fast-m', supportsTools: true }
+        : { tier: 'balanced', model: 'balanced-m', supportsTools: true }
+    },
+    tools: {
+      definitions: () => [{ type: 'function', function: { name: 't1', parameters: { type: 'object' } } }],
+      get: (name) => name === 't1' ? {
+        scopes: ['personal'],
+        schema: { parse: (v) => v },
+        execute: async () => ({ ok: true })
+      } : null
+    },
+    db,
+    config: { agent: { maxRounds: 1, maxToolCalls: 4, maxToolResultChars: 1000, taskTimeoutMs: 2000, toolTimeoutMs: 1000 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+
+  const res = await agent.run({
+    text: 'Halo',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    scope: 'personal',
+    sourceEventId: 'escalate-max-rounds-1'
+  });
+
+  assert.deepEqual(modelsUsed, ['fast-m', 'balanced-m']);
+  assert.equal(res.finalizedAfterRoundLimit, true);
+  assert.equal(res.tier, 'balanced');
+  assert.equal(res.escalatedFromTier, 'fast');
+});

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { normalizeIncoming, normalizeSessionStatus } = require('../../../src/channels/waha/normalizer');
+const { normalizeIncoming, normalizeSessionStatus, normalizePollVote } = require('../../../src/channels/waha/normalizer');
 const { normalizeJid } = require('../../../src/config/env');
 
 test('normalizes DM WAHA payload', () => {
@@ -443,4 +443,80 @@ test('normalizeSessionStatus normalizes session, status, and bot JID metadata', 
     meId: '628999@c.us',
     timestamp: 1712345678
   });
+});
+
+test('normalizeIncoming extracts normalized botId and botLid from me metadata without breaking Phase 2 fields', () => {
+  const fromBodyMe = normalizeIncoming({
+    event: 'message',
+    me: { id: '628999000111:1@s.whatsapp.net', lid: '1234567890:0@lid' },
+    payload: {
+      id: 'msg-me-1',
+      from: '123@g.us',
+      author: '6281@c.us',
+      body: 'Halo @Bubu'
+    }
+  });
+  assert.equal(fromBodyMe.botId, '628999000111@c.us');
+  assert.equal(fromBodyMe.botLid, '1234567890@lid');
+  assert.equal(fromBodyMe.fromMe, false);
+  assert.equal(fromBodyMe.text, 'Halo @Bubu');
+
+  const fromSerialized = normalizeIncoming({
+    event: 'message',
+    me: { _serialized: '628555444333@c.us', lid: '99887766' },
+    payload: { id: 'msg-me-2', from: '6281@c.us', body: 'Test' }
+  });
+  assert.equal(fromSerialized.botId, '628555444333@c.us');
+  assert.equal(fromSerialized.botLid, '99887766@lid');
+
+  const fromPayloadMe = normalizeIncoming({
+    event: 'message',
+    payload: {
+      id: 'msg-me-3',
+      from: '6281@c.us',
+      body: 'Payload me',
+      me: { id: '628777888999@c.us' }
+    }
+  });
+  assert.equal(fromPayloadMe.botId, '628777888999@c.us');
+  assert.equal(fromPayloadMe.botLid, '');
+});
+
+test('normalizePollVote extracts session, pollMessageId, normalized voterId, and selectedOptions or returns null', () => {
+  const vote = normalizePollVote({
+    event: 'poll.vote',
+    session: 'bubu-prod',
+    payload: {
+      poll: { id: 'true_123@g.us_POLL1' },
+      vote: {
+        from: '628123456:2@s.whatsapp.net',
+        selectedOptions: ['Nasi Goreng', { name: 'Mie Ayam' }]
+      }
+    }
+  });
+  assert.deepEqual(vote, {
+    session: 'bubu-prod',
+    pollMessageId: 'true_123@g.us_POLL1',
+    voterId: '628123456@c.us',
+    selectedOptions: ['Nasi Goreng', 'Mie Ayam']
+  });
+
+  const clearedVote = normalizePollVote({
+    event: 'poll.vote',
+    payload: {
+      poll: { id: { _serialized: 'poll-2' } },
+      vote: { voter: '112233:0@lid', selectedOptions: [] }
+    }
+  });
+  assert.deepEqual(clearedVote, {
+    session: 'default',
+    pollMessageId: 'poll-2',
+    voterId: '112233@lid',
+    selectedOptions: []
+  });
+
+  assert.equal(normalizePollVote(null), null);
+  assert.equal(normalizePollVote({ event: 'message', payload: { id: 'm1' } }), null);
+  assert.equal(normalizePollVote({ event: 'poll.vote.failed', payload: { poll: { id: 'p1' } } }), null);
+  assert.equal(normalizePollVote({ event: 'poll.vote', payload: { vote: { from: '6281@c.us' } } }), null);
 });

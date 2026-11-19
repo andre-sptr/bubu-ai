@@ -96,3 +96,163 @@ test('approved message forwards optional replyTo to WhatsApp delivery', async ()
   assert.equal(res.sent, true);
   assert.deepEqual(sent, [{ text: 'Balasan', chatId: '6282@c.us', opts: { replyTo: 'orig-msg-9' } }]);
 });
+
+test('approved message forwards optional mentions alongside replyTo to WhatsApp delivery', async () => {
+  const sent = [];
+  const db = {
+    claimApproval: (id) => id === 'ap-mentions-only'
+      ? {
+          tool_name: 'send_whatsapp_message',
+          arguments: { targetId: '120363@g.us', message: 'Halo @6283', mentions: ['6283@c.us'] }
+        }
+      : {
+          tool_name: 'send_whatsapp_message',
+          arguments: { targetId: '120363@g.us', message: 'Halo tim', replyTo: 'm-1', mentions: ['6283@c.us', '6284@c.us'] }
+        },
+    finishApproval: () => {}
+  };
+  const manager = new ApprovalManager({
+    db,
+    ownerJid: '6281@c.us',
+    waha: { sendText: async (text, chatId, opts) => sent.push({ text, chatId, opts }) }
+  });
+
+  const res1 = await manager.resolve({ id: 'ap-mentions-only', actorId: '6281@c.us', approved: true });
+  assert.equal(res1.sent, true);
+  assert.deepEqual(sent[0], {
+    text: 'Halo @6283',
+    chatId: '120363@g.us',
+    opts: { mentions: ['6283@c.us'] }
+  });
+
+  const res2 = await manager.resolve({ id: 'ap-both', actorId: '6281@c.us', approved: true });
+  assert.equal(res2.sent, true);
+  assert.deepEqual(sent[1], {
+    text: 'Halo tim',
+    chatId: '120363@g.us',
+    opts: { replyTo: 'm-1', mentions: ['6283@c.us', '6284@c.us'] }
+  });
+});
+
+test('ApprovalManager formats prompts, validates arguments, and sends approved poll, location, and contact vCard', async () => {
+  const created = [];
+  const finished = [];
+  const deliveries = [];
+  const items = new Map();
+
+  const db = {
+    createApproval: (item) => {
+      created.push(item);
+      items.set(item.id, { tool_name: item.toolName, arguments: item.arguments });
+    },
+    claimApproval: (id) => items.get(id) || null,
+    finishApproval: (...args) => finished.push(args)
+  };
+  const waha = {
+    sendPoll: async (chatId, poll) => { deliveries.push({ type: 'poll', chatId, poll }); return { id: 'p1' }; },
+    sendLocation: async (chatId, loc) => { deliveries.push({ type: 'location', chatId, loc }); return { id: 'l1' }; },
+    sendContactVcard: async (chatId, contacts, options) => { deliveries.push({ type: 'contact', chatId, contacts, options }); return { id: 'c1' }; }
+  };
+  const manager = new ApprovalManager({ db, waha, ownerJid: '6281@c.us' });
+
+  // 1. send_whatsapp_poll
+  const pollReq = await manager.create({
+    taskId: 't-poll',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    toolName: 'send_whatsapp_poll',
+    args: {
+      targetId: '120363@g.us',
+      question: 'Jadwal rapat?',
+      options: ['Senin', 'Selasa'],
+      multipleAnswers: true,
+      replyTo: 'msg-0'
+    }
+  });
+  assert.match(pollReq.prompt, /Konfirmasi pengiriman polling Bubu/);
+  assert.match(pollReq.prompt, /Jadwal rapat\?/);
+  const pollRes = await manager.resolve({ id: pollReq.approvalId, actorId: '6281@c.us', approved: true });
+  assert.deepEqual(pollRes, { ok: true, sent: true });
+  assert.deepEqual(deliveries[0], {
+    type: 'poll',
+    chatId: '120363@g.us',
+    poll: { name: 'Jadwal rapat?', options: ['Senin', 'Selasa'], multipleAnswers: true, replyTo: 'msg-0' }
+  });
+
+  // 2. send_whatsapp_location
+  const locReq = await manager.create({
+    taskId: 't-loc',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    toolName: 'send_whatsapp_location',
+    args: {
+      targetId: '6282@s.whatsapp.net',
+      latitude: -6.1754,
+      longitude: 106.8272,
+      title: 'Monas',
+      replyTo: 'msg-loc'
+    }
+  });
+  assert.match(locReq.prompt, /Konfirmasi pengiriman lokasi Bubu/);
+  assert.match(locReq.prompt, /-6\.1754, 106\.8272/);
+  const locRes = await manager.resolve({ id: locReq.approvalId, actorId: '6281@c.us', approved: true });
+  assert.deepEqual(locRes, { ok: true, sent: true });
+  assert.deepEqual(deliveries[1], {
+    type: 'location',
+    chatId: '6282@c.us',
+    loc: { latitude: -6.1754, longitude: 106.8272, title: 'Monas', replyTo: 'msg-loc' }
+  });
+
+  // 3. send_whatsapp_contact
+  const contactReq = await manager.create({
+    taskId: 't-contact',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    toolName: 'send_whatsapp_contact',
+    args: {
+      targetId: '6282@c.us',
+      fullName: 'Budi Santoso',
+      phoneNumber: '+628123456789',
+      organization: 'PT Bubu',
+      replyTo: 'msg-c'
+    }
+  });
+  assert.match(contactReq.prompt, /Konfirmasi pengiriman kontak Bubu/);
+  assert.match(contactReq.prompt, /Budi Santoso/);
+  const contactRes = await manager.resolve({ id: contactReq.approvalId, actorId: '6281@c.us', approved: true });
+  assert.deepEqual(contactRes, { ok: true, sent: true });
+  assert.deepEqual(deliveries[2], {
+    type: 'contact',
+    chatId: '6282@c.us',
+    contacts: [{ fullName: 'Budi Santoso', phoneNumber: '+628123456789', organization: 'PT Bubu' }],
+    options: { replyTo: 'msg-c' }
+  });
+
+  // 4. Pre-send validation failures mark failed without calling WAHA
+  items.set('bad-poll', {
+    tool_name: 'send_whatsapp_poll',
+    arguments: { targetId: '120363@g.us', question: 'Q', options: ['Same', 'same'] }
+  });
+  items.set('bad-loc', {
+    tool_name: 'send_whatsapp_location',
+    arguments: { targetId: '6282@c.us', latitude: 95, longitude: 106.8 }
+  });
+  items.set('bad-contact', {
+    tool_name: 'send_whatsapp_contact',
+    arguments: { targetId: '6282@c.us', fullName: 'Budi', phoneNumber: '123' }
+  });
+
+  assert.deepEqual(await manager.resolve({ id: 'bad-poll', actorId: '6281@c.us', approved: true }), {
+    ok: false,
+    reason: 'invalid_arguments'
+  });
+  assert.deepEqual(await manager.resolve({ id: 'bad-loc', actorId: '6281@c.us', approved: true }), {
+    ok: false,
+    reason: 'invalid_arguments'
+  });
+  assert.deepEqual(await manager.resolve({ id: 'bad-contact', actorId: '6281@c.us', approved: true }), {
+    ok: false,
+    reason: 'invalid_arguments'
+  });
+  assert.equal(deliveries.length, 3);
+});
