@@ -60,22 +60,22 @@ NODE
 
 # 3. Run focused Phase 2 multimodal suite
 node --test \
-  test/unit/normalizer.test.js \
-  test/unit/message-processor-media-errors.test.js \
-  test/unit/message-context.test.js \
-  test/unit/p1-services.test.js \
-  test/unit/p3-media.test.js \
-  test/unit/voice-output-mode.test.js \
-  test/unit/voice-output.test.js \
-  test/unit/image-understanding.test.js \
-  test/unit/video-understanding.test.js \
-  test/unit/phase1-regression-contract.test.js \
-  test/unit/phase2-regression-contract.test.js
+  test/unit/channels/normalizer.test.js \
+  test/unit/agent/message-processor-media-errors.test.js \
+  test/unit/agent/message-context.test.js \
+  test/unit/web/web-fetch.test.js \
+  test/unit/documents/document-security.test.js \
+  test/unit/media/media-pipeline.test.js \
+  test/unit/agent/voice-output-mode.test.js \
+  test/unit/channels/voice-output.test.js \
+  test/unit/media/image-understanding.test.js \
+  test/unit/media/video-understanding.test.js \
+  test/contracts/phase1-regression.contract.test.js \
+  test/contracts/phase2-regression.contract.test.js
 
 pass "Focused Phase 2 multimodal test suite passed"
 
 echo "=============================================="
 echo " PHASE 2 AUTOMATED REGRESSION: PASS"
 echo "=============================================="
-echo "Complete the WhatsApp DM & Group acceptance matrix in:"
-echo "docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md and docs/PHASE-2-ROADMAP.md"
+echo "See README.md for WhatsApp DM & Group capabilities."

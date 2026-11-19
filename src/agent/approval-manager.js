@@ -1,6 +1,13 @@
 const crypto = require('node:crypto');
 const { ResponseHandler } = require('../channels/response-handler');
 
+function formatApprovalPrompt({ id, toolName, args, ttlMs = null }) {
+  const expiryNote = ttlMs ? `\nBerlaku ${Math.ceil(ttlMs / 60000)} menit.` : '';
+  return toolName === 'send_whatsapp_file'
+    ? `*Konfirmasi pengiriman file Bubu*\n\nTujuan: ${args.targetId}\nFile: ${args.filename}\nKeterangan: ${args.caption || '-'}\n\nBalas /approve ${id} untuk mengirim atau /deny ${id} untuk membatalkan.${expiryNote}`
+    : `*Konfirmasi tindakan Bubu*\n\nTujuan: ${args.targetId}\nPesan:\n${args.message}\n\nBalas /approve ${id} untuk mengirim atau /deny ${id} untuk membatalkan.${expiryNote}`;
+}
+
 class ApprovalManager {
   constructor({ db, waha, responseHandler = null, ownerJid, ttlMinutes = 5 }) {
     this.db = db;
@@ -14,9 +21,7 @@ class ApprovalManager {
     const id = crypto.randomBytes(4).toString('hex');
     const expiresAt = new Date(Date.now() + this.ttlMs).toISOString();
     this.db.createApproval({ id, taskId, chatId, requesterId, toolName, arguments: args, expiresAt });
-    const prompt = toolName === 'send_whatsapp_file'
-      ? `*Konfirmasi pengiriman file Bubu*\n\nTujuan: ${args.targetId}\nFile: ${args.filename}\nKeterangan: ${args.caption || '-'}\n\nBalas /approve ${id} untuk mengirim atau /deny ${id} untuk membatalkan.\nBerlaku ${Math.ceil(this.ttlMs / 60000)} menit.`
-      : `*Konfirmasi tindakan Bubu*\n\nTujuan: ${args.targetId}\nPesan:\n${args.message}\n\nBalas /approve ${id} untuk mengirim atau /deny ${id} untuk membatalkan.\nBerlaku ${Math.ceil(this.ttlMs / 60000)} menit.`;
+    const prompt = formatApprovalPrompt({ id, toolName, args, ttlMs: this.ttlMs });
     return { pendingApproval: true, approvalId: id, prompt };
   }
 
@@ -28,7 +33,7 @@ class ApprovalManager {
     }
     const item = this.db.claimApproval(id, actorId, this.ownerJid);
     if (!item) return { ok: false, reason: 'not_pending_or_expired' };
-    if (!['send_whatsapp_message','send_whatsapp_file'].includes(item.tool_name)) {
+    if (!['send_whatsapp_message', 'send_whatsapp_file'].includes(item.tool_name)) {
       this.db.finishApproval(id, 'failed', 'Unsupported approved tool');
       return { ok: false, reason: 'unsupported_tool' };
     }
@@ -52,4 +57,4 @@ class ApprovalManager {
   }
 }
 
-module.exports = { ApprovalManager };
+module.exports = { ApprovalManager, formatApprovalPrompt };

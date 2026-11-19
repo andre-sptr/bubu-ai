@@ -52,25 +52,24 @@ if [ -n "$DIRECT_SEND_MATCHES" ]; then
 fi
 pass "All outbound WhatsApp sends route through ResponseHandler"
 
-SAVE_DOC_COUNT="$(grep -cE '^  saveDocument\(' src/db/database.js)"
+SAVE_DOC_COUNT="$(grep -rnE '^  saveDocument\(' src/db/ | wc -l | tr -d ' ')"
 if [ "$SAVE_DOC_COUNT" -ne 1 ]; then
-  fail "Expected exactly 1 saveDocument definition in src/db/database.js, found $SAVE_DOC_COUNT"
+  fail "Expected exactly 1 saveDocument definition in src/db/, found $SAVE_DOC_COUNT"
 fi
 pass "DatabaseStore methods deduplicated"
 
 # 4. Run focused Phase 3 Document Intelligence test suite
 node --test \
-  test/unit/document-generation.test.js \
-  test/unit/document-tools.test.js \
-  test/unit/p1-services.test.js \
-  test/unit/phase3-document-intelligence.test.js \
-  test/unit/phase1-regression-contract.test.js \
-  test/unit/phase2-regression-contract.test.js
+  test/unit/documents/document-generation.test.js \
+  test/unit/documents/document-tools.test.js \
+  test/unit/documents/document-security.test.js \
+  test/unit/documents/document-intelligence.test.js \
+  test/contracts/phase1-regression.contract.test.js \
+  test/contracts/phase2-regression.contract.test.js
 
 pass "Focused Phase 3 Document Intelligence test suite passed"
 
 echo "=============================================="
 echo " PHASE 3 AUTOMATED REGRESSION: PASS"
 echo "=============================================="
-echo "Complete the WhatsApp DM & Group acceptance matrix in:"
-echo "docs/PHASE-3-ROADMAP.md"
+echo "See README.md for Document Intelligence capabilities."

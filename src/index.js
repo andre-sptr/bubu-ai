@@ -1,25 +1,23 @@
 require('dotenv').config();
-const path = require('node:path');
 const pino = require('pino');
 const { loadConfig } = require('./config/env');
 const { DatabaseStore } = require('./db/database');
 const { SumopodProvider } = require('./providers/sumopod');
 const { ModelRouter } = require('./agent/model-router');
-const { createCoreTools } = require('./agent/tool-registry');
+const { registerAllTools } = require('./agent/tool-registry');
 const { ApprovalManager } = require('./agent/approval-manager');
 const { AgentRuntime } = require('./agent/runtime');
-const { WahaClient, normalizeIncoming } = require('./channels/waha/client');
+const { WahaClient } = require('./channels/waha/client');
+const { normalizeIncoming } = require('./channels/waha/normalizer');
 const { ResponseHandler } = require('./channels/response-handler');
 const { MessageProcessor } = require('./agent/message-processor');
 const { InboxWorker } = require('./workers/inbox-worker');
 const { ReminderWorker } = require('./workers/reminder-worker');
 const { buildApp } = require('./app');
-const { DocumentService } = require('./p1/documents/service');
-const { WebSearchService, WebFetchService } = require('./p1/web/search');
-const { createP1Tools } = require('./p1/tools');
-const { MemoryService } = require('./p2/memory-service');
-const { createP2MemoryTools } = require('./p2/tools');
-const { MediaIntelligenceService } = require('./p3/media/service');
+const { DocumentService } = require('./documents/document-service');
+const { WebSearchService, WebFetchService } = require('./web/web-service');
+const { MemoryService } = require('./memory/memory-service');
+const { MediaIntelligenceService } = require('./media/media-service');
 
 async function main() {
   const config = loadConfig();
@@ -34,7 +32,9 @@ async function main() {
   router.assertReady();
   const memoryService = new MemoryService({ db, provider, router, logger });
   const documentService = new DocumentService({
-    db, wahaConfig: config.waha, storageDir: config.storageDir,
+    db,
+    wahaConfig: config.waha,
+    storageDir: config.storageDir,
     maxFileBytes: config.documents.maxFileBytes,
     maxExtractChars: config.documents.maxExtractChars,
     ocrEnabled: config.documents.ocrEnabled,
@@ -72,17 +72,20 @@ async function main() {
     db, waha, responseHandler, ownerJid: config.ownerJid,
     ttlMinutes: config.agent.approvalTtlMinutes
   });
-  const tools = createCoreTools({ db, approvalManager, waha, config, memoryService });
   const webSearch = config.search.tavilyApiKey
     ? new WebSearchService({ apiKey: config.search.tavilyApiKey, maxResults: config.search.maxResults })
     : null;
   const webFetch = new WebFetchService();
-  for (const tool of createP1Tools({ db, documentService, webSearch, webFetch, approvalManager, waha, responseHandler })) {
-    tools.register(tool);
-  }
-  for (const tool of createP2MemoryTools({ db, memoryService })) {
-    tools.register(tool);
-  }
+  const tools = registerAllTools({
+    db,
+    approvalManager,
+    waha,
+    responseHandler,
+    memoryService,
+    documentService,
+    webSearch,
+    webFetch
+  });
   const agent = new AgentRuntime({ provider, router, tools, db, config, logger });
   const processor = new MessageProcessor({
     config, db, waha, responseHandler, agent, approvalManager, provider, router,
@@ -115,7 +118,8 @@ async function main() {
   const app = buildApp({ config, db, logger });
   await app.listen({ host: config.host, port: config.port });
   logger.info({
-    host: config.host, port: config.port,
+    host: config.host,
+    port: config.port,
     database: config.databasePath,
     groupPolicy: config.groupPolicy
   }, 'Bubu v2 started');

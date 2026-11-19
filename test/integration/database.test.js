@@ -399,3 +399,37 @@ test('pending approvals are returned only for the matching chat and only before 
     assert.deepEqual(f.db.getPendingApprovalsForChat('other@g.us'), []);
   } finally { f.close(); }
 });
+
+test('searchMemoriesSemantic tokenizes multi-word lexical queries when queryEmbedding is null', () => {
+  const f = fixture();
+  try {
+    f.db.saveMemory({
+      scope: 'personal',
+      ownerId: 'owner@c.us',
+      title: 'Preferensi Kopi',
+      content: 'Owner menyukai kopi tubruk tanpa gula setiap pagi.',
+      memoryType: 'preference',
+      importance: 4
+    });
+    f.db.saveMemory({
+      scope: 'personal',
+      ownerId: 'owner@c.us',
+      title: 'Jadwal Olahraga',
+      content: 'Jogging rutin setiap hari Sabtu pagi.',
+      memoryType: 'fact',
+      importance: 3
+    });
+
+    const matches = f.db.searchMemoriesSemantic({
+      scope: 'personal',
+      ownerId: 'owner@c.us',
+      query: 'kopi tubruk gula',
+      queryEmbedding: null,
+      limit: 5
+    });
+
+    assert.equal(matches.length, 1);
+    assert.match(matches[0].content, /kopi tubruk/);
+    assert.ok(matches[0].lexicalScore > 0);
+  } finally { f.close(); }
+});

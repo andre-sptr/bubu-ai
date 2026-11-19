@@ -6,27 +6,27 @@ Rebuild bersih (tanpa kode atau data Bubu v1) untuk asisten AI WhatsApp hybrid (
 
 ## 1. Status Roadmap & Fase Proyek
 
-| Fase | Nama Fase | Status | Dokumen Acuan |
+| Fase | Nama Fase | Status | Cakupan Utama |
 |---|---|---|---|
-| **P0–P3 (Fondasi)** | Core Agent, Advanced Tools, Memory, Multimodal Baseline | **Selesai** | `docs/P0-CORE-AGENT.md` s/d `docs/P3-WHATSAPP-MULTIMODAL.md` |
-| **Phase 1** | Core Reliability & Response Control (Task 1.1–1.9) | **Selesai & Disetujui** | `docs/PHASE-1-FULL-REGRESSION-PLAN.md` |
-| **Phase 2** | Full Multimodal WhatsApp (Task 2.1–2.8) | **Kode & Unit Test Selesai** · Menunggu Acceptance VPS | `docs/PHASE-2-ROADMAP.md`, `docs/TASK-2.6-2.8-VISION-VIDEO-REGRESSION.md` |
-| **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Kode & Unit Test Selesai (`217/217`)** · Lulus Regresi VPS | `docs/PHASE-3-ROADMAP.md` |
-| **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Direncanakan (Siap Mulai)** | `docs/PHASE-4-ROADMAP.md` |
-| **Phase 5** | Advanced Agent & Memory Lifecycle (Task 5.1–5.8) | **Direncanakan** | `docs/PHASE-5-ROADMAP.md` |
-| **Phase 6** | Queue Redesign & End-to-End Hardening (Task 6.1–6.8) | **Direncanakan** | `docs/PHASE-6-ROADMAP.md` |
+| **P0–P3 (Fondasi)** | Core Agent, Advanced Tools, Memory, Multimodal Baseline | **Selesai** | Runtime agent, memori hibrida, pencarian web, dokumen & media baseline |
+| **Phase 1** | Core Reliability & Response Control (Task 1.1–1.9) | **Selesai & Disetujui** | Antrean durable SQLite, idempotensi, unified `ResponseHandler`, isolasi DM/grup |
+| **Phase 2** | Full Multimodal WhatsApp (Task 2.1–2.8) | **Kode & Unit Test Selesai** | Pemahaman gambar/video ber-timestamp, STT + Silero VAD, Piper TTS & mode `/voice` |
+| **Phase 3** | Deep Document Intelligence (Task 3.1–3.8) | **Kode & Unit Test Selesai** | PDF hybrid + OCR, DOCX XML terstruktur, analitik spreadsheet, generasi DOCX/XLSX/PDF |
+| **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Direncanakan (Siap Mulai)** | Fitur outbound native WhatsApp lanjutan |
+| **Phase 5** | Advanced Agent & Memory Lifecycle (Task 5.1–5.8) | **Direncanakan** | Siklus hidup memori & orkestrasi agen lanjutan |
+| **Phase 6** | Queue Redesign & End-to-End Hardening (Task 6.1–6.8) | **Direncanakan** | Desain ulang antrean & pengerasan end-to-end |
 
 ---
 
 ## 2. Profil & Spesifikasi VPS Produksi
 
-Informasi lingkungan produksi saat ini (berdasarkan audit VPS pada `docs/TASK-2.1-PRODUCTION-AUDIT-EVIDENCE.md` dan `docs/TASK-2.5-VOICE-AUDIO-EVIDENCE.docx`):
+Informasi lingkungan produksi target:
 
 | Komponen | Spesifikasi / Lokasi di VPS | Catatan Operasional |
 |---|---|---|
 | **Direktori Proyek** | `/www/wwwroot/bot-project/bubu` | Dikelola dengan PM2 (`ecosystem.config.cjs`, proses `bubu`, `max_memory_restart: 512M`). |
 | **Kapasitas Server** | **2 vCPU**, **1,9 GiB RAM total**, **23,7 GiB disk bebas** | Dilindungi single-concurrency guard (`audioBusy` & `videoBusy`) pada `MediaIntelligenceService` dan `maxConcurrentJobs = 1`. |
-| **Runtime Node.js** | **Node.js v24.22.1** (shell & PM2) | Memenuhi syarat engine `>=22.0.0`. |
+| **Runtime Node.js** | **Node.js v24.22.1** (`engines: >=22.0.0`) | `better-sqlite3` v12+ menyediakan prebuilt binary Node.js 24 tanpa kompilasi C++ lokal. |
 | **Endpoint Layanan** | `http://127.0.0.1:3088` (`/webhook`, `/health`, `/ready`) | Readiness memverifikasi koneksi SQLite dan status worker. |
 | **Database** | SQLite (`./data/bubu.sqlite`), **Schema Version 9** | Mode WAL + Foreign Keys aktif; backup online melalui `npm run backup`. |
 | **Storage Dokumen & Media** | `./storage` (`./storage/inbound`, `./storage/generated`) | Berada di luar public web root (`mode 0700`); file media masuk & direktori kerja sementara dihapus otomatis di blok `finally`. |
@@ -56,7 +56,7 @@ WAHA_API_KEY=
 SUMOPOD_API_KEY=
 ```
 
-*(Opsional: tambahkan `TAVILY_API_KEY` jika ingin mengaktifkan tool `web_search`. Lihat `docs/ENVIRONMENT-CONFIGURATION.md` untuk daftar lengkap variabel override opsional).*
+*(Opsional: tambahkan `TAVILY_API_KEY` jika ingin mengaktifkan tool `web_search`. Lihat [`src/config/env.js`](src/config/env.js) untuk daftar lengkap variabel override opsional).*
 
 ---
 
@@ -68,7 +68,7 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 |---|---|---|
 | `fast` | `claude-haiku-5-5` | Pertanyaan singkat, sapaan, klasifikasi ringan |
 | `balanced` | `claude-sonnet-5-5` | Tugas asisten harian, eksekusi tool umum |
-| `vision` | `claude-sonnet-5-5` | Pemahaman visual gambar & rangkaian frame video (`needsVision: true`, terverifikasi mendukung vision + tool calling pada Task 2.1C) |
+| `vision` | `claude-sonnet-5-5` | Pemahaman visual gambar & rangkaian frame video (`needsVision: true`) |
 | `coding` | `claude-sonnet-5-5` | Pembuatan dan debugging kode |
 | `reasoning` | `claude-opus-5-5` | Perencanaan multi-langkah kompleks & penalaran mendalam |
 | `summary` | `gemini/gemini-3.1-pro-preview` | Ringkasan konteks panjang (`/rangkum`, dokumen besar) |
@@ -76,7 +76,7 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 
 ---
 
-## 5. Kapabilitas Utama Saat Ini (Hingga Phase 2)
+## 5. Kapabilitas Utama Saat Ini (Hingga Phase 3)
 
 ### A. Keandalan Inti & Kontrol Respons (Phase 1)
 - **Antrean Inbox Durable (`InboxWorker`):** Deduplikasi event webhook, klaim atomik, retry eksponensial terbatas (`maxAttempts = 5`), transisi `dead`-letter dengan notifikasi aman, dan pemulihan event `stale` saat startup.
@@ -95,7 +95,7 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
   - Perintah `/voice on` (voice-only, fail-closed tanpa fallback teks jika TTS gagal), `/voice both` (teks + voice note), `/voice off` (teks saja), `/voice status`, dan `/voice reset` tersimpan per chat di SQLite.
 - **Konteks Caption & Reply/Quote (`Task 2.4`):** Memisahkan `bodyText`, `captionContext`, `voiceInstruction`, `attachmentEvidence`, dan `quoteContext`. Kutipan lintas chat (`remoteJid` berbeda) ditolak otomatis (`quote.rejected = true`), dan giliran media/quote melewati auto-memory capture.
 
-### C. Deep Document Intelligence, Web, Memori, & Produktivitas (P1, P2, & Phase 3)
+### C. Deep Document Intelligence, Web, Memori, & Produktivitas (Phase 3)
 - **Ingesti PDF Digital, Scan, & Hybrid (`Task 3.2`):** Mengekstrak teks PDF per halaman (`--- [HALAMAN N — TEKS ASLI] ---`) dan otomatis menjalankan fallback render + Tesseract OCR (`ind+eng`) untuk halaman scan/minim teks (`--- [HALAMAN N — OCR SCAN] ---`), dilengkapi guard konkurensi tunggal `ocrBusy` dan pembersihan file sementara otomatis.
 - **Ekstraksi Terstruktur, Navigasi Halaman, & Snippet Search (`Task 3.3`):** Mengekstrak struktur heading (`# / ## / ###`), bullet list, dan tabel pipa dari `word/document.xml` pada file DOCX; mendukung pembacaan per halaman/rentang (`read_document` dengan `page`, `startPage`, `endPage`) serta pencarian cuplikan kontekstual di sekitar kata kunci (`search_document` dengan label halaman).
 - **Analitik Spreadsheet & CSV Deterministik (`Task 3.4`):** Auto-deteksi delimiter CSV (`,`, `;`, `\t`), dukungan sel multi-baris ber-quote, normalisasi angka Indonesia (`Rp 1.250.000,50`) & internasional, serta perhitungan statistik deterministik (`count`, `sum`, `avg`, `min`, `max`), filter baris, dan agregasi `groupByColumn` pada `analyze_spreadsheet`.
@@ -110,67 +110,59 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 
 ```text
 bubu/
-├── data/                       # Database SQLite lokal (bubu.sqlite, WAL/SHM)
-├── docs/                       # Dokumentasi arsitektur, roadmap fase, dan laporan task
-│   ├── DEPLOY-AAPANEL.md
-│   ├── ENVIRONMENT-CONFIGURATION.md
-│   ├── MODEL-ROUTING.md
-│   ├── P0-CORE-AGENT.md ... P3-WHATSAPP-MULTIMODAL.md
-│   ├── PHASE-1-FULL-REGRESSION-PLAN.md
-│   ├── PHASE-2-ROADMAP.md
-│   ├── PHASE-3-ROADMAP.md
-│   ├── PHASE-4-ROADMAP.md
-│   ├── PHASE-5-ROADMAP.md
-│   ├── PHASE-6-ROADMAP.md
-│   ├── TASK-1.1-*.md ... TASK-1.8-*.md
-│   ├── TASK-2.1-*.md ... TASK-2.6-2.8-*.md
-│   └── TEST-REPORT.md
-├── scripts/                    # Skrip operasional & regresi otomatis
-│   ├── backup.js               # Online backup SQLite + storage
-│   ├── list-models.js          # Cek katalog model Sumopod
-│   ├── phase1-regression.sh    # Gate regresi otomatis Phase 1
-│   ├── phase2-regression.sh    # Gate regresi otomatis Phase 2
-│   ├── phase3-regression.sh    # Gate regresi otomatis Phase 3
-│   └── smoke-tool-calling.js   # Uji smoke tool calling
+├── data/                                   # Database SQLite lokal (bubu.sqlite, WAL/SHM — gitignored)
+├── scripts/                                # Skrip operasional, cek sintaks, & regresi otomatis
+│   ├── backup.js                           # Online backup SQLite + storage
+│   ├── check-syntax.js                     # Pemeriksaan sintaks seluruh file JS/CJS
+│   ├── list-models.js                      # Cek katalog model Sumopod
+│   ├── phase1-regression.sh                # Gate regresi otomatis Phase 1
+│   ├── phase2-regression.sh                # Gate regresi otomatis Phase 2
+│   ├── phase3-regression.sh                # Gate regresi otomatis Phase 3
+│   └── smoke-tool-calling.js               # Uji smoke tool calling
 ├── src/
-│   ├── agent/                  # Runtime, MessageProcessor, ModelRouter, Approval, RateLimiter
-│   ├── channels/               # ResponseHandler, WhatsApp Formatter, WAHA Client & Normalizer
-│   ├── config/                 # Konfigurasi & default produksi (env.js)
-│   ├── db/                     # SQLite DatabaseStore & migrasi v1–v9 (database.js)
-│   ├── p1/                     # DocumentService (PDF OCR/DOCX/XLSX/CSV/TXT/PDF Gen), Web Search/Fetch, P1 Tools
-│   ├── p2/                     # MemoryService, Vector cosine similarity, P2 Tools
-│   ├── p3/                     # MediaIntelligenceService (Vision, Video frames, STT+VAD, Piper TTS)
-│   ├── providers/              # SumopodProvider (OpenAI-compatible + image_url sanitizer)
-│   ├── utils/                  # Klasifikasi error operasional (error-policy.js)
-│   ├── workers/                # InboxWorker & ReminderWorker
-│   ├── app.js                  # Server HTTP Fastify (/webhook, /health, /ready)
-│   └── index.js                # Bootstrap aplikasi & graceful shutdown
-├── storage/                    # Penyimpanan privat dokumen & media sementara
+│   ├── agent/                              # Orkestrasi agen (Runtime, PromptBuilder, CommandHandler, MessageProcessor, ModelRouter, ApprovalManager, ToolRegistry)
+│   ├── channels/                           # Transport & formatting WhatsApp (ResponseHandler, WhatsAppFormatter, WAHA Client & Normalizer)
+│   ├── config/                             # Konfigurasi environment & default produksi (env.js)
+│   ├── db/                                 # DatabaseStore, migrasi v1–v9 (migrations.js), dan 7 repository SQLite per domain (repositories/)
+│   ├── documents/                          # Layanan & tools dokumen (DocumentService, DocumentTools, parsers/, generators/)
+│   ├── media/                              # Layanan & validasi multimodal (MediaIntelligenceService, media-validator.js)
+│   ├── memory/                             # Memori semantik & proyek (MemoryService, memory-tools.js)
+│   ├── productivity/                       # Tools task, reminder, & pengiriman pesan DM tervalidasi (productivity-tools.js)
+│   ├── providers/                          # SumopodProvider (OpenAI-compatible + image_url sanitizer)
+│   ├── utils/                              # Utilitas bersama (error-policy, media-http, process-runner, rate-limiter, vector, zod-loader)
+│   ├── web/                                # Pencarian & fetch web aman (WebSearchService, WebFetchService, web-tools.js)
+│   ├── workers/                            # Background worker (InboxWorker, ReminderWorker)
+│   ├── app.js                              # Server HTTP Fastify (/webhook, /health, /ready)
+│   └── index.js                            # Bootstrap aplikasi & graceful shutdown
+├── storage/                                # Penyimpanan privat dokumen & media sementara (isi gitignored)
 └── test/
-    ├── integration/            # Tes integrasi SQLite & migrasi (database.test.js)
-    └── unit/                   # 30 file unit test kontrak Phase 1, Phase 2, & Phase 3
+    ├── contracts/                          # Kontrak regresi lintas-fase (phase1 & phase2)
+    ├── integration/                        # Tes integrasi SQLite & migrasi (database.test.js)
+    └── unit/                               # Unit test terorganisir per domain (agent, channels, config, documents, media, memory, utils, web, workers)
 ```
 
 ---
 
-## 7. Perintah Operasional & Pengujian di VPS
+## 7. Perintah Operasional & Pengujian
 
 ```bash
-# Masuk ke direktori proyek di VPS
-cd /www/wwwroot/bot-project/bubu
-
 # 1. Backup SQLite + storage sebelum update
 npm run backup
 
-# 2. Jalankan seluruh unit & integration test
-npm test
+# 2. Jalankan cek sintaks seluruh JS/CJS + semua test suite (unit, integration, contract)
+npm run check
 
-# 3. Jalankan gate regresi Phase 1, Phase 2, & Phase 3 di VPS
+# 3. Jalankan suite tes spesifik
+npm run test:unit
+npm run test:integration
+npm run test:contracts
+
+# 4. Jalankan gate regresi Phase 1, Phase 2, & Phase 3 di VPS
 npm run test:phase1
-bash scripts/phase2-regression.sh
-bash scripts/phase3-regression.sh
+npm run test:phase2
+npm run test:phase3
 
-# 4. Restart layanan melalui PM2 & cek kesehatan
+# 5. Restart layanan melalui PM2 & cek kesehatan
 pm2 restart bubu
 curl -s http://127.0.0.1:3088/health
 curl -s http://127.0.0.1:3088/ready

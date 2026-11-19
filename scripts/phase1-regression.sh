@@ -32,12 +32,8 @@ console.log('[PASS] Required dependencies are installed');
 NODE
 
 # 3. Syntax-check all project JavaScript
-mapfile -d '' JS_FILES < <(find src test scripts -type f -name '*.js' -print0)
-if ((${#JS_FILES[@]} == 0)); then fail "No JavaScript files found"; fi
-for file in "${JS_FILES[@]}"; do
-  node --check "$file" >/dev/null || fail "Syntax error: $file"
-done
-pass "Syntax check (${#JS_FILES[@]} JavaScript files)"
+node scripts/check-syntax.js || fail "Syntax check failed"
+pass "Syntax check passed"
 
 # 4. Validate effective configuration without printing secrets
 if [[ ! -f .env ]]; then fail "Production .env file is missing"; fi
@@ -112,5 +108,4 @@ NODE
 echo "=============================================="
 echo " PHASE 1 AUTOMATED REGRESSION: PASS"
 echo "=============================================="
-echo "Manual WhatsApp acceptance tests are documented in:"
-echo "docs/PHASE-1-FULL-REGRESSION-PLAN.md"
+echo "Operational overview is documented in README.md"

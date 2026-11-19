@@ -1,5 +1,12 @@
 node_modules/
 .env
+.env.*
+!.env.example
 data/*.sqlite*
+storage/*
+!storage/.gitkeep
+backups/
 logs/*
 *.log
+.DS_Store
+Thumbs.db

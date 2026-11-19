@@ -1,5 +1,8 @@
 const Fastify = require('fastify');
 const helmet = require('@fastify/helmet');
+const { version } = require('../package.json');
+const { normalizeIncoming } = require('./channels/waha/normalizer');
+const { eventKey } = require('./agent/message-processor');
 
 function buildApp({ config, db, logger }) {
   const app = Fastify({
@@ -14,7 +17,7 @@ function buildApp({ config, db, logger }) {
   app.get('/health', async () => ({
     ok: true,
     service: 'bubu-v2',
-    version: '2.0.0',
+    version,
     database: 'sqlite',
     provider: 'sumopod'
   }));
@@ -38,8 +41,6 @@ function buildApp({ config, db, logger }) {
       }
     }
 
-    const { normalizeIncoming } = require('./channels/waha/client');
-    const { eventKey } = require('./agent/message-processor');
     const message = normalizeIncoming(request.body || {});
 
     if (!message.chatId || message.fromMe ||
