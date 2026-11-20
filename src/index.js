@@ -71,6 +71,31 @@ function cleanupStaleTempDirs({
   return { removed, skipped, errors };
 }
 
+function createDeadLetterNotifier({ config, db, waha, responseHandler, logger }) {
+  return async ({ event, message, category }) => {
+    const incoming = normalizeIncoming(event?.payload || {});
+    let chatId = normalizeJid(event?.chat_id || incoming.chatId);
+    if (!chatId) return;
+    if (chatId.endsWith('@lid') && typeof waha?.resolveLid === 'function') {
+      try {
+        const resolved = normalizeJid(await waha.resolveLid(chatId));
+        if (resolved) chatId = resolved;
+      } catch (err) {
+        logger?.warn?.({ eventId: event?.event_id, chatId, error: err?.message }, 'Unable to resolve dead-letter chat LID');
+      }
+    }
+    if (chatId !== config.ownerJid && !chatId.endsWith('@g.us')) return;
+    if (chatId.endsWith('@g.us') && config.groupPolicy !== 'all') return;
+    const mode = db.getChatOutputMode({
+      chatId,
+      requesterId: config.ownerJid,
+      defaultMode: config.media?.voiceReplyDefault ? 'both' : 'text'
+    });
+    logger?.warn?.({ eventId: event?.event_id, chatId, category }, 'Sending terminal processing notice');
+    await responseHandler.sendAssistantResponse(message, chatId, mode);
+  };
+}
+
 async function main() {
   const config = loadConfig();
   const logger = pino({
@@ -177,20 +202,7 @@ async function main() {
     maxAttempts: config.inbox.maxAttempts,
     staleMs: config.inbox.staleMs,
     maxConcurrentJobs: config.agent.maxConcurrentJobs,
-    onDeadLetter: async ({ event, message, category }) => {
-      const incoming = normalizeIncoming(event.payload || {});
-      const chatId = normalizeJid(event.chat_id || incoming.chatId);
-      if (!chatId) return;
-      if (chatId !== config.ownerJid && !chatId.endsWith('@g.us')) return;
-      if (chatId.endsWith('@g.us') && config.groupPolicy !== 'all') return;
-      const mode = db.getChatOutputMode({
-        chatId,
-        requesterId: config.ownerJid,
-        defaultMode: config.media.voiceReplyDefault ? 'both' : 'text'
-      });
-      logger.warn({ eventId: event.event_id, chatId, category }, 'Sending terminal processing notice');
-      await responseHandler.sendAssistantResponse(message, chatId, mode);
-    }
+    onDeadLetter: createDeadLetterNotifier({ config, db, waha, responseHandler, logger })
   }).start();
   processor.worker = worker;
   const reminderWorker = new ReminderWorker({ db, waha, responseHandler, logger });
@@ -234,4 +246,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, cleanupStaleTempDirs };
+module.exports = { main, cleanupStaleTempDirs, createDeadLetterNotifier };

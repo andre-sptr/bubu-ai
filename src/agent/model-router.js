@@ -9,8 +9,18 @@ const TASK_TO_TIER = Object.freeze({
   vision: 'vision'
 });
 
+const DEFAULT_ATTACHMENT_PROMPTS = [
+  /^tolong baca dan jelaskan dokumen yang saya kirim\.?(?:\s+|$)/i,
+  /^tolong jalankan instruksi yang saya sampaikan melalui voice note ini\.?(?:\s+|$)/i
+];
+
 function classifyTask(text = '') {
-  const s = String(text).toLowerCase().trim();
+  let s = String(text).toLowerCase().trim();
+  for (const pattern of DEFAULT_ATTACHMENT_PROMPTS) {
+    if (pattern.test(s)) {
+      s = s.replace(pattern, '').trim();
+    }
+  }
   const isShortGreeting = s.length <= 40 &&
     !/[.?!].*\S/.test(s) &&
     !s.endsWith('?') &&

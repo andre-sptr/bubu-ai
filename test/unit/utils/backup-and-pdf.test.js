@@ -51,7 +51,7 @@ test('runBackup backs up WAL SQLite DB and storage dir, verifies integrity, and 
     const remaining = fs.readdirSync(backupDir);
     assert.equal(remaining.filter((n) => /^bubu-.+\.sqlite$/.test(n)).length, 2);
     assert.equal(remaining.filter((n) => /^storage-.+/.test(n)).length, 2);
-    assert.equal(remaining.some((n) => n.endsWith('.tmp')), false);
+    assert.equal(remaining.some((n) => n.includes('.tmp')), false);
     assert.equal(fs.existsSync(r1.destination), false);
     assert.equal(fs.existsSync(r2.destination), true);
     assert.equal(fs.existsSync(r3.destination), true);

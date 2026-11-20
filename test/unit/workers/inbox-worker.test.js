@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { InboxWorker } = require('../../../src/workers/inbox-worker');
-const { cleanupStaleTempDirs } = require('../../../src/index');
+const { cleanupStaleTempDirs, createDeadLetterNotifier } = require('../../../src/index');
 
 test('worker claims, handles, and completes an event', async () => {
   let completed = false;
@@ -279,4 +279,92 @@ test('cleanupStaleTempDirs removes stale bubu- temp dirs while preserving bubu-d
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('createDeadLetterNotifier resolves owner @lid to ownerJid before gating delivery', async () => {
+  const sent = [];
+  const resolveCalls = [];
+  const notifier = createDeadLetterNotifier({
+    config: { ownerJid: '628111111111@c.us', groupPolicy: 'all', media: { voiceReplyDefault: false } },
+    db: { getChatOutputMode: ({ chatId }) => (sent.push(['mode', chatId]), 'text') },
+    waha: {
+      resolveLid: async (lid) => {
+        resolveCalls.push(lid);
+        return '628111111111@c.us';
+      }
+    },
+    responseHandler: {
+      sendAssistantResponse: async (message, chatId, mode) => {
+        sent.push(['send', message, chatId, mode]);
+      }
+    },
+    logger: { warn: () => {} }
+  });
+
+  await notifier({
+    event: { event_id: 'evt-owner-lid', chat_id: '232701932138501@lid', payload: {} },
+    message: 'Gagal memproses',
+    category: 'timeout'
+  });
+
+  assert.deepEqual(resolveCalls, ['232701932138501@lid']);
+  assert.deepEqual(sent, [
+    ['mode', '628111111111@c.us'],
+    ['send', 'Gagal memproses', '628111111111@c.us', 'text']
+  ]);
+});
+
+test('createDeadLetterNotifier drops non-owner @lid and enforces groupPolicy on @g.us', async () => {
+  const sent = [];
+  let resolveCalls = 0;
+
+  const nonOwnerNotifier = createDeadLetterNotifier({
+    config: { ownerJid: '628111111111@c.us', groupPolicy: 'all', media: { voiceReplyDefault: false } },
+    db: { getChatOutputMode: () => 'text' },
+    waha: {
+      resolveLid: async () => {
+        resolveCalls++;
+        return '628999999999@c.us';
+      }
+    },
+    responseHandler: { sendAssistantResponse: async (...args) => sent.push(args) },
+    logger: { warn: () => {} }
+  });
+  await nonOwnerNotifier({
+    event: { event_id: 'evt-stranger-lid', chat_id: '999999999@lid', payload: {} },
+    message: 'Should drop',
+    category: 'internal'
+  });
+  assert.equal(resolveCalls, 1);
+  assert.equal(sent.length, 0);
+
+  const groupBlockedNotifier = createDeadLetterNotifier({
+    config: { ownerJid: '628111111111@c.us', groupPolicy: 'disabled', media: { voiceReplyDefault: false } },
+    db: { getChatOutputMode: () => 'text' },
+    waha: { resolveLid: async () => { resolveCalls++; return ''; } },
+    responseHandler: { sendAssistantResponse: async (...args) => sent.push(args) },
+    logger: { warn: () => {} }
+  });
+  await groupBlockedNotifier({
+    event: { event_id: 'evt-group-off', chat_id: '120363000000000000@g.us', payload: {} },
+    message: 'Blocked group',
+    category: 'internal'
+  });
+  assert.equal(resolveCalls, 1);
+  assert.equal(sent.length, 0);
+
+  const groupAllowedNotifier = createDeadLetterNotifier({
+    config: { ownerJid: '628111111111@c.us', groupPolicy: 'all', media: { voiceReplyDefault: false } },
+    db: { getChatOutputMode: () => 'text' },
+    waha: { resolveLid: async () => { resolveCalls++; return ''; } },
+    responseHandler: { sendAssistantResponse: async (...args) => sent.push(args) },
+    logger: { warn: () => {} }
+  });
+  await groupAllowedNotifier({
+    event: { event_id: 'evt-group-on', chat_id: '120363000000000000@g.us', payload: {} },
+    message: 'Allowed group',
+    category: 'timeout'
+  });
+  assert.equal(resolveCalls, 1);
+  assert.deepEqual(sent, [['Allowed group', '120363000000000000@g.us', 'text']]);
 });

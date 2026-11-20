@@ -44,3 +44,24 @@ test('router skips tiers whose supportsTools is explicitly false when needsTools
     tier: 'balanced', model: 'sonnet-balanced', supportsTools: true
   });
 });
+
+test('default attachment boilerplate prompts do not force reasoning/agent tier', () => {
+  assert.equal(classifyTask('Tolong baca dan jelaskan dokumen yang saya kirim.'), 'general_chat');
+  assert.equal(
+    classifyTask('Tolong jalankan instruksi yang saya sampaikan melalui voice note ini.\nApakah kamu mengerti yang aku katakan?'),
+    'simple_question'
+  );
+  assert.equal(
+    classifyTask('Tolong jalankan instruksi yang saya sampaikan melalui voice note ini.\nHalo Bubu'),
+    'greeting'
+  );
+  assert.equal(
+    classifyTask('Tolong jalankan instruksi yang saya sampaikan melalui voice note ini.\nTolong rangkum catatan rapat ini'),
+    'summarize'
+  );
+  assert.equal(
+    classifyTask('Tolong jalankan instruksi yang saya sampaikan melalui voice note ini.\nTolong kirim pesan ke Budi'),
+    'agent'
+  );
+  assert.equal(classifyTask('Tolong kirim dokumen laporan ke Budi'), 'agent');
+});

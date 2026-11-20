@@ -81,6 +81,12 @@ function pruneOldBackups(backupDir, keepCount = 7) {
   return { prunedDbCount, prunedStorageCount };
 }
 
+function cleanupTempSidecars(tmpPath) {
+  for (const suffix of ['-shm', '-wal']) {
+    fs.rmSync(`${tmpPath}${suffix}`, { force: true });
+  }
+}
+
 function logBackupInfo(logger, message) {
   if (typeof logger?.info === 'function') {
     logger.info(message);
@@ -139,6 +145,7 @@ async function runBackup({ sourcePath, backupDir, storageDir, keepCount = 7, log
     }
 
     verifySqliteIntegrity(tmpDestination);
+    cleanupTempSidecars(tmpDestination);
     try {
       fs.chmodSync(tmpDestination, 0o600);
     } catch {
@@ -147,6 +154,7 @@ async function runBackup({ sourcePath, backupDir, storageDir, keepCount = 7, log
     fs.renameSync(tmpDestination, destination);
   } catch (error) {
     fs.rmSync(tmpDestination, { force: true });
+    cleanupTempSidecars(tmpDestination);
     throw error;
   }
 
