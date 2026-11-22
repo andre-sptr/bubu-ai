@@ -10,6 +10,7 @@ function makeApp({
   webhookHmacSecret = '',
   dbReady = true,
   worker = null,
+  reminderWorker = null,
   sessionMonitor = null,
   isShuttingDown = null
 } = {}) {
@@ -42,6 +43,7 @@ function makeApp({
     },
     db,
     worker,
+    reminderWorker,
     sessionMonitor,
     isShuttingDown,
     logger: {
@@ -397,4 +399,145 @@ test('POST /webhook updates sessionMonitor bot identity from authenticated reque
     botJid: '628777666555@c.us',
     botLid: '555666777@lid'
   });
+});
+
+test('Stage 1: sessionMonitor.rememberOwnerLid promotes /approve from owner @lid to priority 1 in POST /webhook', async (t) => {
+  const monitor = new WahaSessionMonitor({ session: 'default' });
+  const enqueued = [];
+  const db = {
+    db: { prepare: () => ({ get: () => ({ 1: 1 }) }) },
+    enqueueEvent: (item) => {
+      enqueued.push(item);
+      return true;
+    }
+  };
+  const app = buildApp({
+    config: {
+      ownerJid: '628111111111@c.us',
+      waha: { webhookToken: 'top-secret', webhookHeader: 'x-webhook-token', webhookHmacSecret: '' }
+    },
+    db,
+    sessionMonitor: monitor,
+    logger: { level: 'silent', info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: function () { return this; } }
+  });
+  t.after(() => app.close());
+
+  monitor.rememberOwnerLid('232701932138501:0@lid');
+  assert.equal(monitor.getOwnerLid(), '232701932138501@lid');
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/webhook',
+    headers: { 'x-webhook-token': 'top-secret' },
+    payload: {
+      event: 'message',
+      payload: {
+        id: 'evt-lid-approve',
+        from: '232701932138501@lid',
+        author: '232701932138501@lid',
+        body: '/approve deadbeef'
+      }
+    }
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(enqueued.length, 1);
+  assert.equal(enqueued[0].priority, 1);
+});
+
+test('Stage 2: GET /ready includes reminderWorker health check when supplied and returns 503 when unhealthy', async (t) => {
+  const monitor = new WahaSessionMonitor({ session: 'default', status: 'WORKING' });
+  let reminderHealthy = true;
+  const { app } = makeApp({
+    worker: { isHealthy: () => true },
+    reminderWorker: { isHealthy: () => reminderHealthy },
+    sessionMonitor: monitor,
+    isShuttingDown: () => false
+  });
+  t.after(() => app.close());
+
+  const ok = await app.inject({ method: 'GET', url: '/ready' });
+  assert.equal(ok.statusCode, 200);
+  assert.deepEqual(ok.json(), {
+    ready: true,
+    checks: { sqlite: true, worker: true, reminderWorker: true, waha: true, draining: false }
+  });
+
+  reminderHealthy = false;
+  const down = await app.inject({ method: 'GET', url: '/ready' });
+  assert.equal(down.statusCode, 503);
+  assert.deepEqual(down.json(), {
+    ready: false,
+    checks: { sqlite: true, worker: true, reminderWorker: false, waha: true, draining: false }
+  });
+});
+
+test('Stage 3: POST /webhook persists poll.vote events, ignores malformed votes, and elevates /approvals & /polls owner priority', async (t) => {
+  const { classifyEventPriority } = require('../../../src/app');
+  const recordedVotes = [];
+  const db = {
+    db: { prepare: () => ({ get: () => ({ 1: 1 }) }) },
+    enqueueEvent: () => true,
+    recordPollVote: (vote) => {
+      recordedVotes.push(vote);
+      return true;
+    }
+  };
+  const app = buildApp({
+    config: {
+      ownerJid: '628111111111@c.us',
+      waha: { webhookToken: 'top-secret', webhookHeader: 'x-webhook-token', webhookHmacSecret: '' }
+    },
+    db,
+    logger: { level: 'silent', info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: function () { return this; } }
+  });
+  t.after(() => app.close());
+
+  const okVote = await app.inject({
+    method: 'POST',
+    url: '/webhook',
+    headers: { 'x-webhook-token': 'top-secret' },
+    payload: {
+      event: 'poll.vote',
+      session: 'Bubu',
+      payload: {
+        poll: { id: 'poll-msg-77' },
+        vote: { from: '628222222222@c.us', selectedOptions: ['Opsi A', { name: 'Opsi B' }] }
+      }
+    }
+  });
+  assert.equal(okVote.statusCode, 200);
+  assert.deepEqual(okVote.json(), {
+    accepted: true,
+    event: 'poll.vote',
+    recorded: true,
+    pollMessageId: 'poll-msg-77'
+  });
+  assert.deepEqual(recordedVotes[0], {
+    session: 'Bubu',
+    pollMessageId: 'poll-msg-77',
+    voterId: '628222222222@c.us',
+    selectedOptions: ['Opsi A', 'Opsi B']
+  });
+
+  const invalidVote = await app.inject({
+    method: 'POST',
+    url: '/webhook',
+    headers: { 'x-webhook-token': 'top-secret' },
+    payload: { event: 'poll.vote', payload: { vote: {} } }
+  });
+  assert.equal(invalidVote.statusCode, 200);
+  assert.deepEqual(invalidVote.json(), {
+    accepted: true,
+    ignored: true,
+    eventType: 'poll.vote'
+  });
+
+  assert.equal(
+    classifyEventPriority({ chatId: '6281@c.us', senderId: '6281@c.us', text: '/approvals' }, '6281@c.us'),
+    1
+  );
+  assert.equal(
+    classifyEventPriority({ chatId: '6281@c.us', senderId: '6281@c.us', text: '/polls' }, '6281@c.us'),
+    1
+  );
 });

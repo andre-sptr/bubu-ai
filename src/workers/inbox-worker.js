@@ -1,4 +1,5 @@
 const { classifyOperationalError } = require('../utils/error-policy');
+const { cleanupOrphanStorageFiles } = require('../utils/storage-cleanup');
 
 class InboxWorker {
   constructor({
@@ -6,7 +7,9 @@ class InboxWorker {
     pollMs = 500, maxAttempts = 5, staleMs = 120000,
     staleSweepIntervalMs = 30000,
     maxConcurrentJobs = 1,
-    pruneIntervalMs = 3600000
+    pruneIntervalMs = 3600000,
+    heartbeatIntervalMs = null,
+    storageDir = null
   }) {
     this.db = db;
     this.handler = handler;
@@ -21,9 +24,16 @@ class InboxWorker {
       ? 3600000
       : Number(pruneIntervalMs);
     this.pruneIntervalMs = Number.isFinite(parsedPrune) && parsedPrune >= 0 ? parsedPrune : 3600000;
+    const defaultHeartbeat = Math.max(5000, Math.min(30000, Math.floor((Number(staleMs) || 120000) / 3)));
+    const parsedHeartbeat = (heartbeatIntervalMs === null || heartbeatIntervalMs === undefined || heartbeatIntervalMs === '')
+      ? defaultHeartbeat
+      : Number(heartbeatIntervalMs);
+    this.heartbeatIntervalMs = Number.isFinite(parsedHeartbeat) && parsedHeartbeat > 0 ? parsedHeartbeat : defaultHeartbeat;
+    this.storageDir = storageDir || null;
     this.lastStaleSweepAt = 0;
     this.lastPruneAt = 0;
     this.activeCount = 0;
+    this.inFlightEventIds = new Set();
     this.running = false;
     this.stopped = false;
   }
@@ -45,7 +55,9 @@ class InboxWorker {
     let recovered = 0;
     if (now - this.lastStaleSweepAt >= this.staleSweepIntervalMs) {
       this.lastStaleSweepAt = now;
-      recovered = this.db.recoverStaleEvents?.(this.staleMs) || 0;
+      recovered = (this.inFlightEventIds.size > 0
+        ? this.db.recoverStaleEvents?.(this.staleMs, { excludeEventIds: [...this.inFlightEventIds] })
+        : this.db.recoverStaleEvents?.(this.staleMs)) || 0;
       const recoveredApprovals = this.db.recoverStaleApprovals?.(this.staleMs) || 0;
       const recoveredTools = this.db.recoverStaleToolExecutions?.(this.staleMs) || 0;
       const recoveredResponses = this.db.recoverStaleTaskResponses?.(this.staleMs) || 0;
@@ -67,12 +79,29 @@ class InboxWorker {
           pruned.deletedCompletedEvents ||
           pruned.deletedDeadEvents ||
           pruned.deletedModelUsage ||
-          pruned.deletedAuditLogs
+          pruned.deletedAuditLogs ||
+          pruned.deletedTasks ||
+          pruned.deletedToolExecutions ||
+          pruned.deletedApprovals ||
+          pruned.deletedMemoryExtractions ||
+          pruned.deletedRateLimitEvents
         )) {
           this.logger?.info?.(pruned, 'Pruned expired queue and telemetry history');
         }
       } catch (error) {
         this.logger?.warn?.({ error: error?.message }, 'Periodic queue/history prune failed');
+      }
+
+      if (this.storageDir) {
+        try {
+          cleanupOrphanStorageFiles({
+            db: this.db,
+            storageDir: this.storageDir,
+            logger: this.logger
+          });
+        } catch (error) {
+          this.logger?.warn?.({ error: error?.message }, 'Periodic orphan storage cleanup failed');
+        }
       }
     }
 
@@ -99,8 +128,24 @@ class InboxWorker {
   async _processEvent(event) {
     this.activeCount += 1;
     this.running = this.activeCount > 0;
+    this.inFlightEventIds.add(event.event_id);
+    let heartbeatTimer = null;
+    if (typeof this.db?.touchEventLock === 'function' && this.heartbeatIntervalMs > 0) {
+      heartbeatTimer = setInterval(() => {
+        try {
+          this.db.touchEventLock(event.event_id);
+        } catch (err) {
+          this.logger?.warn?.({ eventId: event.event_id, error: err?.message }, 'Inbox event lock heartbeat failed');
+        }
+      }, this.heartbeatIntervalMs);
+      heartbeatTimer.unref?.();
+    }
     try {
-      await this.handler(event.payload);
+      await this.handler(event.payload, {
+        eventId: event.event_id,
+        chatId: event.chat_id,
+        senderId: event.sender_id
+      });
       this.db.finishEvent(event.event_id);
     } catch (error) {
       const policy = classifyOperationalError(error);
@@ -132,6 +177,8 @@ class InboxWorker {
         this.logger?.warn?.(log, 'Inbox event scheduled for bounded retry');
       }
     } finally {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      this.inFlightEventIds.delete(event.event_id);
       this.activeCount = Math.max(0, this.activeCount - 1);
       this.running = this.activeCount > 0;
     }

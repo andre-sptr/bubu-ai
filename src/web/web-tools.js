@@ -8,6 +8,8 @@ function createWebTools({ webSearch, webFetch }) {
       name: 'web_search',
       description: 'Search current public web information. Return concise source titles, URLs, snippets and dates. Use for fresh facts and research.',
       scopes: ['personal', 'group'],
+      group: 'web',
+      readOnly: true,
       schema: z.object({
         query: z.string().min(3).max(400),
         maxResults: z.number().int().min(1).max(10).optional(),
@@ -30,6 +32,8 @@ function createWebTools({ webSearch, webFetch }) {
       name: 'web_fetch',
       description: 'Fetch and extract readable text from a public HTTP/HTTPS web page. Do not fetch private networks or local services.',
       scopes: ['personal', 'group'],
+      group: 'web',
+      readOnly: true,
       schema: z.object({ url: z.string().url().max(2000) }).strict(),
       parameters: {
         type: 'object', additionalProperties: false,

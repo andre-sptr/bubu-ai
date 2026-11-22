@@ -1,11 +1,20 @@
 const crypto = require('node:crypto');
-const { cosineSimilarity } = require('../../utils/vector');
+const { cosineSimilarity, encodeEmbeddingBlob, decodeEmbeddingBlob } = require('../../utils/vector');
+
+const MAX_MEMORY_CACHE_WORKSPACES = 32;
 
 function normalizeWorkspace(scope, ownerId = null, chatId = null) {
   return {
     normalizedOwner: scope === 'personal' ? ownerId : null,
     normalizedChat: scope === 'group' ? chatId : null
   };
+}
+
+function tokenizeSearchTerms(query = '') {
+  return String(query || '')
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_-]+/u)
+    .filter((term) => term.length >= 2);
 }
 
 function parseValidMemoryId(id) {
@@ -16,14 +25,41 @@ function parseValidMemoryId(id) {
 
 function sanitizeMemoryRow(row) {
   if (!row) return null;
-  const { embedding_json, ...rest } = row;
-  return { ...rest, embedded: Boolean(embedding_json) };
+  const { embedding_json, embedding_blob, ...rest } = row;
+  return { ...rest, embedded: Boolean((embedding_blob && embedding_blob.length > 0) || embedding_json) };
+}
+
+function decodeStoredEmbedding(row) {
+  if (!row) return null;
+  if (row.embedding_blob) {
+    const decoded = decodeEmbeddingBlob(row.embedding_blob);
+    if (decoded) return decoded;
+  }
+  if (row.embedding_json) {
+    try {
+      const parsed = JSON.parse(row.embedding_json);
+      return Array.isArray(parsed) && parsed.length ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function invalidateMemoryVectorCache(store, scope, normalizedOwner, normalizedChat) {
+  if (!store?._memoryVectorCache) return;
+  const prefix = `${scope}|${normalizedOwner || ''}|${normalizedChat || ''}|`;
+  for (const key of store._memoryVectorCache.keys()) {
+    if (key.startsWith(prefix)) {
+      store._memoryVectorCache.delete(key);
+    }
+  }
 }
 
 const MEMORY_SELECT_COLUMNS = `
   id,scope,owner_id,chat_id,kind,memory_type,title,content,source,
   importance,project_id,status,superseded_by,metadata_json,
-  embedding_json,created_at,last_accessed_at,updated_at
+  embedding_json,embedding_blob,created_at,last_accessed_at,updated_at
 `;
 
 const memoryRepository = {
@@ -38,7 +74,7 @@ const memoryRepository = {
     const { normalizedOwner, normalizedChat } = normalizeWorkspace(scope, ownerId, chatId);
     const normalizedImportance = Math.max(1, Math.min(5, Number(importance) || 3));
     const normalizedTitle = title ?? null;
-    const embeddingJson = embedding ? JSON.stringify(embedding) : null;
+    const embeddingBlob = encodeEmbeddingBlob(embedding);
 
     if (sourceEventId) {
       const existing = this.db.prepare(`
@@ -68,25 +104,28 @@ const memoryRepository = {
         SET importance = MAX(importance, ?),
             last_accessed_at = ?,
             updated_at = ?,
-            embedding_json = COALESCE(?, embedding_json)
+            embedding_blob = COALESCE(?, embedding_blob),
+            embedding_json = CASE WHEN ? IS NOT NULL THEN NULL ELSE embedding_json END
         WHERE id = ?
-      `).run(normalizedImportance, now, now, embeddingJson, duplicate.id);
+      `).run(normalizedImportance, now, now, embeddingBlob, embeddingBlob, duplicate.id);
+      invalidateMemoryVectorCache(this, scope, normalizedOwner, normalizedChat);
       return Number(duplicate.id);
     }
 
     const result = this.db.prepare(`
       INSERT INTO memories (
         scope,owner_id,chat_id,kind,content,source,created_at,
-        memory_type,title,embedding_json,importance,project_id,
+        memory_type,title,embedding_json,embedding_blob,importance,project_id,
         metadata_json,last_accessed_at,updated_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       scope, normalizedOwner, normalizedChat, kind, content, source, now,
-      memoryType, normalizedTitle, embeddingJson,
+      memoryType, normalizedTitle, null, embeddingBlob,
       normalizedImportance,
       projectId, JSON.stringify({ ...metadata, ...(sourceEventId ? { sourceEventId } : {}) }),
       now, now
     );
+    invalidateMemoryVectorCache(this, scope, normalizedOwner, normalizedChat);
     return Number(result.lastInsertRowid);
   },
 
@@ -102,10 +141,7 @@ const memoryRepository = {
       ${statusFilter}
       ORDER BY id DESC LIMIT 300`).all(scope, normalizedOwner, normalizedChat);
 
-    const terms = String(query || '')
-      .toLowerCase()
-      .split(/\W+/)
-      .filter((term) => term.length > 2);
+    const terms = tokenizeSearchTerms(query);
 
     const scored = rows.map((row) => ({
       ...row,
@@ -131,29 +167,69 @@ const memoryRepository = {
   }) {
     const { normalizedOwner, normalizedChat } = normalizeWorkspace(scope, ownerId, chatId);
     const statusFilter = includeArchived ? '' : "AND COALESCE(status, 'active') = 'active'";
-    const rows = this.db.prepare(`
-      SELECT id,kind,memory_type,title,content,importance,project_id,
-             status,embedding_json,created_at,last_accessed_at,updated_at
+    const stampRow = this.db.prepare(`
+      SELECT COUNT(*) AS cnt, COALESCE(MAX(id), 0) AS maxId, COALESCE(MAX(updated_at), '') AS maxUpdated
       FROM memories
       WHERE scope=?
         AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
         AND (? IS NULL OR project_id=?)
         ${statusFilter}
-      ORDER BY importance DESC,id DESC
-      LIMIT 500
-    `).all(scope, normalizedOwner, normalizedChat, projectId, projectId);
+    `).get(scope, normalizedOwner, normalizedChat, projectId, projectId);
+    const stamp = `${stampRow?.cnt || 0}|${stampRow?.maxId || 0}|${stampRow?.maxUpdated || ''}`;
+    const cacheKey = `${scope}|${normalizedOwner || ''}|${normalizedChat || ''}|${projectId || ''}|${includeArchived ? 1 : 0}`;
 
-    const terms = String(query || '').toLowerCase().split(/\W+/).filter((term) => term.length > 2);
-    const scored = rows.map((row) => {
-      const haystack = `${row.title || ''} ${row.content || ''}`.toLowerCase();
-      const lexical = terms.length
-        ? terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0) / terms.length
-        : 0;
-      let semantic = 0;
-      if (queryEmbedding && row.embedding_json) {
-        try { semantic = cosineSimilarity(queryEmbedding, JSON.parse(row.embedding_json)); } catch {}
+    if (!this._memoryVectorCache) this._memoryVectorCache = new Map();
+    let entries = null;
+    const cached = this._memoryVectorCache.get(cacheKey);
+    if (cached && cached.stamp === stamp) {
+      this._memoryVectorCache.delete(cacheKey);
+      this._memoryVectorCache.set(cacheKey, cached);
+      entries = cached.entries;
+    } else {
+      const rows = this.db.prepare(`
+        SELECT id,kind,memory_type,title,content,importance,project_id,
+               status,embedding_json,embedding_blob,created_at,last_accessed_at,updated_at
+        FROM memories
+        WHERE scope=?
+          AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
+          AND (? IS NULL OR project_id=?)
+          ${statusFilter}
+        ORDER BY importance DESC,id DESC
+        LIMIT 500
+      `).all(scope, normalizedOwner, normalizedChat, projectId, projectId);
+
+      entries = rows.map((row) => {
+        const { embedding_json, embedding_blob, ...cleanRow } = row;
+        return {
+          row: cleanRow,
+          haystack: `${row.title || ''} ${row.content || ''}`.toLowerCase(),
+          vector: decodeStoredEmbedding(row),
+          recencyAnchorMs: Date.parse(row.updated_at || row.last_accessed_at || row.created_at)
+        };
+      });
+
+      if (this._memoryVectorCache.has(cacheKey)) {
+        this._memoryVectorCache.delete(cacheKey);
       }
-      const recency = Math.max(0, 1 - ((Date.now() - Date.parse(row.created_at)) / (180 * 86400000)));
+      this._memoryVectorCache.set(cacheKey, { stamp, entries });
+      if (this._memoryVectorCache.size > MAX_MEMORY_CACHE_WORKSPACES) {
+        const oldestKey = this._memoryVectorCache.keys().next().value;
+        if (oldestKey !== undefined) this._memoryVectorCache.delete(oldestKey);
+      }
+    }
+
+    const terms = tokenizeSearchTerms(query);
+    const nowMs = Date.now();
+    const scored = entries.map((entry) => {
+      const row = entry.row;
+      const lexical = terms.length
+        ? terms.reduce((sum, term) => sum + (entry.haystack.includes(term) ? 1 : 0), 0) / terms.length
+        : 0;
+      const semantic = queryEmbedding && entry.vector
+        ? cosineSimilarity(queryEmbedding, entry.vector)
+        : 0;
+      const recencyMs = Number.isFinite(entry.recencyAnchorMs) ? entry.recencyAnchorMs : nowMs;
+      const recency = Math.max(0, Math.min(1, 1 - ((nowMs - recencyMs) / (180 * 86400000))));
       const importance = Math.max(1, Math.min(5, row.importance || 3)) / 5;
       const score = queryEmbedding
         ? semantic * 0.72 + lexical * 0.18 + importance * 0.07 + recency * 0.03
@@ -174,7 +250,7 @@ const memoryRepository = {
       const now = new Date().toISOString();
       this.db.transaction(() => ids.forEach((id) => update.run(now, id)))();
     }
-    return relevant.map(({ embedding_json, ...row }) => row);
+    return relevant;
   },
 
   getMemory({ id, scope, ownerId = null, chatId = null }) {
@@ -219,29 +295,56 @@ const memoryRepository = {
     const { normalizedOwner, normalizedChat } = normalizeWorkspace(scope, ownerId, chatId);
     const allowed = [
       'title', 'content', 'memory_type', 'kind', 'importance',
-      'project_id', 'status', 'superseded_by', 'embedding_json', 'metadata_json'
+      'project_id', 'status', 'superseded_by', 'embedding', 'embedding_json', 'embedding_blob', 'metadata_json'
     ];
     const keys = Object.keys(fields).filter((key) => allowed.includes(key) && fields[key] !== undefined);
     if (!keys.length) return this.getMemory({ id: numericId, scope, ownerId, chatId });
+
+    const mappedFields = {};
+    for (const key of keys) {
+      let value = fields[key];
+      if (key === 'embedding') {
+        mappedFields.embedding_blob = encodeEmbeddingBlob(value);
+        mappedFields.embedding_json = null;
+        continue;
+      }
+      if (key === 'embedding_json') {
+        if (value === null) {
+          mappedFields.embedding_blob = null;
+          mappedFields.embedding_json = null;
+        } else {
+          let vec = value;
+          if (typeof value === 'string') {
+            try { vec = JSON.parse(value); } catch { vec = null; }
+          }
+          const blob = encodeEmbeddingBlob(vec);
+          if (blob) {
+            mappedFields.embedding_blob = blob;
+            mappedFields.embedding_json = null;
+          } else {
+            mappedFields.embedding_json = typeof value === 'string' ? value : JSON.stringify(value);
+          }
+        }
+        continue;
+      }
+      if (key === 'importance') {
+        value = Math.max(1, Math.min(5, Number(value) || 3));
+      } else if (key === 'metadata_json' && value !== null && typeof value !== 'string') {
+        value = JSON.stringify(value);
+      }
+      mappedFields[key] = value;
+    }
 
     const params = {
       id: numericId,
       scope,
       ownerId: normalizedOwner,
       chatId: normalizedChat,
-      updated_at: new Date().toISOString()
+      updated_at: new Date().toISOString(),
+      ...mappedFields
     };
-    for (const key of keys) {
-      let value = fields[key];
-      if (key === 'importance') {
-        value = Math.max(1, Math.min(5, Number(value) || 3));
-      } else if ((key === 'embedding_json' || key === 'metadata_json') && value !== null && typeof value !== 'string') {
-        value = JSON.stringify(value);
-      }
-      params[key] = value;
-    }
-
-    const assignments = keys.map((key) => `${key}=@${key}`).join(',');
+    const colKeys = Object.keys(mappedFields);
+    const assignments = colKeys.map((key) => `${key}=@${key}`).join(',');
     const result = this.db.prepare(`
       UPDATE memories
       SET ${assignments}, updated_at=@updated_at
@@ -249,6 +352,7 @@ const memoryRepository = {
         AND ((scope='personal' AND owner_id=@ownerId) OR (scope='group' AND chat_id=@chatId))
     `).run(params);
 
+    if (result.changes) invalidateMemoryVectorCache(this, scope, normalizedOwner, normalizedChat);
     return result.changes ? this.getMemory({ id: numericId, scope, ownerId, chatId }) : null;
   },
 
@@ -277,6 +381,7 @@ const memoryRepository = {
           WHERE id=? AND scope=?
             AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
         `).run(newId, now, targetOldId, scope, normalizedOwner, normalizedChat);
+        invalidateMemoryVectorCache(this, scope, normalizedOwner, normalizedChat);
       }
       return {
         superseded: true,
@@ -306,6 +411,7 @@ const memoryRepository = {
             AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
         `).run(new Date().toISOString(), numericId, scope, normalizedOwner, normalizedChat);
 
+    if (result.changes) invalidateMemoryVectorCache(this, scope, normalizedOwner, normalizedChat);
     return { deleted: result.changes > 0, id: Number(id), mode };
   },
 
@@ -317,6 +423,7 @@ const memoryRepository = {
         SELECT id, scope, owner_id, chat_id, title, content, memory_type
         FROM memories
         WHERE COALESCE(status, 'active') = 'active'
+          AND embedding_blob IS NULL
           AND embedding_json IS NULL
           AND scope = ?
           AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
@@ -328,6 +435,7 @@ const memoryRepository = {
       SELECT id, scope, owner_id, chat_id, title, content, memory_type
       FROM memories
       WHERE COALESCE(status, 'active') = 'active'
+        AND embedding_blob IS NULL
         AND embedding_json IS NULL
       ORDER BY importance DESC, id DESC
       LIMIT ?
@@ -338,9 +446,14 @@ const memoryRepository = {
     const numericId = parseValidMemoryId(id);
     if (!numericId) return false;
     const now = new Date().toISOString();
+    const blob = encodeEmbeddingBlob(embedding);
     const result = this.db.prepare(`
-      UPDATE memories SET embedding_json=?, updated_at=? WHERE id=?
-    `).run(embedding ? JSON.stringify(embedding) : null, now, numericId);
+      UPDATE memories SET embedding_blob=?, embedding_json=NULL, updated_at=? WHERE id=?
+    `).run(blob, now, numericId);
+    if (result.changes > 0) {
+      const row = this.db.prepare('SELECT scope, owner_id, chat_id FROM memories WHERE id=?').get(numericId);
+      if (row) invalidateMemoryVectorCache(this, row.scope, row.owner_id, row.chat_id);
+    }
     return result.changes > 0;
   },
 
@@ -349,11 +462,11 @@ const memoryRepository = {
     const now = new Date().toISOString();
     const safeStaleDays = Number.isFinite(Number(staleDays)) ? Math.max(0, Number(staleDays)) : 180;
     const cutoffMs = Date.now() - safeStaleDays * 86400000;
-    void maxActive;
+    const maxActiveCap = Number.isInteger(Number(maxActive)) && Number(maxActive) > 0 ? Number(maxActive) : null;
 
     return this.db.transaction(() => {
       const activeRows = this.db.prepare(`
-        SELECT id, content, importance, created_at, last_accessed_at
+        SELECT id, content, importance, created_at, last_accessed_at, updated_at
         FROM memories
         WHERE scope=?
           AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))
@@ -378,6 +491,7 @@ const memoryRepository = {
       }
 
       const duplicateSet = new Set(duplicateIds);
+      const staleSet = new Set();
       let archivedStaleCount = 0;
       for (const row of activeRows) {
         if (duplicateSet.has(row.id)) continue;
@@ -385,14 +499,40 @@ const memoryRepository = {
           const touchedMs = Date.parse(row.last_accessed_at || row.created_at);
           if (Number.isFinite(touchedMs) && touchedMs < cutoffMs) {
             archiveStmt.run(now, row.id);
+            staleSet.add(row.id);
             archivedStaleCount++;
           }
         }
       }
 
+      let archivedOverflowCount = 0;
+      if (maxActiveCap !== null) {
+        const remaining = activeRows.filter((row) => !duplicateSet.has(row.id) && !staleSet.has(row.id));
+        if (remaining.length > maxActiveCap) {
+          const excess = remaining.length - maxActiveCap;
+          const sortedLowToHigh = [...remaining].sort((a, b) => {
+            const impDiff = (Number(a.importance) || 3) - (Number(b.importance) || 3);
+            if (impDiff !== 0) return impDiff;
+            const tA = Date.parse(a.last_accessed_at || a.updated_at || a.created_at) || 0;
+            const tB = Date.parse(b.last_accessed_at || b.updated_at || b.created_at) || 0;
+            if (tA !== tB) return tA - tB;
+            return a.id - b.id;
+          });
+          for (const row of sortedLowToHigh.slice(0, excess)) {
+            archiveStmt.run(now, row.id);
+            archivedOverflowCount++;
+          }
+        }
+      }
+
+      if (duplicateIds.length || archivedStaleCount || archivedOverflowCount) {
+        invalidateMemoryVectorCache(this, scope, normalizedOwner, normalizedChat);
+      }
+
       return {
         deduplicatedCount: duplicateIds.length,
-        archivedStaleCount
+        archivedStaleCount,
+        ...(archivedOverflowCount > 0 ? { archivedOverflowCount } : {})
       };
     })();
   },
@@ -404,7 +544,7 @@ const memoryRepository = {
         COALESCE(SUM(CASE WHEN COALESCE(status, 'active') = 'active' THEN 1 ELSE 0 END), 0) AS activeCount,
         COALESCE(SUM(CASE WHEN status = 'superseded' THEN 1 ELSE 0 END), 0) AS supersededCount,
         COALESCE(SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END), 0) AS archivedCount,
-        COALESCE(SUM(CASE WHEN COALESCE(status, 'active') = 'active' AND embedding_json IS NULL THEN 1 ELSE 0 END), 0) AS unembeddedCount
+        COALESCE(SUM(CASE WHEN COALESCE(status, 'active') = 'active' AND embedding_blob IS NULL AND embedding_json IS NULL THEN 1 ELSE 0 END), 0) AS unembeddedCount
       FROM memories
       WHERE scope=?
         AND ((scope='personal' AND owner_id=?) OR (scope='group' AND chat_id=?))

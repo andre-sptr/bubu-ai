@@ -1,5 +1,6 @@
 const crypto = require('node:crypto');
 const { z } = require('../utils/zod-loader');
+const { normalizeRecurrence } = require('../utils/recurrence');
 
 function createProductivityTools({ db, approvalManager }) {
   const tools = [];
@@ -8,6 +9,7 @@ function createProductivityTools({ db, approvalManager }) {
     name: 'create_task',
     description: 'Create a task in the current workspace. Use ISO-8601 with timezone for optional dueAt.',
     scopes: ['personal', 'group'],
+    group: 'productivity',
     schema: z.object({
       title: z.string().min(1).max(180),
       description: z.string().max(2000).optional(),
@@ -44,6 +46,8 @@ function createProductivityTools({ db, approvalManager }) {
     name: 'list_tasks',
     description: 'List tasks from the current personal or group workspace. Optionally filter by status.',
     scopes: ['personal', 'group'],
+    group: 'productivity',
+    readOnly: true,
     schema: z.object({
       status: z.enum(['open', 'in_progress', 'blocked', 'completed', 'cancelled']).optional(),
       limit: z.number().int().min(1).max(30).optional()
@@ -67,6 +71,7 @@ function createProductivityTools({ db, approvalManager }) {
     name: 'update_task',
     description: 'Update a task in the current workspace by task ID. Only fields supplied are changed.',
     scopes: ['personal', 'group'],
+    group: 'productivity',
     schema: z.object({
       taskId: z.string().uuid(),
       title: z.string().min(1).max(180).optional(),
@@ -113,6 +118,7 @@ function createProductivityTools({ db, approvalManager }) {
     name: 'complete_task',
     description: 'Mark a task as completed in the current workspace.',
     scopes: ['personal', 'group'],
+    group: 'productivity',
     schema: z.object({ taskId: z.string().uuid() }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
@@ -133,31 +139,43 @@ function createProductivityTools({ db, approvalManager }) {
 
   tools.push({
     name: 'create_reminder',
-    description: 'Create a one-time reminder for the owner. dueAt must be ISO-8601 with timezone.',
+    description: 'Create a one-time or recurring reminder for the owner. dueAt must be ISO-8601 with timezone. Optional recurrence: daily, weekdays, weekly, monthly, or every:<N><m|h|d>.',
     scopes: ['personal'],
+    group: 'productivity',
     schema: z.object({
       message: z.string().min(1).max(500),
-      dueAt: z.string().datetime({ offset: true })
+      dueAt: z.string().datetime({ offset: true }),
+      recurrence: z.string().min(4).max(24).optional()
     }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         message: { type: 'string' },
-        dueAt: { type: 'string', description: 'ISO-8601 timestamp with timezone' }
+        dueAt: { type: 'string', description: 'ISO-8601 timestamp with timezone' },
+        recurrence: {
+          type: 'string',
+          description: 'Optional recurrence rule: daily, weekdays, weekly, monthly, or every:<N><m|h|d>'
+        }
       },
       required: ['message', 'dueAt']
     },
-    execute: async ({ message, dueAt }, ctx) => {
+    execute: async ({ message, dueAt, recurrence }, ctx) => {
       const dueTime = Date.parse(dueAt);
       if (!Number.isFinite(dueTime) || dueTime <= Date.now() || dueTime > Date.now() + 365 * 86400000) {
         throw new Error('Reminder time must be in the future and within one year');
       }
+      const normalizedRecurrence = normalizeRecurrence(recurrence);
+      const reminderId = db.createReminder({
+        chatId: ctx.chatId,
+        requesterId: ctx.requesterId,
+        message,
+        dueAt: new Date(dueTime).toISOString(),
+        ...(normalizedRecurrence ? { recurrence: normalizedRecurrence } : {})
+      });
       return {
         created: true,
-        reminderId: db.createReminder({
-          chatId: ctx.chatId, requesterId: ctx.requesterId, message,
-          dueAt: new Date(dueTime).toISOString()
-        })
+        reminderId,
+        ...(normalizedRecurrence ? { recurrence: normalizedRecurrence } : {})
       };
     }
   });
@@ -166,6 +184,8 @@ function createProductivityTools({ db, approvalManager }) {
     name: 'list_reminders',
     description: 'List the owner’s reminders in the current private chat.',
     scopes: ['personal'],
+    group: 'productivity',
+    readOnly: true,
     schema: z.object({
       status: z.enum(['pending', 'sent', 'failed', 'cancelled']).optional(),
       limit: z.number().int().min(1).max(30).optional()
@@ -185,6 +205,7 @@ function createProductivityTools({ db, approvalManager }) {
     name: 'cancel_reminder',
     description: 'Cancel a pending reminder owned by the current user in the current private chat.',
     scopes: ['personal'],
+    group: 'productivity',
     schema: z.object({ reminderId: z.number().int().positive() }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
@@ -199,6 +220,7 @@ function createProductivityTools({ db, approvalManager }) {
     name: 'send_whatsapp_message',
     description: 'Request owner confirmation to send a WhatsApp text to a known contact or group. Never claim sent before approval and send result.',
     scopes: ['personal'],
+    group: 'waha',
     risk: 'external',
     requiresApproval: true,
     schema: z.object({

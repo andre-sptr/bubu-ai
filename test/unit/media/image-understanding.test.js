@@ -66,6 +66,29 @@ test('Task 2.6: SumopodProvider permits sanitized base64 image data URLs and rej
   assert.equal(sanitized[0].content[1].image_url.url, validDataUrl);
 });
 
+test('Stage 1: SumopodProvider exposes close() and validates base64 image size without Buffer.from re-encoding', () => {
+  const validDataUrl = `data:image/jpeg;base64,${APPLE_JPEG.toString('base64')}`;
+  const origFrom = Buffer.from;
+  let bufferFromCalls = 0;
+  Buffer.from = (...args) => {
+    bufferFromCalls++;
+    return origFrom(...args);
+  };
+  try {
+    assert.equal(validateImageDataUrl(validDataUrl, APPLE_JPEG.length), validDataUrl);
+    assert.equal(bufferFromCalls, 0);
+  } finally {
+    Buffer.from = origFrom;
+  }
+
+  const provider = new SumopodProvider({
+    baseUrl: 'https://ai.sumopod.com/v1',
+    apiKey: 'test-key'
+  });
+  assert.equal(typeof provider.close, 'function');
+  provider.close();
+});
+
 test('Task 2.6: MediaIntelligenceService normalizes image, enforces dimension/byte bounds, and cleans up temp files', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-26-img-'));
   const ffmpegCalls = [];

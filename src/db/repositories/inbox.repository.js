@@ -63,12 +63,33 @@ const inboxRepository = {
     );
   },
 
-  recoverStaleEvents(staleMs = 120000) {
+  recoverStaleEvents(staleMs = 120000, options = null) {
     const cutoff = new Date(Date.now() - staleMs).toISOString();
+    const now = new Date().toISOString();
+    const excludeIds = Array.isArray(options?.excludeEventIds)
+      ? options.excludeEventIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : [];
+    if (excludeIds.length > 0) {
+      const placeholders = excludeIds.map(() => '?').join(',');
+      return this.db.prepare(`UPDATE inbox_events SET status='failed',locked_at=NULL,
+        available_at=?,last_error='Recovered stale processing event',updated_at=?
+        WHERE status='processing' AND locked_at<? AND event_id NOT IN (${placeholders})`)
+        .run(now, now, cutoff, ...excludeIds).changes;
+    }
     return this.db.prepare(`UPDATE inbox_events SET status='failed',locked_at=NULL,
       available_at=?,last_error='Recovered stale processing event',updated_at=?
       WHERE status='processing' AND locked_at<?`)
-      .run(new Date().toISOString(), new Date().toISOString(), cutoff).changes;
+      .run(now, now, cutoff).changes;
+  },
+
+  touchEventLock(eventId) {
+    const id = String(eventId || '').trim();
+    if (!id) return false;
+    const now = new Date().toISOString();
+    return this.db.prepare(`
+      UPDATE inbox_events SET locked_at=?, updated_at=?
+      WHERE event_id=? AND status='processing'
+    `).run(now, now, id).changes > 0;
   },
 
   getQueueStats() {
@@ -137,13 +158,29 @@ const inboxRepository = {
     completedRetentionDays = 7,
     deadRetentionDays = 30,
     telemetryRetentionDays = 30,
-    nowMs = Date.now()
+    taskRetentionDays = 30,
+    approvalRetentionDays = 14,
+    extractionRetentionDays = 30,
+    rateLimitRetentionHours = 24,
+    nowMs = Date.now(),
+    includeExtendedCounts = false
   } = {}) {
     const completedCutoff = toCutoffIso(completedRetentionDays, nowMs, 7);
     const deadCutoff = toCutoffIso(deadRetentionDays, nowMs, 30);
     const telemetryCutoff = toCutoffIso(telemetryRetentionDays, nowMs, 30);
+    const taskCutoff = toCutoffIso(taskRetentionDays, nowMs, 30);
+    const approvalCutoff = toCutoffIso(approvalRetentionDays, nowMs, 14);
+    const extractionCutoff = toCutoffIso(extractionRetentionDays, nowMs, 30);
+    const safeRateHours = Number.isFinite(Number(rateLimitRetentionHours)) && Number(rateLimitRetentionHours) >= 0
+      ? Number(rateLimitRetentionHours)
+      : 24;
+    const rateLimitCutoffMs = nowMs - safeRateHours * 3600000;
 
     return this.db.transaction(() => {
+      const tableExists = (tableName) => Boolean(
+        this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(tableName)
+      );
+
       const deletedCompletedEvents = this.db.prepare(
         "DELETE FROM inbox_events WHERE status='completed' AND updated_at < ?"
       ).run(completedCutoff).changes;
@@ -157,11 +194,51 @@ const inboxRepository = {
         'DELETE FROM audit_logs WHERE created_at < ?'
       ).run(telemetryCutoff).changes;
 
+      const deletedTasks = tableExists('tasks')
+        ? this.db.prepare("DELETE FROM tasks WHERE status IN ('completed','failed','cancelled') AND updated_at < ?").run(taskCutoff).changes
+        : 0;
+      const deletedToolExecutions = tableExists('tool_executions')
+        ? this.db.prepare(
+            tableExists('tasks')
+              ? "DELETE FROM tool_executions WHERE (status IN ('completed','failed') AND updated_at < ?) OR task_id NOT IN (SELECT id FROM tasks)"
+              : "DELETE FROM tool_executions WHERE status IN ('completed','failed') AND updated_at < ?"
+          ).run(taskCutoff).changes
+        : 0;
+      const deletedApprovals = tableExists('approvals')
+        ? this.db.prepare("DELETE FROM approvals WHERE status IN ('approved','denied','failed','expired') AND updated_at < ?").run(approvalCutoff).changes
+        : 0;
+      const deletedMemoryExtractions = tableExists('memory_extraction_runs')
+        ? this.db.prepare('DELETE FROM memory_extraction_runs WHERE created_at < ?').run(extractionCutoff).changes
+        : 0;
+      const deletedRateLimitEvents = tableExists('rate_limit_events')
+        ? this.db.prepare('DELETE FROM rate_limit_events WHERE created_at_ms < ?').run(rateLimitCutoffMs).changes
+        : 0;
+      const deletedGroupPassiveMessages = tableExists('group_passive_messages')
+        ? this.db.prepare('DELETE FROM group_passive_messages WHERE created_at < ?').run(approvalCutoff).changes
+        : 0;
+
+      const anyExtendedDeleted = (
+        deletedTasks > 0 ||
+        deletedToolExecutions > 0 ||
+        deletedApprovals > 0 ||
+        deletedMemoryExtractions > 0 ||
+        deletedRateLimitEvents > 0 ||
+        deletedGroupPassiveMessages > 0
+      );
+
       return {
         deletedCompletedEvents,
         deletedDeadEvents,
         deletedModelUsage,
-        deletedAuditLogs
+        deletedAuditLogs,
+        ...(includeExtendedCounts || anyExtendedDeleted ? {
+          deletedTasks,
+          deletedToolExecutions,
+          deletedApprovals,
+          deletedMemoryExtractions,
+          deletedRateLimitEvents,
+          deletedGroupPassiveMessages
+        } : {})
       };
     })();
   }

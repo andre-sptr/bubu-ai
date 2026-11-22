@@ -22,6 +22,8 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'list_documents',
     description: 'List documents uploaded in the current personal or group workspace.',
     scopes: ['personal', 'group'],
+    group: 'documents',
+    readOnly: true,
     schema: z.object({ limit: z.number().int().min(1).max(20).optional() }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
@@ -41,6 +43,8 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'read_document',
     description: 'Read an uploaded document by its document ID from the current workspace. Supports optional page or startPage/endPage pagination for multi-page PDF/DOCX/text documents.',
     scopes: ['personal', 'group'],
+    group: 'documents',
+    readOnly: true,
     schema: z.object({
       documentId: z.string().uuid(),
       page: z.number().int().min(1).max(500).optional(),
@@ -82,32 +86,104 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
 
   tools.push({
     name: 'search_document',
-    description: 'Search for terms across uploaded documents in the current workspace and return contextual snippets with page/section labels.',
+    description: 'Search for terms or concepts across uploaded documents in the current workspace using hybrid lexical + semantic chunk retrieval and return contextual snippets with page/section labels.',
     scopes: ['personal', 'group'],
-    schema: z.object({ query: z.string().min(2).max(300), limit: z.number().int().min(1).max(10).optional() }).strict(),
+    group: 'documents',
+    readOnly: true,
+    schema: z.object({
+      query: z.string().min(2).max(300),
+      documentId: z.string().uuid().optional(),
+      limit: z.number().int().min(1).max(10).optional()
+    }).strict(),
     parameters: {
       type: 'object', additionalProperties: false,
-      properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 10 } },
+      properties: {
+        query: { type: 'string' },
+        documentId: { type: 'string', description: 'Optional specific document UUID to narrow search' },
+        limit: { type: 'integer', minimum: 1, maximum: 10 }
+      },
       required: ['query']
     },
-    execute: async ({ query, limit }, ctx) => {
-      const rawMatches = db.searchDocuments({
+    execute: async ({ query, documentId, limit }, ctx) => {
+      const ownerId = ctx.scope === 'personal' ? ctx.requesterId : null;
+      const chatId = ctx.scope === 'group' ? ctx.chatId : null;
+      const boundedLimit = limit || 5;
+      const rawMatches = (db.searchDocuments({
         scope: ctx.scope,
-        ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
-        chatId: ctx.scope === 'group' ? ctx.chatId : null,
-        query, limit: limit || 5
-      }) || [];
-      const matches = rawMatches.map((item) => {
-        if (Array.isArray(item.snippets)) return item;
-        const snippetInfo = searchDocumentSnippets(item.extracted_text || item.excerpt || '', query);
-        return {
-          ...item,
-          snippets: snippetInfo.snippets,
-          matchedPages: snippetInfo.snippets.map((s) => s.pageNumber),
-          totalPages: snippetInfo.totalPages,
-          excerpt: snippetInfo.excerpt || item.excerpt || ''
-        };
-      });
+        ownerId,
+        chatId,
+        query,
+        limit: boundedLimit
+      }) || []).filter((item) => !documentId || item.id === documentId);
+
+      const matchesById = new Map();
+      for (const item of rawMatches) {
+        let enriched = item;
+        if (!Array.isArray(item.snippets)) {
+          const snippetInfo = searchDocumentSnippets(item.extracted_text || item.excerpt || '', query);
+          enriched = {
+            ...item,
+            snippets: snippetInfo.snippets,
+            matchedPages: snippetInfo.snippets.map((s) => s.pageNumber),
+            totalPages: snippetInfo.totalPages,
+            excerpt: snippetInfo.excerpt || item.excerpt || ''
+          };
+        }
+        matchesById.set(enriched.id, enriched);
+      }
+
+      if (typeof db.searchDocumentChunks === 'function') {
+        const queryEmbedding = typeof documentService?.embedText === 'function'
+          ? await documentService.embedText(query).catch(() => null)
+          : null;
+        const chunkMatches = db.searchDocumentChunks({
+          scope: ctx.scope,
+          ownerId,
+          chatId,
+          query,
+          queryEmbedding,
+          documentId: documentId || null,
+          limit: Math.max(boundedLimit * 2, 8)
+        }) || [];
+
+        for (const chunk of chunkMatches) {
+          const existing = matchesById.get(chunk.documentId) || {
+            id: chunk.documentId,
+            filename: chunk.filename,
+            mime_type: chunk.mimeType,
+            created_at: chunk.createdAt,
+            score: 0,
+            snippets: [],
+            matchedPages: [],
+            excerpt: ''
+          };
+          const snippetText = String(chunk.content || '').trim();
+          const alreadyHas = existing.snippets.some(
+            (s) => s.pageNumber === chunk.pageNumber && String(s.text || s.snippet || '').trim() === snippetText
+          );
+          if (!alreadyHas && snippetText) {
+            existing.snippets.push({
+              pageNumber: chunk.pageNumber,
+              chunkIndex: chunk.chunkIndex,
+              score: Number(chunk.score || 0),
+              semanticScore: Number(chunk.semanticScore || 0),
+              snippet: snippetText
+            });
+          }
+          if (!existing.matchedPages.includes(chunk.pageNumber)) {
+            existing.matchedPages.push(chunk.pageNumber);
+          }
+          if (!existing.excerpt && snippetText) {
+            existing.excerpt = snippetText.slice(0, 1200);
+          }
+          existing.score = Math.max(Number(existing.score || 0), Number(chunk.score || 0) * 10);
+          matchesById.set(chunk.documentId, existing);
+        }
+      }
+
+      const matches = [...matchesById.values()]
+        .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+        .slice(0, boundedLimit);
       return { matches };
     }
   });
@@ -116,6 +192,8 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'analyze_spreadsheet',
     description: 'Analyze a previously uploaded XLSX, XLSM or CSV document with deterministic column schema inference, statistics (count, sum, avg, min, max), optional row filtering, and group-by aggregation.',
     scopes: ['personal', 'group'],
+    group: 'documents',
+    readOnly: true,
     schema: z.object({
       documentId: z.string().uuid(),
       question: z.string().max(500).optional(),
@@ -140,15 +218,38 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
       }, required: ['documentId']
     },
     execute: async ({ documentId, question, sheetName, filterColumn, filterValue, groupByColumn, aggregateColumn, rowLimit }, ctx) => {
-      const doc = db.getDocument(
-        documentId, ctx.scope,
-        ctx.scope === 'personal' ? ctx.requesterId : null,
-        ctx.scope === 'group' ? ctx.chatId : null
-      );
-      if (!doc || !['.xlsx', '.xlsm', '.csv'].includes(path.extname(doc.filename).toLowerCase())) {
+      const ownerId = ctx.scope === 'personal' ? ctx.requesterId : null;
+      const chatId = ctx.scope === 'group' ? ctx.chatId : null;
+      const doc = db.getDocument(documentId, ctx.scope, ownerId, chatId);
+      const ext = doc ? path.extname(doc.filename).toLowerCase() : '';
+      if (!doc || !['.xlsx', '.xlsm', '.csv'].includes(ext)) {
         throw new Error('Spreadsheet tidak ditemukan atau formatnya bukan XLSX/XLSM/CSV.');
       }
-      const analysis = analyzeSpreadsheetText(doc.extracted_text, {
+
+      let targetText = doc.extracted_text;
+      let usedFullFile = false;
+      let truncated = String(doc.extracted_text || '').length >= (documentService?.maxExtractChars || 50000);
+
+      if (typeof db.getDocumentFile === 'function' && typeof documentService?.extractFullSpreadsheetFromFile === 'function') {
+        const stored = db.getDocumentFile(documentId, ctx.scope, ownerId, chatId);
+        if (stored?.file_path && isPathWithinDir(documentService.storageDir, stored.file_path)) {
+          try {
+            const stat = await fsp.stat(stored.file_path);
+            if (stat.isFile() && stat.size > 0) {
+              const extractedFull = await documentService.extractFullSpreadsheetFromFile(stored.file_path, ext);
+              if (extractedFull?.text) {
+                targetText = extractedFull.text;
+                usedFullFile = true;
+                truncated = Boolean(extractedFull.truncated);
+              }
+            }
+          } catch (err) {
+            log?.warn?.({ documentId, error: err?.message }, 'Falling back to stored extracted_text for spreadsheet analysis');
+          }
+        }
+      }
+
+      const analysis = analyzeSpreadsheetText(targetText, {
         filename: doc.filename,
         question,
         sheetName,
@@ -162,6 +263,8 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
         documentId: doc.id,
         filename: doc.filename,
         question: question || null,
+        sourceMode: usedFullFile ? 'full_file' : 'extracted_text',
+        truncated: Boolean(truncated),
         analysis
       };
     }
@@ -171,6 +274,8 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'compare_documents',
     description: 'Compare two uploaded documents in the current workspace (e.g. Contract v1 vs v2, or Month 1 vs Month 2 spreadsheet) and return deterministic line/page differences and numeric deltas.',
     scopes: ['personal', 'group'],
+    group: 'documents',
+    readOnly: true,
     schema: z.object({
       firstDocumentId: z.string().uuid(),
       secondDocumentId: z.string().uuid(),
@@ -207,6 +312,7 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
 
   const saveGeneratedDocument = async ({ file, title, content }, ctx) => {
     try {
+      const extractedText = String(content || title || '').slice(0, 50000);
       const record = db.saveDocument({
         id: file.id,
         scope: ctx.scope,
@@ -216,9 +322,22 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
         mimeType: file.mimeType,
         filePath: file.filePath,
         fileSize: file.fileSize,
-        extractedText: String(content || title || '').slice(0, 50000)
+        extractedText
       });
       if (!record) throw new Error('Generated file metadata could not be saved to the workspace.');
+      if (typeof documentService?.indexDocumentChunks === 'function') {
+        try {
+          await documentService.indexDocumentChunks({
+            documentId: record.id,
+            scope: ctx.scope,
+            ownerId: ctx.scope === 'personal' ? ctx.requesterId : null,
+            chatId: ctx.scope === 'group' ? ctx.chatId : null,
+            extractedText
+          });
+        } catch (chunkErr) {
+          log?.warn?.({ documentId: record.id, error: chunkErr?.message }, 'Generated document chunk indexing failed');
+        }
+      }
       return { record, file };
     } catch (error) {
       await fsp.rm(file.filePath, { force: true }).catch(() => {});
@@ -314,6 +433,8 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'list_document_templates',
     description: 'List the professional DOCX, PDF, and XLSX document templates Bubu can generate. Use this when the user asks what kinds of files or templates are available.',
     scopes: ['personal', 'group'],
+    group: 'documents',
+    readOnly: true,
     schema: z.object({}).strict(),
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     execute: async () => ({
@@ -360,6 +481,7 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'create_document',
     description: `Create a professionally formatted DOCX or PDF file for the current workspace (personal DM or group). Choose documentType from: ${documentTypes.join(', ')}. Write complete, useful content with Markdown headings, inline bold/italic/code, bullet/numbered lists and pipe tables when appropriate. Include a clear title, executive summary or purpose, structured sections, and conclusion/next steps when suitable. Do not invent facts, names, dates, amounts or legal requirements; label assumptions and placeholders. In group scope, automatically send the generated file to the same originating group after verifying its group-scoped database record and storage path. Never choose another destination. In personal scope, ask owner approval before sending the file.`,
     scopes: ['personal', 'group'],
+    group: 'documents',
     schema: z.object({
       title: z.string().min(1).max(180),
       content: z.string().min(1).max(30000),
@@ -411,6 +533,8 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'create_pdf',
     description: `Create a professionally formatted, print-ready PDF document for the current workspace (personal DM or group). Choose documentType from: ${documentTypes.join(', ')}. Supports Markdown headings, inline bold/italic/code, bullet/numbered lists, and pipe tables. In group scope, automatically sends the generated PDF to the originating group after verifying workspace ownership. In personal scope, requires owner approval before sending.`,
     scopes: ['personal', 'group'],
+    group: 'documents',
+    aliasOf: 'create_document',
     schema: z.object({
       title: z.string().min(1).max(180),
       content: z.string().min(1).max(30000),
@@ -448,6 +572,7 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'delete_document',
     description: 'Delete a document from the current personal or group workspace by its document ID, removing both its database record and stored file.',
     scopes: ['personal', 'group'],
+    group: 'documents',
     schema: z.object({
       documentId: z.string().uuid()
     }).strict(),
@@ -501,6 +626,7 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     name: 'create_spreadsheet',
     description: 'Create a professionally formatted XLSX workbook for the current workspace. Supports a single sheet or up to 12 named worksheets, formulas, column number formats, frozen headers and filters. Common use cases: financial budget/cash flow/profit-and-loss, inventory and stock opname, sales report, project tracker, KPI dashboard, HR attendance/leave/payroll worksheet, customer database and custom analysis. Use formulas for derived totals and ratios; do not invent source data. In group scope, generate, save and automatically send to the current originating group after validating workspace ownership. In personal scope, the owner must approve sending.',
     scopes: ['personal', 'group'],
+    group: 'documents',
     schema: z.object({
       title: z.string().min(1).max(31),
       headers: z.array(z.string().max(100)).min(1).max(40).optional(),
@@ -553,12 +679,16 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
         filename: filename?.toLowerCase().endsWith('.xlsx') ? filename : `${filename || title}.xlsx`,
         mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       });
-      const workbookSummary = (sheets?.length ? sheets : [{ name: title, headers, rows, formulas }])
+      const sanitizeSummaryCell = (value) => String(value ?? '')
+        .replace(/\u0000/g, '')
+        .replace(/\s*\r?\n+\s*/g, ' ')
+        .replace(/\|/g, '│')
+        .trim();
+      const workbookSummary = (sheets?.length ? sheets : [{ name: title, headers, rows }])
         .map((sheet) => [
           `SHEET: ${sheet.name || title}`,
-          `HEADERS: ${(sheet.headers || []).join(' | ')}`,
-          ...(sheet.rows || []).map((row) => (row || []).map((value) => String(value ?? '')).join(' | ')),
-          `FORMULAS: ${JSON.stringify(sheet.formulas || {})}`
+          `1: ${(sheet.headers || []).map(sanitizeSummaryCell).join(' | ')}`,
+          ...(sheet.rows || []).map((row, idx) => `${idx + 2}: ${(row || []).map(sanitizeSummaryCell).join(' | ')}`)
         ].join('\n')).join('\n\n');
       const saved = await saveGeneratedDocument({
         file, title, content: workbookSummary

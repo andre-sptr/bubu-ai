@@ -50,7 +50,20 @@ class WahaSessionMonitor {
     this.status = normalizeSessionState(status);
     this.botJid = botJid ? normalizeJid(extractIdentityString(botJid)) : '';
     this.botLid = normalizeBotLid(botLid);
+    this.ownerLid = '';
     this.updatedAt = null;
+  }
+
+  rememberOwnerLid(lid) {
+    const normalized = normalizeBotLid(lid);
+    if (normalized) {
+      this.ownerLid = normalized;
+    }
+    return this.ownerLid;
+  }
+
+  getOwnerLid() {
+    return this.ownerLid;
   }
 
   update({ session, status, me } = {}) {

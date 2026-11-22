@@ -158,3 +158,10 @@ test('splitWhatsAppMessage preserves balanced fenced code blocks across chunks w
     assert.ok(combined.includes(token), `Missing token ${token}`);
   }
 });
+
+test('Stage 1: formatWhatsAppText preserves math multiplication, intraword asterisks, and glob patterns', () => {
+  assert.equal(formatWhatsAppText('Hitung 2 * 3 * 4 = 24'), 'Hitung 2 * 3 * 4 = 24');
+  assert.equal(formatWhatsAppText('Variabel foo*bar*baz tetap utuh'), 'Variabel foo*bar*baz tetap utuh');
+  assert.equal(formatWhatsAppText('Filter *.js dan *.ts saja'), 'Filter *.js dan *.ts saja');
+  assert.equal(formatWhatsAppText('Ini *miring* dan (*catatan*)'), 'Ini _miring_ dan (_catatan_)');
+});

@@ -1,11 +1,30 @@
 const crypto = require('node:crypto');
 const { classifyTask } = require('./model-router');
 const { formatApprovalPrompt } = require('./approval-manager');
+const { REQUEST_TOOL_GROUP_NAME, ALL_TOOL_GROUPS } = require('./tool-registry');
 const {
   SYSTEM_PROMPT,
   buildAttachmentEvidenceMessage,
   buildAgentMessages
 } = require('./prompt-builder');
+
+function isTransientProviderError(error) {
+  if (!error) return false;
+  const msg = String(error.message || '');
+  if (msg === 'Agent task timed out' || msg === 'Agent task timed out before final response') return false;
+  const status = Number(error.status || error.statusCode || error.response?.status);
+  if ([400, 401, 403, 413, 415, 422].includes(status)) return false;
+  if ([429, 500, 502, 503, 504, 529].includes(status)) return true;
+  const code = String(error.code || '').toUpperCase();
+  if (['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'EPIPE'].includes(code)) return true;
+  return /rate.?limit|overloaded|temporarily unavailable|service unavailable|bad gateway|gateway timeout/i.test(msg);
+}
+
+function isSchemaValidationError(error) {
+  return error?.name === 'ZodError' ||
+    error?.message === 'Tool arguments were not valid JSON' ||
+    /Tool arguments were not valid JSON|invalid_type|Required|Expected .*received|Unrecognized key|Expected (?:string|number|boolean|null|array|object|one of)|Invalid union/i.test(error?.message || '');
+}
 
 function parseArguments(raw) {
   try { return JSON.parse(raw || '{}'); }
@@ -27,12 +46,15 @@ function stableTaskId(sourceEventId, fallbackText) {
   return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
 
-function timeout(promise, ms, label) {
+function timeout(promise, ms, label, abortController = null) {
   let timer;
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+      timer = setTimeout(() => {
+        abortController?.abort();
+        reject(new Error(`${label} timed out`));
+      }, ms);
       timer.unref?.();
     })
   ]).finally(() => clearTimeout(timer));
@@ -48,7 +70,7 @@ class AgentRuntime {
     this.logger = logger;
   }
 
-  async run({ text, chatId, requesterId, scope, history = [], memories = [], projects = [], captionContext = null, voiceInstruction = null, attachmentEvidence = null, quoteContext = null, sourceEventId = null, incomingMessageId = null }) {
+  async run({ text, chatId, requesterId, scope, history = [], memories = [], projects = [], captionContext = null, voiceInstruction = null, attachmentEvidence = null, quoteContext = null, passiveGroupMessages = [], sourceEventId = null, incomingMessageId = null }) {
     const taskId = stableTaskId(sourceEventId, text);
     const existingTask = this.db.getTask(taskId);
     if (existingTask?.status === 'completed') {
@@ -93,7 +115,8 @@ class AgentRuntime {
       };
     }
 
-    const task = classifyTask([text, captionContext, voiceInstruction].filter(Boolean).join('\n'));
+    const combinedText = [text, captionContext, voiceInstruction].filter(Boolean).join('\n');
+    const task = classifyTask(combinedText);
     const hasVisualImages = Array.isArray(attachmentEvidence?.visualImages) && attachmentEvidence.visualImages.length > 0;
     let selected = this.router.select(
       task,
@@ -132,7 +155,8 @@ class AgentRuntime {
     const pendingApprovals = this.db.getPendingApprovalsForChat
       ? this.db.getPendingApprovalsForChat(chatId)
       : [];
-    const recentDocuments = typeof this.db.listDocuments === 'function'
+    const isGreetingFastPath = task === 'greeting' && !hasVisualImages && !attachmentEvidence && !quoteContext;
+    const recentDocuments = !isGreetingFastPath && typeof this.db.listDocuments === 'function'
       ? (this.db.listDocuments({
           scope,
           ownerId: scope === 'personal' ? requesterId : null,
@@ -158,8 +182,26 @@ class AgentRuntime {
       captionContext,
       voiceInstruction,
       attachmentMessage,
-      quoteContext
+      quoteContext,
+      passiveGroupMessages,
+      timezone: this.config?.appTimezone || 'Asia/Jakarta'
     });
+
+    const enabledToolGroups = new Set();
+    const resolveRoundTools = (activeTask = task) => {
+      if (typeof this.tools?.definitionsForContext === 'function') {
+        return this.tools.definitionsForContext(scope, {
+          task: activeTask,
+          text: combinedText,
+          hasAttachment: Boolean(attachmentEvidence),
+          hasRecentDocuments: recentDocuments.length > 0,
+          hasQuote: Boolean(quoteContext?.present),
+          hasPendingApprovals: pendingApprovals.length > 0,
+          enabledGroups: enabledToolGroups
+        });
+      }
+      return this.tools.definitions(scope);
+    };
 
     let calls = 0;
     let step = this.db.countTaskSteps(taskId);
@@ -168,26 +210,299 @@ class AgentRuntime {
     const started = Date.now();
     const deadline = started + this.config.agent.taskTimeoutMs;
 
+    const callModelWithFallback = async ({
+      modelMessages,
+      toolsDefs,
+      maxTokens,
+      label = 'Model request',
+      timeoutMessage = 'Agent task timed out',
+      taskForRouting = task,
+      needsVision = false
+    }) => {
+      const candidates = [selected];
+      const seenModels = new Set([selected.model]);
+      if (typeof this.router?.selectCandidates === 'function') {
+        try {
+          const extras = this.router.selectCandidates(taskForRouting, {
+            needsTools: Array.isArray(toolsDefs) && toolsDefs.length > 0,
+            needsVision
+          });
+          for (const candidate of extras) {
+            if (candidates.length >= 3) break;
+            if (!candidate?.model || seenModels.has(candidate.model)) continue;
+            seenModels.add(candidate.model);
+            candidates.push(candidate);
+          }
+        } catch {
+          // Keep primary candidate when fallback discovery fails.
+        }
+      }
+
+      for (let idx = 0; idx < candidates.length; idx++) {
+        const candidate = candidates[idx];
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) throw new Error(timeoutMessage);
+        const requestStarted = Date.now();
+        const controller = new AbortController();
+        try {
+          const completion = await timeout(this.provider.chat({
+            model: candidate.model,
+            messages: modelMessages,
+            ...(toolsDefs !== undefined ? { tools: toolsDefs } : {}),
+            maxTokens,
+            signal: controller.signal
+          }), remainingMs, label, controller);
+          if (candidate.model !== selected.model) {
+            selected = candidate;
+          }
+          return { completion, requestStarted };
+        } catch (error) {
+          this.db.logModelUsage?.({
+            taskId, modelId: candidate.model, tier: candidate.tier,
+            usage: null, latencyMs: Date.now() - requestStarted, outcome: 'error'
+          });
+          const hasNext = idx < candidates.length - 1;
+          if (!hasNext || !isTransientProviderError(error) || (deadline - Date.now()) <= 200) {
+            throw error;
+          }
+          const nextCandidate = candidates[idx + 1];
+          this.logger?.warn?.({
+            taskId,
+            fromModel: candidate.model,
+            fromTier: candidate.tier,
+            toModel: nextCandidate.model,
+            toTier: nextCandidate.tier,
+            error: error?.message
+          }, 'Transient provider error; falling back to next model candidate');
+        }
+      }
+      throw new Error('No model candidate succeeded');
+    };
+
+    const runToolCall = async (call, completionModel) => {
+      const name = call.function?.name;
+      const toolKey = name || 'unknown';
+      const startedTool = Date.now();
+      let result;
+      let isSchemaError = false;
+      let earlyReturn = null;
+
+      if (name === REQUEST_TOOL_GROUP_NAME) {
+        try {
+          const parsedArgs = parseArguments(call.function?.arguments);
+          const groupName = typeof parsedArgs?.group === 'string' ? parsedArgs.group.trim() : '';
+          if (!ALL_TOOL_GROUPS.includes(groupName)) {
+            throw new Error(`Invalid union: group must be one of ${ALL_TOOL_GROUPS.join(', ')}`);
+          }
+          enabledToolGroups.add(groupName);
+          const availableTools = typeof this.tools?.list === 'function'
+            ? this.tools.list(scope).filter((t) => t.group === groupName && !t.aliasOf).map((t) => t.name)
+            : [];
+          result = { enabled: true, group: groupName, tools: availableTools };
+        } catch (error) {
+          result = { error: error.message || 'Invalid tool group request' };
+          isSchemaError = isSchemaValidationError(error);
+        }
+        return {
+          name,
+          toolKey,
+          durationMs: Date.now() - startedTool,
+          result,
+          isSchemaError,
+          earlyReturn: null
+        };
+      }
+
+      const tool = this.tools.get(name);
+      let idempotencyKey = null;
+      if (!tool || !tool.scopes.includes(scope)) {
+        result = { error: 'Tool is not available in this workspace' };
+      } else {
+        try {
+          const args = tool.schema.parse(parseArguments(call.function?.arguments));
+          idempotencyKey = crypto.createHash('sha256')
+            .update(`${taskId}|${name}|${stableStringify(args)}`).digest('hex');
+          const prior = this.db.beginToolExecution({ idempotencyKey, taskId, toolName: name });
+          if (prior.state === 'completed') {
+            result = prior.output;
+          } else if (prior.state !== 'claimed') {
+            if (prior.state === 'uncertain' && tool.risk === 'external') {
+              const notice = 'Status tindakan eksternal sebelumnya belum dapat dipastikan. Bubu menghentikan task dan tidak akan mengirim ulang otomatis untuk mencegah duplikasi.';
+              earlyReturn = { type: 'uncertain', notice, error: prior.error || notice, model: selected.model };
+            } else {
+              result = { error: 'Previous execution status is uncertain; automatic replay is blocked.' };
+            }
+          } else {
+            try {
+              const toolBudget = Math.min(this.config.agent.toolTimeoutMs, Math.max(1, deadline - Date.now()));
+              const toolController = new AbortController();
+              result = await timeout(
+                tool.execute(args, { ...context, signal: toolController.signal }),
+                toolBudget,
+                `Tool ${name}`,
+                toolController
+              );
+              this.db.completeToolExecution(idempotencyKey, result);
+            } catch (error) {
+              const uncertain = tool.risk === 'external' && error?.deliveryStatus !== 'failed';
+              this.db.failToolExecution(idempotencyKey, error.message, uncertain);
+              if (uncertain) {
+                const notice = 'Pengiriman/permintaan eksternal mengalami hasil yang tidak pasti. Bubu tidak akan mengulang tindakan otomatis. Periksa WhatsApp sebelum mencoba lagi.';
+                earlyReturn = { type: 'uncertain', notice, error: error.message, model: completionModel };
+              } else {
+                throw error;
+              }
+            }
+          }
+        } catch (error) {
+          result = { error: error.message || 'Tool execution failed' };
+          isSchemaError = isSchemaValidationError(error);
+        }
+      }
+
+      return {
+        name,
+        toolKey,
+        durationMs: Date.now() - startedTool,
+        result,
+        isSchemaError,
+        earlyReturn
+      };
+    };
+
+    const isParallelizableReadOnlyCall = (call) => {
+      const name = call?.function?.name;
+      if (!name || name === REQUEST_TOOL_GROUP_NAME) return false;
+      const tool = this.tools.get(name);
+      return Boolean(tool && Array.isArray(tool.scopes) && tool.scopes.includes(scope) && tool.risk === 'low' && tool.readOnly === true);
+    };
+
+    const recordToolOutcome = ({ call, stepNo, outcome, completionModel }) => {
+      const { name, toolKey, durationMs, result, isSchemaError, earlyReturn } = outcome;
+      if (earlyReturn?.type === 'uncertain') {
+        this.db.updateTask(taskId, {
+          status: 'uncertain',
+          error: earlyReturn.error,
+          model_tier: selected.tier,
+          tool_calls: calls
+        });
+        this.db.queueTaskResponse(taskId, earlyReturn.notice);
+        return {
+          taskId,
+          task,
+          tier: selected.tier,
+          model: earlyReturn.model,
+          text: earlyReturn.notice,
+          toolCalls: calls,
+          uncertain: true,
+          memoryToolsAvailable,
+          ...(escalatedFromTier ? { escalatedFromTier } : {})
+        };
+      }
+
+      let currentToolSchemaErrors = 0;
+      if (isSchemaError) {
+        currentToolSchemaErrors = (consecutiveSchemaErrorsByTool.get(toolKey) || 0) + 1;
+        consecutiveSchemaErrorsByTool.set(toolKey, currentToolSchemaErrors);
+      } else {
+        consecutiveSchemaErrorsByTool.delete(toolKey);
+      }
+
+      this.db.addTaskStep({
+        taskId, stepNo, toolName: name,
+        input: { raw: call.function?.arguments || '' },
+        output: result,
+        status: result?.error ? 'failed' : 'completed',
+        durationMs
+      });
+      this.db.audit({
+        chatId, actorId: requesterId, action: `tool:${toolKey}`,
+        outcome: result?.error ? 'failed' : 'completed',
+        details: { taskId, scope }
+      });
+
+      if (currentToolSchemaErrors >= 2) {
+        const isDocTool = ['create_document', 'create_pdf', 'create_spreadsheet'].includes(name);
+        const notice = isDocTool
+          ? 'Bubu belum dapat membuat dokumen karena model mengirim parameter tool yang tidak lengkap berulang kali. Tidak ada file yang dibuat. Silakan ulangi permintaan dengan menyebutkan jenis dokumen dan informasi utamanya, atau coba beberapa saat lagi.'
+          : `Bubu belum dapat menjalankan tindakan (${toolKey}) karena model mengirim parameter tool yang tidak lengkap berulang kali. Tidak ada tindakan yang dijalankan. Silakan ulangi permintaan dengan informasi yang lebih spesifik, atau coba beberapa saat lagi.`;
+        this.db.updateTask(taskId, {
+          status: 'completed', result_text: notice,
+          model_tier: selected.tier, tool_calls: calls
+        });
+        this.db.queueTaskResponse(taskId, notice);
+        this.logger.warn({
+          taskId, toolName: name,
+          repeatedInvalidToolCalls: currentToolSchemaErrors,
+          argumentBytes: Buffer.byteLength(String(call.function?.arguments || '{}'))
+        }, 'Stopping repeated invalid tool-call loop');
+        return {
+          taskId,
+          task,
+          tier: selected.tier,
+          model: completionModel,
+          text: notice,
+          toolCalls: calls,
+          toolValidationLoop: true,
+          memoryToolsAvailable,
+          ...(escalatedFromTier ? { escalatedFromTier } : {})
+        };
+      }
+
+      if (result?.pendingApproval) {
+        const message = result.prompt || `Tindakan menunggu persetujuan. Balas /approve ${result.approvalId} atau /deny ${result.approvalId}.`;
+        this.db.updateTask(taskId, {
+          status: 'awaiting_approval', model_tier: selected.tier,
+          tool_calls: calls, result_text: message
+        });
+        this.db.queueTaskResponse(taskId, message);
+        return {
+          taskId,
+          task,
+          tier: selected.tier,
+          model: completionModel,
+          text: message,
+          toolCalls: calls,
+          awaitingApproval: true,
+          memoryToolsAvailable,
+          ...(escalatedFromTier ? { escalatedFromTier } : {})
+        };
+      }
+
+      const serializedResult = JSON.stringify(result === undefined ? null : result) ?? 'null';
+      const toolContent = serializedResult.slice(0, this.config.agent.maxToolResultChars);
+      messages.push({ role: 'tool', tool_call_id: call.id, content: toolContent });
+      return null;
+    };
+
     try {
       for (let round = 0; round < this.config.agent.maxRounds; round++) {
         if (round >= 1 && selected.tier === 'fast') {
           maybeEscalateTier();
         }
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) throw new Error('Agent task timed out');
-        const requestStarted = Date.now();
+        if (deadline - Date.now() <= 0) throw new Error('Agent task timed out');
+        const roundTask = round >= 1 && task === 'greeting' ? 'general_chat' : task;
+        const roundTools = resolveRoundTools(roundTask);
+        const maxTokens = this.config.agent.maxOutputTokens || 4096;
         this.logger.debug({
           taskId, round: round + 1, maxRounds: this.config.agent.maxRounds,
-          tier: selected.tier, model: selected.model, messageCount: messages.length
+          tier: selected.tier, model: selected.model, messageCount: messages.length,
+          toolSchemaCount: roundTools.length
         }, 'Agent model request started');
         let completion;
+        let requestStarted = Date.now();
         try {
-          completion = await timeout(this.provider.chat({
-            model: selected.model,
-            messages,
-            tools: this.tools.definitions(scope),
-            maxTokens: this.config.agent.maxOutputTokens || 4096
-          }), remainingMs, 'Model request');
+          const callRes = await callModelWithFallback({
+            modelMessages: messages,
+            toolsDefs: roundTools,
+            maxTokens,
+            label: 'Model request',
+            timeoutMessage: 'Agent task timed out',
+            taskForRouting: roundTask,
+            needsVision: hasVisualImages && !visionFallbackApplied
+          });
+          completion = callRes.completion;
+          requestStarted = callRes.requestStarted;
         } catch (providerError) {
           const status = providerError?.status || providerError?.statusCode || providerError?.response?.status;
           const canFallbackToOcr = hasVisualImages &&
@@ -208,17 +523,20 @@ class AgentRuntime {
           if (idx !== -1 && fallbackAttachmentMessage) {
             messages[idx] = fallbackAttachmentMessage;
           }
-          const retryRemainingMs = deadline - Date.now();
-          if (retryRemainingMs <= 0) throw new Error('Agent task timed out');
-          completion = await timeout(this.provider.chat({
-            model: selected.model,
-            messages,
-            tools: this.tools.definitions(scope),
-            maxTokens: this.config.agent.maxOutputTokens || 4096
-          }), retryRemainingMs, 'Model request');
+          const retryRes = await callModelWithFallback({
+            modelMessages: messages,
+            toolsDefs: roundTools,
+            maxTokens,
+            label: 'Model request',
+            timeoutMessage: 'Agent task timed out',
+            taskForRouting: roundTask,
+            needsVision: false
+          });
+          completion = retryRes.completion;
+          requestStarted = retryRes.requestStarted;
         }
 
-        this.db.logModelUsage({
+        this.db.logModelUsage?.({
           taskId, modelId: completion.model, tier: selected.tier,
           usage: completion.usage, latencyMs: Date.now() - requestStarted, outcome: 'success'
         });
@@ -286,10 +604,10 @@ class AgentRuntime {
         }
 
         messages.push(assistantMessage);
-        for (const call of assistantMessage.tool_calls) {
-          calls++;
-          step++;
-          if (calls > this.config.agent.maxToolCalls) {
+        let idx = 0;
+        while (idx < roundToolCalls.length) {
+          if (calls >= this.config.agent.maxToolCalls) {
+            calls++;
             const notice = 'Bubu menghentikan proses karena batas pemanggilan tool tercapai. Belum semua langkah dapat diselesaikan. Silakan pecah permintaan menjadi beberapa bagian yang lebih kecil.';
             this.db.updateTask(taskId, {
               status: 'completed', result_text: notice,
@@ -310,153 +628,52 @@ class AgentRuntime {
             };
           }
 
-          const name = call.function?.name;
-          const toolKey = name || 'unknown';
-          const tool = this.tools.get(name);
-          const startedTool = Date.now();
-          let result;
-          let currentToolSchemaErrors = 0;
+          const batch = [];
+          const seenSignatures = new Set();
+          let cursor = idx;
+          while (
+            cursor < roundToolCalls.length &&
+            calls + batch.length < this.config.agent.maxToolCalls &&
+            isParallelizableReadOnlyCall(roundToolCalls[cursor])
+          ) {
+            const c = roundToolCalls[cursor];
+            const sig = `${c.function?.name}|${String(c.function?.arguments || '')}`;
+            if (seenSignatures.has(sig)) break;
+            seenSignatures.add(sig);
+            batch.push(c);
+            cursor++;
+          }
 
-          let idempotencyKey = null;
-          if (!tool || !tool.scopes.includes(scope)) {
-            result = { error: 'Tool is not available in this workspace' };
-            consecutiveSchemaErrorsByTool.delete(toolKey);
-          } else {
-            try {
-              const args = tool.schema.parse(parseArguments(call.function.arguments));
-              idempotencyKey = crypto.createHash('sha256')
-                .update(`${taskId}|${name}|${stableStringify(args)}`).digest('hex');
-              const prior = this.db.beginToolExecution({ idempotencyKey, taskId, toolName: name });
-              if (prior.state === 'completed') {
-                result = prior.output;
-              } else if (prior.state !== 'claimed') {
-                if (prior.state === 'uncertain' && tool.risk === 'external') {
-                  const notice = 'Status tindakan eksternal sebelumnya belum dapat dipastikan. Bubu menghentikan task dan tidak akan mengirim ulang otomatis untuk mencegah duplikasi.';
-                  this.db.updateTask(taskId, { status: 'uncertain', error: prior.error || notice, model_tier: selected.tier, tool_calls: calls });
-                  this.db.queueTaskResponse(taskId, notice);
-                  return {
-                    taskId,
-                    task,
-                    tier: selected.tier,
-                    model: selected.model,
-                    text: notice,
-                    toolCalls: calls,
-                    uncertain: true,
-                    memoryToolsAvailable,
-                    ...(escalatedFromTier ? { escalatedFromTier } : {})
-                  };
-                }
-                result = { error: 'Previous execution status is uncertain; automatic replay is blocked.' };
-              } else {
-                try {
-                  const toolBudget = Math.min(this.config.agent.toolTimeoutMs, Math.max(1, deadline - Date.now()));
-                  result = await timeout(tool.execute(args, context), toolBudget, `Tool ${name}`);
-                  this.db.completeToolExecution(idempotencyKey, result);
-                } catch (error) {
-                  const uncertain = tool.risk === 'external' && error?.deliveryStatus !== 'failed';
-                  this.db.failToolExecution(idempotencyKey, error.message, uncertain);
-                  if (uncertain) {
-                    const notice = 'Pengiriman/permintaan eksternal mengalami hasil yang tidak pasti. Bubu tidak akan mengulang tindakan otomatis. Periksa WhatsApp sebelum mencoba lagi.';
-                    this.db.updateTask(taskId, { status: 'uncertain', error: error.message, model_tier: selected.tier, tool_calls: calls });
-                    this.db.queueTaskResponse(taskId, notice);
-                    return {
-                      taskId,
-                      task,
-                      tier: selected.tier,
-                      model: completion.model,
-                      text: notice,
-                      toolCalls: calls,
-                      uncertain: true,
-                      memoryToolsAvailable,
-                      ...(escalatedFromTier ? { escalatedFromTier } : {})
-                    };
-                  }
-                  throw error;
-                }
-              }
-              consecutiveSchemaErrorsByTool.delete(toolKey);
-            } catch (error) {
-              result = { error: error.message || 'Tool execution failed' };
-
-              // Model-generated schema errors are not transient tool failures.
-              // If the model repeats invalid calls for the same tool, stop the loop
-              // and return a useful response instead of retrying the webhook forever.
-              const isSchemaError = error?.name === 'ZodError' ||
-                error?.message === 'Tool arguments were not valid JSON' ||
-                /Tool arguments were not valid JSON|invalid_type|Required|Expected .*received|Unrecognized key|Expected (?:string|number|boolean|null|array|object|one of)|Invalid union/i.test(error?.message || '');
-              if (isSchemaError) {
-                currentToolSchemaErrors = (consecutiveSchemaErrorsByTool.get(toolKey) || 0) + 1;
-                consecutiveSchemaErrorsByTool.set(toolKey, currentToolSchemaErrors);
-              } else {
-                consecutiveSchemaErrorsByTool.delete(toolKey);
-              }
+          if (batch.length >= 2) {
+            const baseStep = step;
+            calls += batch.length;
+            step += batch.length;
+            const outcomes = await Promise.all(batch.map((c) => runToolCall(c, completion.model)));
+            for (let b = 0; b < batch.length; b++) {
+              const exitResult = recordToolOutcome({
+                call: batch[b],
+                stepNo: baseStep + b + 1,
+                outcome: outcomes[b],
+                completionModel: completion.model
+              });
+              if (exitResult) return exitResult;
             }
+            idx += batch.length;
+            continue;
           }
 
-          this.db.addTaskStep({
-            taskId, stepNo: step, toolName: name,
-            input: { raw: call.function?.arguments || '' },
-            output: result,
-            status: result?.error ? 'failed' : 'completed',
-            durationMs: Date.now() - startedTool
+          const call = roundToolCalls[idx];
+          calls++;
+          step++;
+          const outcome = await runToolCall(call, completion.model);
+          const exitResult = recordToolOutcome({
+            call,
+            stepNo: step,
+            outcome,
+            completionModel: completion.model
           });
-          this.db.audit({
-            chatId, actorId: requesterId, action: `tool:${toolKey}`,
-            outcome: result?.error ? 'failed' : 'completed',
-            details: { taskId, scope }
-          });
-
-          if (currentToolSchemaErrors >= 2) {
-            const isDocTool = ['create_document', 'create_pdf', 'create_spreadsheet'].includes(name);
-            const notice = isDocTool
-              ? 'Bubu belum dapat membuat dokumen karena model mengirim parameter tool yang tidak lengkap berulang kali. Tidak ada file yang dibuat. Silakan ulangi permintaan dengan menyebutkan jenis dokumen dan informasi utamanya, atau coba beberapa saat lagi.'
-              : `Bubu belum dapat menjalankan tindakan (${toolKey}) karena model mengirim parameter tool yang tidak lengkap berulang kali. Tidak ada tindakan yang dijalankan. Silakan ulangi permintaan dengan informasi yang lebih spesifik, atau coba beberapa saat lagi.`;
-            this.db.updateTask(taskId, {
-              status: 'completed', result_text: notice,
-              model_tier: selected.tier, tool_calls: calls
-            });
-            this.db.queueTaskResponse(taskId, notice);
-            this.logger.warn({
-              taskId, toolName: name,
-              repeatedInvalidToolCalls: currentToolSchemaErrors,
-              argumentBytes: Buffer.byteLength(String(call.function?.arguments || '{}'))
-            }, 'Stopping repeated invalid tool-call loop');
-            return {
-              taskId,
-              task,
-              tier: selected.tier,
-              model: completion.model,
-              text: notice,
-              toolCalls: calls,
-              toolValidationLoop: true,
-              memoryToolsAvailable,
-              ...(escalatedFromTier ? { escalatedFromTier } : {})
-            };
-          }
-
-          if (result?.pendingApproval) {
-            const message = result.prompt || `Tindakan menunggu persetujuan. Balas /approve ${result.approvalId} atau /deny ${result.approvalId}.`;
-            this.db.updateTask(taskId, {
-              status: 'awaiting_approval', model_tier: selected.tier,
-              tool_calls: calls, result_text: message
-            });
-            this.db.queueTaskResponse(taskId, message);
-            return {
-              taskId,
-              task,
-              tier: selected.tier,
-              model: completion.model,
-              text: message,
-              toolCalls: calls,
-              awaitingApproval: true,
-              memoryToolsAvailable,
-              ...(escalatedFromTier ? { escalatedFromTier } : {})
-            };
-          }
-
-          const serializedResult = JSON.stringify(result === undefined ? null : result) ?? 'null';
-          const toolContent = serializedResult.slice(0, this.config.agent.maxToolResultChars);
-          messages.push({ role: 'tool', tool_call_id: call.id, content: toolContent });
+          if (exitResult) return exitResult;
+          idx += 1;
         }
 
         if (selected.tier === 'fast') {
@@ -466,19 +683,32 @@ class AgentRuntime {
 
       // A tool may have completed successfully in the final planning round.
       // Give the model one tool-free opportunity to summarize those results.
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) throw new Error('Agent task timed out before final response');
-      const finalCompletion = await timeout(this.provider.chat({
-        model: selected.model,
-        messages: [
+      const finalRes = await callModelWithFallback({
+        modelMessages: [
           ...messages,
           {
             role: 'system',
             content: 'You have reached the tool-planning limit. Do not call any more tools. Use the tool results already present in this conversation to provide the final answer. Be concise and state accurately what succeeded or failed.'
           }
         ],
-        maxTokens: 1200
-      }), remainingMs, 'Final response request');
+        toolsDefs: undefined,
+        maxTokens: 1200,
+        label: 'Final response request',
+        timeoutMessage: 'Agent task timed out before final response',
+        taskForRouting: task === 'greeting' ? 'general_chat' : task,
+        needsVision: false
+      });
+      const finalCompletion = finalRes.completion;
+      const finalStarted = finalRes.requestStarted;
+
+      this.db.logModelUsage?.({
+        taskId,
+        modelId: finalCompletion.model || selected.model,
+        tier: selected.tier,
+        usage: finalCompletion.usage || null,
+        latencyMs: Date.now() - finalStarted,
+        outcome: 'success'
+      });
 
       const finalAnswer = String(finalCompletion.message?.content || '').trim() ||
         'Bubu sudah menyelesaikan batas pemanggilan tool, tetapi belum menerima ringkasan akhir yang valid. Periksa status hasil tool sebelum mengulangi permintaan.';

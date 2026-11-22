@@ -1,14 +1,66 @@
 const { DOC_TYPE_LABELS, parseInlineMarkdownTokens, stripInlineMarkdown } = require('./markdown-inline');
 
+const UNICODE_TRANSLITERATIONS = new Map([
+  ['\u2018', "'"],
+  ['\u2019', "'"],
+  ['\u201A', ','],
+  ['\u201C', '"'],
+  ['\u201D', '"'],
+  ['\u201E', '"'],
+  ['\u2013', '-'],
+  ['\u2014', '-'],
+  ['\u2015', '-'],
+  ['\u2212', '-'],
+  ['\u2022', '*'],
+  ['\u25CF', '*'],
+  ['\u25CB', 'o'],
+  ['\u2026', '...'],
+  ['\u2713', '[v]'],
+  ['\u2714', '[v]'],
+  ['\u2705', '[v]'],
+  ['\u2717', '[x]'],
+  ['\u2718', '[x]'],
+  ['\u2715', '[x]'],
+  ['\u2716', '[x]'],
+  ['\u274C', '[x]'],
+  ['\u2192', '->'],
+  ['\u2190', '<-'],
+  ['\u2194', '<->'],
+  ['\u21D2', '=>'],
+  ['\u21D0', '<='],
+  ['\u2264', '<='],
+  ['\u2265', '>='],
+  ['\u2260', '!='],
+  ['\u2248', '~'],
+  ['\u00B1', '+/-'],
+  ['\u00D7', 'x'],
+  ['\u00F7', '/'],
+  ['\u20AC', 'EUR'],
+  ['\u00A3', 'GBP'],
+  ['\u00A5', 'JPY'],
+  ['\u00A9', '(c)'],
+  ['\u00AE', '(R)'],
+  ['\u2122', '(TM)'],
+  ['\u00B0', ' deg']
+]);
+
 function escapePdfString(value) {
-  const safe = String(value ?? '')
-    .replace(/[\u2018\u2019]/g, "'")
-    .replace(/[\u201C\u201D]/g, '"')
-    .replace(/[\u2013\u2014]/g, '-')
-    .replace(/\u2022/g, '*')
-    .replace(/\u2026/g, '...')
+  let mapped = '';
+  for (const ch of String(value ?? '')) {
+    if (ch === '\u200B' || ch === '\u200C' || ch === '\u200D' || ch === '\uFE0E' || ch === '\uFE0F') {
+      continue;
+    }
+    const replacement = UNICODE_TRANSLITERATIONS.get(ch);
+    if (replacement !== undefined) {
+      mapped += replacement;
+    } else {
+      mapped += ch;
+    }
+  }
+  const safe = mapped
     // Keep WinAnsi / Latin-1 printable range for standard Type1 PDF fonts
-    .replace(/[^\x20-\x7E\xA0-\xFF]/g, ' ');
+    .replace(/[^\x20-\x7E\xA0-\xFF]/g, ' ')
+    .replace(/ {2,}/g, ' ');
   return safe
     .replace(/\\/g, '\\\\')
     .replace(/\(/g, '\\(')
@@ -67,6 +119,23 @@ function wrapTextToWidth(text, maxChars) {
   return lines;
 }
 
+function wrapCellLines(text, maxChars, maxLines = 4) {
+  const lineLimit = Math.max(1, Math.floor(Number(maxLines) || 4));
+  const charLimit = Math.max(1, Math.floor(Number(maxChars) || 1));
+  const lines = wrapTextToWidth(text, charLimit);
+  if (lines.length <= lineLimit) return lines;
+  const kept = lines.slice(0, lineLimit);
+  const last = kept[lineLimit - 1];
+  if (charLimit <= 3) {
+    kept[lineLimit - 1] = '.'.repeat(charLimit);
+  } else if (last.length + 3 <= charLimit) {
+    kept[lineLimit - 1] = `${last}...`;
+  } else {
+    kept[lineLimit - 1] = `${last.slice(0, Math.max(1, charLimit - 3)).trimEnd()}...`;
+  }
+  return kept;
+}
+
 function buildPdf14Buffer({ title, content, documentType = 'general', subtitle = '', author = 'Bubu AI' }) {
   const pageWidth = 595.28;
   const pageHeight = 841.89;
@@ -116,7 +185,8 @@ function buildPdf14Buffer({ title, content, documentType = 'general', subtitle =
       addTextLine(line, { font: 'F3', size: 11, color: '0.35 0.35 0.35', leading: 16 });
     }
   }
-  addTextLine(label, { font: 'F2', size: 9, color: '0.27 0.45 0.77', leading: 18 });
+  const generatedDate = new Date().toISOString().slice(0, 10);
+  addTextLine(`${label}  |  ${generatedDate}`, { font: 'F2', size: 9, color: '0.27 0.45 0.77', leading: 18 });
   cursorY -= 6;
 
   const rawLines = String(content || '').replace(/\r\n/g, '\n').split('\n');
@@ -145,37 +215,56 @@ function buildPdf14Buffer({ title, content, documentType = 'general', subtitle =
       }
 
       const maxCellChars = Math.max(6, Math.floor((colWidth - 8) / 5.4));
-      for (let r = 0; r < tableRows.length; r++) {
-        const wrappedCells = tableRows[r].map((cell) =>
-          wrapTextToWidth(String(cell ?? ''), maxCellChars).slice(0, 4)
-        );
+      const measuredRows = tableRows.map((row) => {
+        const wrappedCells = row.map((cell) => wrapCellLines(String(cell ?? ''), maxCellChars, 4));
         const maxCellLines = Math.max(1, ...wrappedCells.map((lines) => lines.length));
         const rowHeight = Math.max(20, maxCellLines * 11 + 8);
-        ensureSpace(rowHeight + 4);
+        return { wrappedCells, rowHeight };
+      });
+
+      const renderTableRow = ({ wrappedCells, rowHeight }, { isHeader = false, isStriped = false } = {}) => {
         const rowTop = cursorY + 11;
         const rowBottom = rowTop - rowHeight;
-        if (r === 0) {
+        if (isHeader) {
           currentOps.push('0.12 0.31 0.47 rg');
           currentOps.push(`${marginX} ${rowBottom.toFixed(2)} ${contentWidth.toFixed(2)} ${rowHeight} re f`);
-        } else if (r % 2 === 1) {
+        } else if (isStriped) {
           currentOps.push('0.96 0.97 0.99 rg');
           currentOps.push(`${marginX} ${rowBottom.toFixed(2)} ${contentWidth.toFixed(2)} ${rowHeight} re f`);
         }
         currentOps.push('0.82 0.86 0.92 RG 0.5 w');
         currentOps.push(`${marginX} ${rowBottom.toFixed(2)} ${contentWidth.toFixed(2)} ${rowHeight} re S`);
+        for (let c = 1; c < colCount; c++) {
+          const divX = (marginX + c * colWidth).toFixed(2);
+          currentOps.push(`${divX} ${rowBottom.toFixed(2)} m ${divX} ${rowTop.toFixed(2)} l S`);
+        }
 
         for (let c = 0; c < colCount; c++) {
           const cellX = marginX + c * colWidth + 5;
           const cellLines = wrappedCells[c] || [''];
-          currentOps.push(r === 0 ? '1 1 1 rg' : '0.13 0.13 0.13 rg');
+          currentOps.push(isHeader ? '1 1 1 rg' : '0.13 0.13 0.13 rg');
           for (let lineIdx = 0; lineIdx < cellLines.length; lineIdx++) {
             const lineY = rowTop - 14 - lineIdx * 11;
             currentOps.push(
-              `BT /${r === 0 ? 'F2' : 'F1'} 9 Tf ${cellX.toFixed(2)} ${lineY.toFixed(2)} Td (${escapePdfString(cellLines[lineIdx])}) Tj ET`
+              `BT /${isHeader ? 'F2' : 'F1'} 9 Tf ${cellX.toFixed(2)} ${lineY.toFixed(2)} Td (${escapePdfString(cellLines[lineIdx])}) Tj ET`
             );
           }
         }
         cursorY -= rowHeight;
+      };
+
+      const headerRow = measuredRows[0];
+      const minTableStartSpace = headerRow.rowHeight + (measuredRows[1]?.rowHeight || 0) + 4;
+      ensureSpace(minTableStartSpace);
+      renderTableRow(headerRow, { isHeader: true });
+
+      for (let r = 1; r < measuredRows.length; r++) {
+        const rowData = measuredRows[r];
+        if (cursorY - (rowData.rowHeight + 4) < bottomY) {
+          startNewPage();
+          renderTableRow(headerRow, { isHeader: true });
+        }
+        renderTableRow(rowData, { isHeader: false, isStriped: r % 2 === 1 });
       }
       cursorY -= 8;
       continue;
@@ -310,5 +399,6 @@ module.exports = {
   escapePdfString,
   splitOversizedToken,
   wrapTextToWidth,
+  wrapCellLines,
   buildPdf14Buffer
 };

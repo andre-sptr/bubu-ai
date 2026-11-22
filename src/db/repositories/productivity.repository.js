@@ -1,8 +1,11 @@
+const { normalizeRecurrence } = require('../../utils/recurrence');
+
 const productivityRepository = {
-  createReminder({ chatId, requesterId, message, dueAt, sourceEventId = null }) {
+  createReminder({ chatId, requesterId, message, dueAt, sourceEventId = null, recurrence = null }) {
+    const normalizedRecurrence = normalizeRecurrence(recurrence);
     const now = new Date().toISOString();
-    const result = this.db.prepare(`INSERT OR IGNORE INTO reminders(source_event_id,chat_id,requester_id,message,due_at,status,created_at,updated_at)
-      VALUES(?,?,?,?,?,'pending',?,?)`).run(sourceEventId, chatId, requesterId, message, dueAt, now, now);
+    const result = this.db.prepare(`INSERT OR IGNORE INTO reminders(source_event_id,chat_id,requester_id,message,due_at,recurrence,status,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,'pending',?,?)`).run(sourceEventId, chatId, requesterId, message, dueAt, normalizedRecurrence, now, now);
     if (result.changes) return Number(result.lastInsertRowid);
     if (sourceEventId) {
       const existing = this.db.prepare('SELECT id FROM reminders WHERE source_event_id=?').get(sourceEventId);
@@ -46,9 +49,48 @@ const productivityRepository = {
   },
 
   listReminders({ chatId, requesterId, status = 'pending', limit = 20 }) {
-    return this.db.prepare(`SELECT id,message,due_at,status,delivery_uncertain,created_at
+    return this.db.prepare(`SELECT id,message,due_at,recurrence,status,delivery_uncertain,created_at
       FROM reminders WHERE chat_id=? AND requester_id=? AND (? IS NULL OR status=?)
       ORDER BY due_at LIMIT ?`).all(chatId, requesterId, status, status, Math.max(1, Math.min(limit, 50)));
+  },
+
+  rescheduleRecurringReminder(id, nextDueAt) {
+    if (!nextDueAt) return false;
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`
+      UPDATE reminders
+      SET due_at=?, status='pending', delivery_uncertain=0, attempts=0, updated_at=?
+      WHERE id=? AND status='sending' AND recurrence IS NOT NULL
+    `).run(nextDueAt, now, id);
+    return result.changes === 1;
+  },
+
+  getDailyBriefingData({ ownerId, chatId, nowMs = Date.now(), horizonHours = 24 }) {
+    const horizonIso = new Date(nowMs + Math.max(1, Number(horizonHours) || 24) * 3600000).toISOString();
+    const tasks = this.db.prepare(`
+      SELECT id, title, priority, status, due_at
+      FROM user_tasks
+      WHERE scope='personal' AND owner_id=? AND status IN ('open','in_progress','blocked')
+        AND (priority IN ('urgent','high') OR (due_at IS NOT NULL AND due_at<=?))
+      ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+        CASE WHEN due_at IS NULL THEN 1 ELSE 0 END, due_at ASC
+      LIMIT 10
+    `).all(ownerId, horizonIso);
+
+    const reminders = this.db.prepare(`
+      SELECT id, message, due_at, recurrence
+      FROM reminders
+      WHERE chat_id=? AND requester_id=? AND status='pending' AND due_at<=?
+      ORDER BY due_at ASC
+      LIMIT 10
+    `).all(chatId, ownerId, horizonIso);
+
+    const deadRow = this.db.prepare("SELECT COUNT(*) AS count FROM inbox_events WHERE status='dead'").get();
+    return {
+      tasks,
+      reminders,
+      deadLetterCount: Number(deadRow?.count || 0)
+    };
   },
 
   cancelReminder({ id, chatId, requesterId }) {

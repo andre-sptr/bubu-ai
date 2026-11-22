@@ -1,3 +1,14 @@
+class UserValidationError extends Error {
+  constructor(message, { userMessage = null, category = 'validation', code = 'USER_VALIDATION' } = {}) {
+    super(message);
+    this.name = 'UserValidationError';
+    this.category = category;
+    this.retryable = false;
+    this.code = code;
+    this.userMessage = userMessage || message;
+  }
+}
+
 function statusOf(error) {
   return Number(error?.status || error?.statusCode || error?.response?.status ||
     error?.cause?.response?.status || 0) || null;
@@ -25,6 +36,13 @@ function classifyOperationalError(error) {
       category: 'delivery_uncertain',
       retryable: false,
       userMessage: 'Bubu belum dapat memastikan apakah pesan atau file sudah terkirim. Periksa chat WhatsApp terlebih dahulu. Bubu tidak akan mengirim ulang otomatis untuk mencegah duplikasi.'
+    };
+  }
+  if (error instanceof UserValidationError || error?.name === 'UserValidationError') {
+    return {
+      category: error.category || 'validation',
+      retryable: false,
+      userMessage: error.userMessage || error.message
     };
   }
   if (status === 401 || status === 403) {
@@ -69,6 +87,13 @@ function classifyOperationalError(error) {
       userMessage: 'Bubu menerima data yang tidak sesuai saat menjalankan fitur. Silakan ulangi permintaan dengan informasi yang lebih jelas.'
     };
   }
+  if (!status && error?.retryable === false) {
+    return {
+      category: error.category || 'validation',
+      retryable: false,
+      userMessage: error.userMessage || error.message || 'Permintaan tidak dapat diproses.'
+    };
+  }
   return {
     category: 'internal',
     retryable: true,
@@ -76,4 +101,4 @@ function classifyOperationalError(error) {
   };
 }
 
-module.exports = { classifyOperationalError, statusOf, isTimeout, isNetworkError };
+module.exports = { UserValidationError, classifyOperationalError, statusOf, isTimeout, isNetworkError };

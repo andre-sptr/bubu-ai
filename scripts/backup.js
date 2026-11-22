@@ -1,6 +1,7 @@
 require('dotenv').config();
 const path = require('node:path');
 const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
 const Database = require('better-sqlite3');
 
 function normalizeForCompare(targetPath) {
@@ -95,7 +96,7 @@ function logBackupInfo(logger, message) {
   }
 }
 
-async function runBackup({ sourcePath, backupDir, storageDir, keepCount = 7, logger = console } = {}) {
+async function runBackup({ sourcePath, backupDir, storageDir, keepCount = 7, compressStorage = false, logger = console } = {}) {
   const resolvedSourcePath = path.resolve(sourcePath || process.env.DATABASE_PATH || './data/bubu.sqlite');
   if (!fs.existsSync(resolvedSourcePath) || !fs.statSync(resolvedSourcePath).isFile()) {
     throw new Error(`Database not found: ${resolvedSourcePath}`);
@@ -160,8 +161,38 @@ async function runBackup({ sourcePath, backupDir, storageDir, keepCount = 7, log
 
   let storageBackup = null;
   if (resolvedStorageDir && fs.existsSync(resolvedStorageDir)) {
-    fs.cpSync(resolvedStorageDir, storageBackupTarget, { recursive: true, errorOnExist: true });
-    storageBackup = storageBackupTarget;
+    const inboundDir = path.join(resolvedStorageDir, 'inbound');
+    if (compressStorage) {
+      const archivePath = `${storageBackupTarget}.tar.gz`;
+      const tmpArchivePath = `${archivePath}.tmp`;
+      try {
+        execFileSync('tar', [
+          '--exclude=./inbound',
+          '--exclude=*.tmp',
+          '-czf',
+          tmpArchivePath,
+          '-C',
+          resolvedStorageDir,
+          '.'
+        ], { stdio: 'ignore' });
+        fs.renameSync(tmpArchivePath, archivePath);
+        storageBackup = archivePath;
+      } catch (err) {
+        fs.rmSync(tmpArchivePath, { force: true });
+        throw err;
+      }
+    } else {
+      fs.cpSync(resolvedStorageDir, storageBackupTarget, {
+        recursive: true,
+        errorOnExist: true,
+        filter: (src) => {
+          if (isSameOrInside(inboundDir, src)) return false;
+          if (src.endsWith('.tmp')) return false;
+          return true;
+        }
+      });
+      storageBackup = storageBackupTarget;
+    }
   }
 
   const { prunedDbCount, prunedStorageCount } = pruneOldBackups(resolvedBackupDir, keepCount);
@@ -183,7 +214,10 @@ async function runBackup({ sourcePath, backupDir, storageDir, keepCount = 7, log
 async function main() {
   const envKeep = process.env.BACKUP_KEEP_COUNT ? Number(process.env.BACKUP_KEEP_COUNT) : 7;
   const keepCount = Number.isFinite(envKeep) && envKeep >= 1 ? Math.floor(envKeep) : 7;
-  return runBackup({ keepCount });
+  const compressStorage = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.BACKUP_COMPRESS_STORAGE || '').toLowerCase()
+  );
+  return runBackup({ keepCount, compressStorage });
 }
 
 if (require.main === module) {

@@ -1,4 +1,5 @@
 const path = require('node:path');
+const { UserValidationError } = require('./error-policy');
 
 function safeFilename(name, fallback = 'document') {
   const portable = String(name || fallback).replace(/\\/g, '/');
@@ -53,7 +54,7 @@ function isGenericMime(value) {
 
 function normalizeMediaUrl(mediaUrl, wahaBaseUrl) {
   if (typeof mediaUrl !== 'string' || !mediaUrl.trim()) {
-    throw new Error('WAHA tidak menyediakan URL media yang valid.');
+    throw new UserValidationError('WAHA tidak menyediakan URL media yang valid.');
   }
 
   let base;
@@ -62,15 +63,15 @@ function normalizeMediaUrl(mediaUrl, wahaBaseUrl) {
     base = new URL(wahaBaseUrl);
     media = new URL(mediaUrl.trim(), base);
   } catch {
-    throw new Error('Media URL atau WAHA base URL tidak valid.');
+    throw new UserValidationError('Media URL atau WAHA base URL tidak valid.');
   }
 
   if (!['http:', 'https:'].includes(base.protocol) ||
       !['http:', 'https:'].includes(media.protocol)) {
-    throw new Error('Media URL hanya boleh menggunakan HTTP atau HTTPS.');
+    throw new UserValidationError('Media URL hanya boleh menggunakan HTTP atau HTTPS.');
   }
   if (media.username || media.password) {
-    throw new Error('Media URL dengan kredensial tertanam ditolak.');
+    throw new UserValidationError('Media URL dengan kredensial tertanam ditolak.');
   }
 
   const localAliases = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]']);
@@ -79,7 +80,7 @@ function normalizeMediaUrl(mediaUrl, wahaBaseUrl) {
   }
 
   if (media.origin !== base.origin) {
-    throw new Error('Media URL tidak berasal dari host WAHA yang dikonfigurasi.');
+    throw new UserValidationError('Media URL tidak berasal dari host WAHA yang dikonfigurasi.');
   }
 
   // Fragments are client-side only and must never be sent to WAHA.
@@ -94,18 +95,18 @@ function validateResponseMime(declaredMime, responseMime, acceptedMimes, label) 
 
   if (declared && !isGenericMime(declared) && accepted.size && !accepted.has(declared) &&
       !(declared === 'application/zip' && ['.docx', '.xlsx', '.xlsm'].includes(label))) {
-    throw new Error(`MIME type media tidak didukung untuk ${label}.`);
+    throw new UserValidationError(`MIME type media tidak didukung untuk ${label}.`);
   }
   if (received && !isGenericMime(received) && accepted.size && !accepted.has(received)) {
     // application/zip is a common generic container MIME for OOXML files.
     if (!(received === 'application/zip' && ['.docx', '.xlsx', '.xlsm'].includes(label))) {
-      throw new Error(`Content-Type unduhan tidak sesuai dengan ${label}.`);
+      throw new UserValidationError(`Content-Type unduhan tidak sesuai dengan ${label}.`);
     }
   }
   if (declared && received && !isGenericMime(declared) && !isGenericMime(received) &&
       declared !== received && !(received === 'application/zip' &&
         ['.docx', '.xlsx', '.xlsm'].includes(label))) {
-    throw new Error('MIME type webhook berbeda dengan Content-Type hasil unduhan.');
+    throw new UserValidationError('MIME type webhook berbeda dengan Content-Type hasil unduhan.');
   }
 }
 

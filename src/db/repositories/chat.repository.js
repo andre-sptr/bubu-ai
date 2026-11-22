@@ -1,8 +1,16 @@
 const chatRepository = {
-  addMessage({ chatId, scope, role, senderId = null, content, eventId = null }) {
-    const result = this.db.prepare(`INSERT OR IGNORE INTO messages(chat_id,scope,role,sender_id,content,event_id,created_at)
-      VALUES(?,?,?,?,?,?,?)`).run(chatId, scope, role, senderId, content, eventId, new Date().toISOString());
+  addMessage({ chatId, scope, role, senderId = null, content, eventId = null, waMessageId = null }) {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO messages(chat_id,scope,role,sender_id,content,event_id,wa_message_id,created_at)
+      VALUES(?,?,?,?,?,?,?,?)`).run(chatId, scope, role, senderId, content, eventId, waMessageId, new Date().toISOString());
     return result.changes === 1;
+  },
+
+  isBotOutboundMessage(chatId, waMessageId) {
+    const id = String(waMessageId || '').trim();
+    if (!chatId || !id) return false;
+    return Boolean(
+      this.db.prepare("SELECT 1 FROM messages WHERE chat_id=? AND role='assistant' AND wa_message_id=? LIMIT 1").get(chatId, id)
+    );
   },
 
   clearMessages(chatId) {
@@ -72,6 +80,86 @@ const chatRepository = {
       chatId, requesterId, mode: enabled ? 'both' : 'text'
     });
     return this.getChatPreference({ chatId, requesterId });
+  },
+
+  addGroupPassiveMessage({ chatId, senderId = null, messageId = null, content, maxBuffer = 40 }) {
+    const cleanChatId = String(chatId || '').trim();
+    const cleanContent = String(content || '').trim().slice(0, 1500);
+    if (!cleanChatId || !cleanContent) return false;
+    const cleanMessageId = messageId ? String(messageId).trim() : null;
+    const cap = Math.min(100, Math.max(5, Number(maxBuffer) || 40));
+    const now = new Date().toISOString();
+
+    return this.db.transaction(() => {
+      if (cleanMessageId) {
+        const exists = this.db.prepare(
+          'SELECT 1 FROM group_passive_messages WHERE chat_id=? AND message_id=? LIMIT 1'
+        ).get(cleanChatId, cleanMessageId);
+        if (exists) return false;
+      }
+      this.db.prepare(`
+        INSERT INTO group_passive_messages(chat_id,sender_id,message_id,content,created_at)
+        VALUES(?,?,?,?,?)
+      `).run(cleanChatId, senderId || null, cleanMessageId, cleanContent, now);
+      this.db.prepare(`
+        DELETE FROM group_passive_messages
+        WHERE chat_id=? AND id NOT IN (
+          SELECT id FROM group_passive_messages
+          WHERE chat_id=?
+          ORDER BY id DESC
+          LIMIT ?
+        )
+      `).run(cleanChatId, cleanChatId, cap);
+      return true;
+    })();
+  },
+
+  getGroupPassiveMessages(chatId, limit = 40) {
+    const cleanChatId = String(chatId || '').trim();
+    if (!cleanChatId) return [];
+    const safeLimit = Math.min(100, Math.max(1, Number(limit) || 40));
+    return this.db.prepare(`
+      SELECT id, sender_id, message_id, content, created_at
+      FROM group_passive_messages
+      WHERE chat_id=?
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(cleanChatId, safeLimit).reverse().map((row) => ({
+      id: row.id,
+      sender: row.sender_id,
+      messageId: row.message_id,
+      content: row.content,
+      createdAt: row.created_at
+    }));
+  },
+
+  clearGroupPassiveMessages(chatId) {
+    this.db.prepare('DELETE FROM group_passive_messages WHERE chat_id=?').run(chatId);
+  },
+
+  getAppSetting(key) {
+    const row = this.db.prepare('SELECT value_json FROM app_settings WHERE key=?').get(String(key || ''));
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value_json);
+    } catch {
+      return row.value_json;
+    }
+  },
+
+  setAppSetting(key, value) {
+    const cleanKey = String(key || '').trim();
+    if (!cleanKey) return false;
+    const now = new Date().toISOString();
+    const encoded = JSON.stringify(value ?? null);
+    this.db.prepare(`
+      INSERT INTO app_settings(key,value_json,updated_at)
+      VALUES(?,?,?)
+      ON CONFLICT(key)
+      DO UPDATE SET value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+    `).run(cleanKey, encoded, now);
+    return true;
   }
 };
 

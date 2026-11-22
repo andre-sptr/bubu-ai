@@ -61,7 +61,32 @@ test('default attachment boilerplate prompts do not force reasoning/agent tier',
   );
   assert.equal(
     classifyTask('Tolong jalankan instruksi yang saya sampaikan melalui voice note ini.\nTolong kirim pesan ke Budi'),
-    'agent'
+    'tool_action'
   );
-  assert.equal(classifyTask('Tolong kirim dokumen laporan ke Budi'), 'agent');
+  assert.equal(classifyTask('Tolong kirim dokumen laporan ke Budi'), 'tool_action');
+  assert.equal(classifyTask('Carikan berita AI terbaru lalu kirim ringkasannya ke grup'), 'agent');
+});
+
+test('Stage 2: router selectCandidates returns ordered deduplicated fallback models', () => {
+  const router = new ModelRouter({
+    fast: { id: 'claude-haiku-5-5', supportsTools: true, supportsVision: false },
+    balanced: { id: 'claude-sonnet-5-5', supportsTools: true, supportsVision: true },
+    coding: { id: 'claude-sonnet-5-5', supportsTools: true, supportsVision: false },
+    summary: { id: 'gemini/gemini-3.1-pro-preview', supportsTools: true, supportsVision: false },
+    reasoning: { id: 'claude-opus-5-5', supportsTools: true, supportsVision: false },
+    vision: { id: 'claude-sonnet-5-5', supportsTools: true, supportsVision: true }
+  });
+
+  const singleAction = classifyTask('Tolong kirim pesan pengingat ke Budi');
+  assert.equal(singleAction, 'tool_action');
+  assert.equal(router.select(singleAction, { needsTools: true }).model, 'claude-sonnet-5-5');
+
+  const candidates = router.selectCandidates('tool_action', { needsTools: true });
+  assert.deepEqual(
+    candidates.map((c) => c.model),
+    ['claude-sonnet-5-5', 'gemini/gemini-3.1-pro-preview', 'claude-haiku-5-5', 'claude-opus-5-5']
+  );
+
+  const visionCandidates = router.selectCandidates('reasoning', { needsTools: true, needsVision: true });
+  assert.deepEqual(visionCandidates.map((c) => c.model), ['claude-sonnet-5-5']);
 });

@@ -1,17 +1,22 @@
+const { normalizeRecurrence, parseNextWallClockIso } = require('../utils/recurrence');
+
 const MAX_RANGKUM_CHARS = 24000;
 const MAX_REMINDER_CHARS = 500;
 
 const RECOGNIZED_SLASH_COMMANDS = new Set([
   '/approve',
   '/deny',
+  '/approvals',
   '/voice',
   '/help',
   '/status',
   '/reset',
   '/rangkum',
   '/reminder',
+  '/polls',
   '/memory',
-  '/queue'
+  '/queue',
+  '/usage'
 ]);
 
 function extractSlashCommand(text = '') {
@@ -87,6 +92,11 @@ async function handleQueueCommand(processor, { trimmed, msg, owner }) {
           .join(', ');
         lines.push(`Tier: ${tierSummary}`);
       }
+      if (Number.isFinite(telemetry.estimatedCostUsd)) {
+        const usdStr = Number(telemetry.estimatedCostUsd).toFixed(4);
+        const idrStr = Number(telemetry.estimatedCostIdr || 0).toLocaleString('id-ID');
+        lines.push(`Estimasi biaya (${telemetry.windowHours}j): ~$${usdStr} (~Rp ${idrStr})`);
+      }
     }
     lines.push('Perintah: /queue status, /queue dead, /queue retry <eventId>, /queue prune.');
     await processor.responseHandler.sendText(lines.join('\n'), msg.chatId);
@@ -147,10 +157,16 @@ async function handleQueueCommand(processor, { trimmed, msg, owner }) {
       return true;
     }
     const res = processor.db.pruneHistoryAndQueue();
-    await processor.responseHandler.sendText(
-      `Pembersihan antrean & riwayat selesai.\nCompleted events dihapus: ${res?.deletedCompletedEvents ?? 0}\nDead events dihapus: ${res?.deletedDeadEvents ?? 0}\nModel usage dihapus: ${res?.deletedModelUsage ?? 0}\nAudit logs dihapus: ${res?.deletedAuditLogs ?? 0}`,
-      msg.chatId
-    );
+    const lines = [
+      'Pembersihan antrean & riwayat selesai.',
+      `Completed events dihapus: ${res?.deletedCompletedEvents ?? 0}`,
+      `Dead events dihapus: ${res?.deletedDeadEvents ?? 0}`,
+      `Model usage dihapus: ${res?.deletedModelUsage ?? 0}`,
+      `Audit logs dihapus: ${res?.deletedAuditLogs ?? 0}`
+    ];
+    if (res?.deletedTasks) lines.push(`Tasks dihapus: ${res.deletedTasks}`);
+    if (res?.deletedApprovals) lines.push(`Approvals dihapus: ${res.deletedApprovals}`);
+    await processor.responseHandler.sendText(lines.join('\n'), msg.chatId);
     return true;
   }
 
@@ -161,20 +177,197 @@ async function handleQueueCommand(processor, { trimmed, msg, owner }) {
   return true;
 }
 
+function parseUsageWindowHours(arg = '') {
+  const clean = String(arg || '').trim().toLowerCase();
+  if (!clean) return 24;
+  const match = clean.match(/^(\d{1,3})\s*(h|j|jam|hours?|d|hari|days?)$/);
+  if (!match) return 24;
+  const num = Number(match[1]);
+  const hours = match[2].startsWith('d') || match[2] === 'hari' ? num * 24 : num;
+  return Math.max(1, Math.min(720, hours || 24));
+}
+
+async function handleUsageCommand(processor, { trimmed, msg, owner }) {
+  if (!owner) {
+    await processor.responseHandler.sendText('Perintah /usage hanya dapat diakses oleh pemilik Bubu.', msg.chatId);
+    return true;
+  }
+  if (typeof processor.db?.getTelemetrySummary !== 'function') {
+    await processor.responseHandler.sendText('Statistik pemakaian LLM belum tersedia.', msg.chatId);
+    return true;
+  }
+  const parts = trimmed.split(/\s+/);
+  const windowHours = parseUsageWindowHours(parts[1] || '');
+  const usdToIdr = processor.config?.telemetry?.usdToIdr || 16500;
+  const summary = processor.db.getTelemetrySummary({ windowHours, usdToIdr });
+
+  const usd = Number(summary?.estimatedCostUsd || 0);
+  const idr = Number(summary?.estimatedCostIdr ?? Math.round(usd * usdToIdr));
+  const lines = [
+    `*Ringkasan Pemakaian LLM (${summary.windowHours} jam terakhir)*`,
+    `Total calls: ${summary.totalCalls ?? 0} (sukses ${summary.successCalls ?? 0} | gagal ${summary.failedCalls ?? Math.max(0, (summary.totalCalls || 0) - (summary.successCalls || 0))})`,
+    `Token: ${(summary.totalInputTokens ?? 0).toLocaleString('id-ID')} input / ${(summary.totalOutputTokens ?? 0).toLocaleString('id-ID')} output`,
+    `Rata-rata latensi: ${summary.avgLatencyMs ?? 0} ms`,
+    `Estimasi biaya: ~$${usd.toFixed(4)} USD (~Rp ${idr.toLocaleString('id-ID')})`
+  ];
+
+  const tierEntries = Object.entries(summary.byTier || {});
+  if (tierEntries.length > 0) {
+    lines.push('', '*Rincian per Tier:*');
+    for (const [tier, info] of tierEntries) {
+      const costInfo = summary.costByTier?.[tier];
+      const costSuffix = costInfo ? ` | ~$${Number(costInfo.estimatedCostUsd || 0).toFixed(4)}` : '';
+      lines.push(
+        `• ${tier}: ${info.calls ?? 0} calls (${info.inputTokens ?? 0} in / ${info.outputTokens ?? 0} out)${costSuffix}`
+      );
+    }
+  }
+
+  await processor.responseHandler.sendText(lines.join('\n'), msg.chatId);
+  return true;
+}
+
+function formatLocalTimestamp(iso, timezone = 'Asia/Jakarta') {
+  try {
+    const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return String(iso || '-');
+    return d.toLocaleString('id-ID', {
+      timeZone: timezone || 'Asia/Jakarta',
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  } catch {
+    return String(iso || '-');
+  }
+}
+
+function getPendingApprovals(processor, chatId) {
+  if (typeof processor.db?.listPendingApprovalsDetailed === 'function') {
+    return processor.db.listPendingApprovalsDetailed(chatId) || [];
+  }
+  if (typeof processor.db?.getPendingApprovalsForChat === 'function') {
+    return processor.db.getPendingApprovalsForChat(chatId) || [];
+  }
+  return [];
+}
+
+function formatApprovalSummaryLine(item, timezone = 'Asia/Jakarta') {
+  const target = item.arguments?.targetId ? ` -> ${item.arguments.targetId}` : '';
+  const detail = item.arguments?.filename
+    ? ` (${item.arguments.filename})`
+    : item.arguments?.question
+      ? ` ("${String(item.arguments.question).slice(0, 40)}")`
+      : item.arguments?.message
+        ? ` ("${String(item.arguments.message).replace(/\s+/g, ' ').slice(0, 40)}")`
+        : '';
+  const exp = item.expires_at ? ` | kedaluwarsa: ${formatLocalTimestamp(item.expires_at, timezone)}` : '';
+  return `• *${item.id}* — ${item.tool_name}${target}${detail}${exp}`;
+}
+
+async function handleApprovalsCommand(processor, { msg, owner, isGroup }) {
+  if (!owner || isGroup) {
+    await processor.responseHandler.sendText('Daftar persetujuan hanya dapat diakses pemilik melalui DM pribadi.', msg.chatId);
+    return true;
+  }
+  const pending = getPendingApprovals(processor, msg.chatId);
+  if (!pending.length) {
+    await processor.responseHandler.sendText('Tidak ada persetujuan yang sedang menunggu saat ini.', msg.chatId);
+    return true;
+  }
+  const tz = processor.config?.appTimezone || 'Asia/Jakarta';
+  const lines = pending.map((item) => formatApprovalSummaryLine(item, tz));
+  const hint = pending.length === 1
+    ? 'Balas /approve atau /deny (tanpa ID) atau sertakan ID.'
+    : 'Balas /approve <id> atau /deny <id>.';
+  await processor.responseHandler.sendText(
+    `*Persetujuan Tertunda (${pending.length})*\n${lines.join('\n')}\n\n${hint}`,
+    msg.chatId
+  );
+  return true;
+}
+
+function parseDurationTokenMs(token) {
+  const match = String(token || '').trim().match(/^(\d+h(?:\d+m)?|\d+m)$/i);
+  if (!match) return null;
+  const hours = Number((token.match(/(\d+)h/i) || [])[1] || 0);
+  const mins = Number((token.match(/(\d+)m/i) || [])[1] || 0);
+  const ms = hours * 3600000 + mins * 60000;
+  return ms > 0 ? ms : null;
+}
+
+function formatPollResultBlock(poll) {
+  const header = `*${poll.question}* (${poll.totalVoters} pemilih)`;
+  const optionsLines = (poll.tally || []).map((entry) => `  • ${entry.option}: ${entry.votes} suara`);
+  const idLine = poll.pollMessageId ? `  ID: ${poll.pollMessageId}` : '';
+  return [header, ...optionsLines, ...(idLine ? [idLine] : [])].join('\n');
+}
+
+async function handlePollsCommand(processor, { trimmed, msg, scope }) {
+  if (typeof processor.db?.listPolls !== 'function' && typeof processor.db?.getPollResults !== 'function') {
+    await processor.responseHandler.sendText('Data polling belum tersedia.', msg.chatId);
+    return true;
+  }
+  const parts = trimmed.split(/\s+/);
+  const pollId = parts[1] ? parts[1].trim() : '';
+  if (pollId && typeof processor.db?.getPollResults === 'function') {
+    const res = processor.db.getPollResults({ pollMessageId: pollId, chatId: msg.chatId, scope });
+    if (!res?.found) {
+      await processor.responseHandler.sendText(`Polling ${pollId} tidak ditemukan di chat ini.`, msg.chatId);
+      return true;
+    }
+    await processor.responseHandler.sendText(`*Hasil Polling*\n${formatPollResultBlock(res)}`, msg.chatId);
+    return true;
+  }
+
+  const polls = typeof processor.db?.listPolls === 'function'
+    ? (processor.db.listPolls({ chatId: msg.chatId, scope, limit: 5 }) || [])
+    : [];
+  if (!polls.length) {
+    await processor.responseHandler.sendText('Belum ada polling tercatat di workspace ini.', msg.chatId);
+    return true;
+  }
+  const blocks = polls.map((poll) => formatPollResultBlock(poll));
+  await processor.responseHandler.sendText(`*Daftar & Hasil Polling*\n\n${blocks.join('\n\n')}`, msg.chatId);
+  return true;
+}
+
 async function handleSlashCommand(processor, { text, msg, senderId, owner, isGroup, scope, eventId }) {
   const trimmed = String(text || '').trim();
   const cmd = extractSlashCommand(trimmed);
   if (!cmd) return false;
+
+  if (cmd === '/approvals') {
+    return handleApprovalsCommand(processor, { msg, owner, isGroup });
+  }
+
+  if (cmd === '/polls') {
+    return handlePollsCommand(processor, { trimmed, msg, scope });
+  }
 
   if (cmd === '/approve' || cmd === '/deny') {
     if (!owner || isGroup) {
       await processor.responseHandler.sendText('Persetujuan hanya dapat dilakukan pemilik melalui DM pribadi.', msg.chatId);
       return true;
     }
-    const [, id] = trimmed.split(/\s+/);
+    let [, id] = trimmed.split(/\s+/);
     if (!id) {
-      await processor.responseHandler.sendText('Format: /approve <id> atau /deny <id>.', msg.chatId);
-      return true;
+      const pending = getPendingApprovals(processor, msg.chatId);
+      if (pending.length === 1) {
+        id = pending[0].id;
+      } else if (pending.length > 1) {
+        const tz = processor.config?.appTimezone || 'Asia/Jakarta';
+        const lines = pending.map((item) => formatApprovalSummaryLine(item, tz));
+        await processor.responseHandler.sendText(
+          `*Ada ${pending.length} persetujuan aktif*\n${lines.join('\n')}\n\nPilih dengan: /approve <id> atau /deny <id>.`,
+          msg.chatId
+        );
+        return true;
+      } else {
+        await processor.responseHandler.sendText('Tidak ada persetujuan aktif. Format: /approve <id> atau /deny <id>.', msg.chatId);
+        return true;
+      }
     }
     const result = await processor.approvalManager.resolve({
       id, actorId: senderId, approved: cmd === '/approve'
@@ -260,7 +453,7 @@ async function handleSlashCommand(processor, { text, msg, senderId, owner, isGro
 
   if (cmd === '/help') {
     await processor.responseHandler.sendText(
-      '*Bubu v2 — Perintah*\n/help — Bantuan\n/status — Status layanan\n/reset — Reset riwayat chat\n/rangkum — Ringkas percakapan\n/reminder 30m pesan — Reminder sekali jalan\n/memory status|list|sync — Kelola memori workspace\n/queue status|dead|retry|prune — Kelola antrean & telemetri (owner)\n/voice on|off|both|status|reset — Mode output\n/approve ID — Setujui tindakan\n/deny ID — Tolak tindakan',
+      '*Bubu v2 — Perintah*\n/help — Bantuan\n/status — Status layanan\n/reset — Reset riwayat chat\n/rangkum — Ringkas percakapan\n/reminder 30m pesan — Reminder sekali jalan atau berulang (/reminder list|cancel)\n/polls — Lihat daftar & hasil polling chat\n/memory status|list|sync — Kelola memori workspace\n/queue status|dead|retry|prune — Kelola antrean & telemetri (owner)\n/usage [24h|7d] — Ringkasan pemakaian token & estimasi biaya (owner)\n/approvals — Lihat persetujuan tertunda (owner)\n/voice on|off|both|status|reset — Mode output\n/approve ID — Setujui tindakan\n/deny ID — Tolak tindakan',
       msg.chatId
     );
     return true;
@@ -304,14 +497,26 @@ async function handleSlashCommand(processor, { text, msg, senderId, owner, isGro
       return true;
     }
     const history = processor.db.getHistory(msg.chatId, scope, 60);
-    if (!history.length) {
+    const passiveMessages = isGroup &&
+      processor.config?.groupPassiveHistory &&
+      typeof processor.db?.getGroupPassiveMessages === 'function'
+      ? (processor.db.getGroupPassiveMessages(msg.chatId, processor.config.groupPassiveBufferSize || 40) || [])
+      : [];
+    if (!history.length && !passiveMessages.length) {
       await processor.responseHandler.sendText('Belum ada riwayat percakapan untuk dirangkum.', msg.chatId);
       return true;
     }
-    const transcript = history
-      .map((m) => `${m.role}${m.sender ? ` (${m.sender})` : ''}: ${String(m.content || '').slice(0, 1500)}`)
-      .join('\n')
-      .slice(-MAX_RANGKUM_CHARS);
+    const historyLines = history
+      .map((m) => `${m.role}${m.sender ? ` (${m.sender})` : ''}: ${String(m.content || '').slice(0, 1500)}`);
+    const passiveLines = passiveMessages
+      .map((m) => `[passive] (${m.sender || 'member'}): ${String(m.content || '').slice(0, 800)}`);
+    const transcript = passiveLines.length > 0
+      ? [
+          '--- Percakapan Grup Pasif (Konteks Tambahan) ---',
+          ...passiveLines,
+          ...(historyLines.length > 0 ? ['--- Percakapan dengan Bubu ---', ...historyLines] : [])
+        ].join('\n').slice(-MAX_RANGKUM_CHARS)
+      : historyLines.join('\n').slice(-MAX_RANGKUM_CHARS);
     const selected = processor.router.select('summarize');
     const started = Date.now();
     const timeoutMs = processor.config?.agent?.taskTimeoutMs || 30000;
@@ -345,28 +550,123 @@ async function handleSlashCommand(processor, { text, msg, senderId, owner, isGro
       await processor.responseHandler.sendText('Reminder personal hanya dapat dibuat pemilik melalui DM.', msg.chatId);
       return true;
     }
-    const match = trimmed.match(/^\/reminder\s+((?:\d+h(?:\d+m)?|\d+m))\s+(.+)$/is);
-    if (!match) {
-      await processor.responseHandler.sendText('Format: /reminder 30m Pesan atau /reminder 2h30m Pesan', msg.chatId);
+    const timezone = processor.config?.appTimezone || 'Asia/Jakarta';
+    const remainder = trimmed.replace(/^\/reminder\s*/i, '').trim();
+
+    if (/^list\b/i.test(remainder)) {
+      const reminders = processor.db.listReminders?.({
+        chatId: msg.chatId,
+        requesterId: senderId,
+        status: 'pending',
+        limit: 15
+      }) || [];
+      if (!reminders.length) {
+        await processor.responseHandler.sendText('Belum ada reminder aktif.', msg.chatId);
+        return true;
+      }
+      const lines = reminders.map((r) => {
+        const rec = r.recurrence ? ` [${r.recurrence}]` : '';
+        return `#${r.id}${rec} — ${formatLocalTimestamp(r.due_at, timezone)}: ${r.message}`;
+      });
+      await processor.responseHandler.sendText(`*Daftar Reminder Aktif*\n${lines.join('\n')}`, msg.chatId);
       return true;
     }
-    const reminderMessage = match[2].trim();
-    if (!reminderMessage || reminderMessage.length > MAX_REMINDER_CHARS) {
+
+    const cancelMatch = remainder.match(/^cancel\s+(\d+)\s*$/i);
+    if (cancelMatch) {
+      const id = Number(cancelMatch[1]);
+      const cancelled = Boolean(processor.db.cancelReminder?.({ id, chatId: msg.chatId, requesterId: senderId }));
+      await processor.responseHandler.sendText(
+        cancelled
+          ? `Reminder #${id} dibatalkan.`
+          : `Reminder #${id} tidak ditemukan atau sudah selesai/dibatalkan.`,
+        msg.chatId
+      );
+      return true;
+    }
+
+    let recurrence = null;
+    let dueAt = null;
+    let reminderMessage = '';
+
+    const recMatch = remainder.match(/^(daily|weekdays|weekly|monthly|every:\d{1,3}[mhd])\s+(.+)$/is);
+    if (recMatch) {
+      try {
+        recurrence = normalizeRecurrence(recMatch[1]);
+      } catch {
+        recurrence = null;
+      }
+      const afterRec = recMatch[2].trim();
+      const timeMatch = afterRec.match(/^([^\s]+)\s+(.+)$/s);
+      const token = timeMatch?.[1] || '';
+      const durMs = parseDurationTokenMs(token);
+      const clockIso = parseNextWallClockIso(token, {
+        timezone,
+        weekdaysOnly: recurrence === 'weekdays'
+      });
+
+      if (timeMatch && durMs && durMs <= 365 * 86400000) {
+        dueAt = new Date(Date.now() + durMs).toISOString();
+        reminderMessage = timeMatch[2].trim();
+      } else if (timeMatch && clockIso) {
+        dueAt = clockIso;
+        reminderMessage = timeMatch[2].trim();
+      } else if (recurrence?.startsWith('every:')) {
+        const intervalUnit = recurrence.slice(6);
+        const intervalMs = parseDurationTokenMs(intervalUnit) ||
+          (intervalUnit.endsWith('d') ? Number(intervalUnit.slice(0, -1)) * 86400000 : null);
+        if (intervalMs && intervalMs <= 365 * 86400000) {
+          dueAt = new Date(Date.now() + intervalMs).toISOString();
+          reminderMessage = afterRec;
+        }
+      }
+    } else {
+      const oneTimeMatch = remainder.match(/^([^\s]+)\s+(.+)$/s);
+      if (oneTimeMatch) {
+        const token = oneTimeMatch[1];
+        const durMs = parseDurationTokenMs(token);
+        if (durMs) {
+          if (durMs > 365 * 86400000) {
+            await processor.responseHandler.sendText('Waktu reminder tidak valid atau melebihi satu tahun.', msg.chatId);
+            return true;
+          }
+          dueAt = new Date(Date.now() + durMs).toISOString();
+          reminderMessage = oneTimeMatch[2].trim();
+        } else {
+          const clockIso = parseNextWallClockIso(token, { timezone });
+          if (clockIso) {
+            dueAt = clockIso;
+            reminderMessage = oneTimeMatch[2].trim();
+          }
+        }
+      }
+    }
+
+    if (!dueAt || !reminderMessage) {
+      await processor.responseHandler.sendText(
+        'Format: /reminder 30m Pesan, /reminder 2h30m Pesan, /reminder 08:00 Pesan, /reminder daily 08:00 Pesan, /reminder list, atau /reminder cancel <id>',
+        msg.chatId
+      );
+      return true;
+    }
+    if (reminderMessage.length > MAX_REMINDER_CHARS) {
       await processor.responseHandler.sendText(`Pesan reminder harus 1–${MAX_REMINDER_CHARS} karakter.`, msg.chatId);
       return true;
     }
-    const durationMs = (Number((match[1].match(/(\d+)h/i) || [])[1] || 0) * 3600000)
-      + (Number((match[1].match(/(\d+)m/i) || [])[1] || 0) * 60000);
-    if (!durationMs || durationMs > 365 * 86400000) {
-      await processor.responseHandler.sendText('Waktu reminder tidak valid atau melebihi satu tahun.', msg.chatId);
-      return true;
-    }
+
     const id = processor.db.createReminder({
-      chatId: msg.chatId, requesterId: senderId, message: reminderMessage,
-      dueAt: new Date(Date.now() + durationMs).toISOString(),
+      chatId: msg.chatId,
+      requesterId: senderId,
+      message: reminderMessage,
+      dueAt,
+      ...(recurrence ? { recurrence } : {}),
       sourceEventId: eventId
     });
-    await processor.responseHandler.sendText(`Reminder #${id} tersimpan. Reminder tetap ada setelah restart.`, msg.chatId);
+    const recNote = recurrence ? ` (berulang: ${recurrence})` : '';
+    await processor.responseHandler.sendText(
+      `Reminder #${id} tersimpan${recNote}. Jadwal: ${formatLocalTimestamp(dueAt, timezone)}. Reminder tetap ada setelah restart.`,
+      msg.chatId
+    );
     return true;
   }
 
@@ -466,6 +766,10 @@ async function handleSlashCommand(processor, { text, msg, senderId, owner, isGro
 
   if (cmd === '/queue') {
     return handleQueueCommand(processor, { trimmed, msg, owner });
+  }
+
+  if (cmd === '/usage') {
+    return handleUsageCommand(processor, { trimmed, msg, owner });
   }
 
   return false;

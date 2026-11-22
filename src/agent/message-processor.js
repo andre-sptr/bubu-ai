@@ -5,6 +5,7 @@ const { ResponseHandler } = require('../channels/response-handler');
 const { normalizeIncoming } = require('../channels/waha/normalizer');
 const { normalizeMediaUrl } = require('../utils/media-http');
 const { detectMediaKind } = require('../media/media-validator');
+const { classifyTask } = require('./model-router');
 const { handleSlashCommand, isRecognizedSlashCommand } = require('./command-handler');
 
 function eventKey(message) {
@@ -77,7 +78,7 @@ class MessageProcessor {
     }
   }
 
-  async process(payload) {
+  async process(payload, meta = null) {
     const msg = normalizeIncoming(payload);
     if (msg.botId || msg.botLid) {
       this.sessionMonitor?.updateBotIdentity?.({ id: msg.botId, lid: msg.botLid });
@@ -86,6 +87,10 @@ class MessageProcessor {
     if (!msg.chatId || (!msg.text && !msg.hasMedia && !msg.quote?.present && !msg.quote?.rejected) || msg.fromMe) return;
     if (msg.chatId.endsWith('@broadcast') || msg.chatId.endsWith('@newsletter')) return;
     if (msg.eventType && msg.eventType !== 'message') return;
+
+    const rawChatId = msg.chatId;
+    const rawSenderId = normalizeJid(msg.senderId);
+    const initialEventId = eventKey({ ...msg, chatId: rawChatId, senderId: rawSenderId });
 
     const isGroup = msg.chatId.endsWith('@g.us');
     if (isGroup && this.config.groupPolicy !== 'all') return;
@@ -113,6 +118,19 @@ class MessageProcessor {
 
       if (this.config.groupRequireMention &&
           !hasMention && !isCommand && !mediaMayTriggerWithoutMention) {
+        if (this.config.groupPassiveHistory && currentMessageText && typeof this.db?.addGroupPassiveMessage === 'function') {
+          try {
+            this.db.addGroupPassiveMessage({
+              chatId: msg.chatId,
+              senderId: rawSenderId || null,
+              messageId: msg.eventId || null,
+              content: currentMessageText,
+              maxBuffer: this.config.groupPassiveBufferSize || 40
+            });
+          } catch (err) {
+            this.logger?.warn?.({ chatId: msg.chatId, error: err?.message }, 'Failed to buffer passive group message');
+          }
+        }
         return; // Ordinary group conversation remains quiet; media-only messages follow their separate policy.
       }
     }
@@ -140,6 +158,10 @@ class MessageProcessor {
 
     // The personal assistant is owner-only. In groups, anyone may address Bubu.
     if (scope === 'untrusted') return;
+
+    if (owner && rawSenderId.endsWith('@lid')) {
+      this.sessionMonitor?.rememberOwnerLid?.(rawSenderId);
+    }
 
     if (!owner) {
       const rate = this.db.consumeRateLimit(`${msg.chatId}:${senderId}`, {
@@ -175,6 +197,24 @@ class MessageProcessor {
           logger: this.logger
         })
       : null;
+    let typingStopped = false;
+    const stopTypingOnce = async () => {
+      if (typingStopped) return;
+      typingStopped = true;
+      if (typingKeepalive) {
+        try {
+          await typingKeepalive.stop();
+        } catch (error) {
+          this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA typing keepalive stop failed');
+        }
+      } else if (typeof this.waha?.stopTyping === 'function') {
+        try {
+          await this.waha.stopTyping(msg.chatId);
+        } catch (error) {
+          this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA stopTyping failed');
+        }
+      }
+    };
     if (typingKeepalive) {
       try {
         await typingKeepalive.start();
@@ -189,7 +229,22 @@ class MessageProcessor {
       }
     }
 
-    const eventId = eventKey(msg);
+    const eventId = meta?.eventId || initialEventId;
+    const canProgressReact = Boolean(
+      this.config?.waha?.progressReactions !== false &&
+      msg.eventId &&
+      typeof this.responseHandler?.sendReaction === 'function'
+    );
+    let progressReacted = false;
+    let progressSettled = false;
+    const reactProgress = async (emoji) => {
+      if (!canProgressReact) return;
+      try {
+        await this.responseHandler.sendReaction(msg.chatId, msg.eventId, emoji);
+      } catch (err) {
+        this.logger?.warn?.({ chatId: msg.chatId, emoji, error: err?.message }, 'WAHA progress reaction failed');
+      }
+    };
 
     try {
       if (msg.hasMedia) {
@@ -206,6 +261,8 @@ class MessageProcessor {
             path.basename(normalizedMediaUrl.pathname);
           const mediaKind = detectMediaKind(mediaFilename, msg.media.mimetype);
           if (mediaKind === 'document') {
+            await reactProgress('⏳');
+            progressReacted = true;
             const doc = await this.documentService.ingestMedia({
               media: msg.media,
               scope,
@@ -232,6 +289,10 @@ class MessageProcessor {
               );
               return;
             }
+            if (mediaKind === 'audio' || mediaKind === 'video') {
+              await reactProgress('⏳');
+              progressReacted = true;
+            }
             const processed = await this.mediaService.processIncoming({ media: msg.media });
             const extractedText = String(processed.extractedText || '').slice(
               0, this.config.documents.maxExtractChars || 30000
@@ -241,6 +302,10 @@ class MessageProcessor {
                 'Saya tidak mendeteksi ucapan pada audio tersebut. Silakan kirim ulang voice note yang berisi suara.',
                 msg.chatId
               );
+              if (progressReacted && !progressSettled) {
+                progressSettled = true;
+                await reactProgress('✅');
+              }
               return;
             }
             if (mediaKind === 'audio' && msg.media.isPtt === true && extractedText) {
@@ -301,24 +366,24 @@ class MessageProcessor {
           }) || [];
           let matchedDoc = null;
           if (quoteContext.quotedMessageId) {
-            const quotedEventKey = eventKey({ chatId: msg.chatId, eventId: quoteContext.quotedMessageId });
+            const candidateKeys = [
+              quoteContext.quotedMessageId,
+              eventKey({ chatId: msg.chatId, eventId: quoteContext.quotedMessageId }),
+              ...(rawChatId && rawChatId !== msg.chatId
+                ? [eventKey({ chatId: rawChatId, eventId: quoteContext.quotedMessageId })]
+                : [])
+            ];
+            const keySet = new Set(candidateKeys);
             matchedDoc = workspaceDocs.find((d) =>
-              d.source_event_id &&
-              (d.source_event_id === quoteContext.quotedMessageId || d.source_event_id === quotedEventKey)
+              d.source_event_id && keySet.has(d.source_event_id)
             ) || null;
-            if (!matchedDoc && typeof this.db?.db?.prepare === 'function') {
-              matchedDoc = this.db.db.prepare(
-                `SELECT id, filename, mime_type FROM documents
-                 WHERE scope = ? AND ((scope = 'personal' AND owner_id = ?) OR (scope = 'group' AND chat_id = ?))
-                 AND source_event_id IN (?, ?)
-                 LIMIT 1`
-              ).get(
+            if (!matchedDoc && typeof this.db?.findDocumentBySourceEvent === 'function') {
+              matchedDoc = this.db.findDocumentBySourceEvent({
                 scope,
-                scope === 'personal' ? senderId : null,
-                scope === 'group' ? msg.chatId : null,
-                quoteContext.quotedMessageId,
-                quotedEventKey
-              ) || null;
+                ownerId: scope === 'personal' ? senderId : null,
+                chatId: scope === 'group' ? msg.chatId : null,
+                sourceEventIds: candidateKeys
+              }) || null;
             }
           }
           if (!matchedDoc && workspaceDocs.length > 0) {
@@ -377,16 +442,30 @@ class MessageProcessor {
         ownerId: scope === 'personal' ? senderId : null,
         chatId: scope === 'group' ? msg.chatId : null
       };
-      const memories = this.memoryService
-        ? await this.memoryService.retrieve({ ...memoryContext, query: text, limit: 8 })
-        : this.db.searchMemories({ ...memoryContext, query: text, limit: 6 });
-      const projects = this.memoryService
+      const isGreetingFastPath = !msg.hasMedia && !quoteContext && !captionContext && !voiceInstruction && classifyTask(text) === 'greeting';
+      const passiveGroupMessages = isGroup &&
+        this.config.groupPassiveHistory &&
+        !isGreetingFastPath &&
+        typeof this.db?.getGroupPassiveMessages === 'function'
+        ? (this.db.getGroupPassiveMessages(msg.chatId, Math.min(20, this.config.groupPassiveBufferSize || 40)) || [])
+        : [];
+      if (!progressReacted && !isGreetingFastPath && ['agent', 'reasoning'].includes(classifyTask(text))) {
+        await reactProgress('⏳');
+        progressReacted = true;
+      }
+      const memories = !isGreetingFastPath
+        ? (this.memoryService
+            ? await this.memoryService.retrieve({ ...memoryContext, query: text, limit: 8 })
+            : this.db.searchMemories({ ...memoryContext, query: text, limit: 6 }))
+        : [];
+      const projects = !isGreetingFastPath && this.memoryService
         ? await this.memoryService.projectContext({ ...memoryContext, query: text, limit: 5 })
         : [];
 
       const result = await this.agent.run({
         text, chatId: msg.chatId, requesterId: senderId, scope, history, memories, projects,
         captionContext, voiceInstruction, attachmentEvidence, quoteContext,
+        ...(passiveGroupMessages.length > 0 ? { passiveGroupMessages } : {}),
         sourceEventId: eventId,
         incomingMessageId: msg.eventId || null
       });
@@ -400,19 +479,24 @@ class MessageProcessor {
               defaultMode: this.config.media.voiceReplyDefault ? 'both' : 'text'
             });
 
-            if (isGroup && msg.eventId) {
-              await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode, {
-                replyTo: msg.eventId
-              });
-            } else {
-              await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode);
-            }
+            const deliveryReceipt = isGroup && msg.eventId
+              ? await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode, {
+                  replyTo: msg.eventId
+                })
+              : await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode);
+            const waMessageId = deliveryReceipt?.deliveries?.[0]?.messageId || deliveryReceipt?.messageId || null;
 
             this.db.finishTaskResponse(result.taskId, 'sent');
+            if (progressReacted && !progressSettled) {
+              progressSettled = true;
+              await reactProgress('✅');
+            }
             this.db.addMessage({
               chatId: msg.chatId, scope, role: 'assistant',
-              content: responseText, eventId
+              content: responseText, eventId,
+              ...(waMessageId ? { waMessageId } : {})
             });
+            await stopTypingOnce();
             if (this.memoryService && !msg.hasMedia && !quoteContext) {
               try {
                 this.db.saveMemoryEvent({
@@ -440,20 +524,18 @@ class MessageProcessor {
           }
         }
       }
-    } finally {
-      if (typingKeepalive) {
-        try {
-          await typingKeepalive.stop();
-        } catch (error) {
-          this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA typing keepalive stop failed');
-        }
-      } else if (typeof this.waha?.stopTyping === 'function') {
-        try {
-          await this.waha.stopTyping(msg.chatId);
-        } catch (error) {
-          this.logger.warn({ chatId: msg.chatId, error: error.message }, 'WAHA stopTyping failed');
-        }
+      if (progressReacted && !progressSettled) {
+        progressSettled = true;
+        await reactProgress('✅');
       }
+    } catch (error) {
+      if (progressReacted && !progressSettled) {
+        progressSettled = true;
+        await reactProgress('❌');
+      }
+      throw error;
+    } finally {
+      await stopTypingOnce();
     }
   }
 }

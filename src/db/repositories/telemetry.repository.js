@@ -1,3 +1,9 @@
+const {
+  DEFAULT_USD_TO_IDR,
+  estimateModelCostUsd,
+  estimateCostIdr
+} = require('../../utils/model-pricing');
+
 const telemetryRepository = {
   logModelUsage({ taskId, modelId, tier, usage, latencyMs, outcome }) {
     this.db.prepare(`INSERT INTO model_usage(task_id,model_id,tier,input_tokens,output_tokens,latency_ms,outcome,created_at)
@@ -8,7 +14,7 @@ const telemetryRepository = {
   consumeRateLimit(rateKey, { limit = 10, windowMs = 60000, now = Date.now() } = {}) {
     const cutoff = now - windowMs;
     const tx = this.db.transaction(() => {
-      this.db.prepare('DELETE FROM rate_limit_events WHERE created_at_ms<?').run(cutoff);
+      this.db.prepare('DELETE FROM rate_limit_events WHERE rate_key=? AND created_at_ms<?').run(rateKey, cutoff);
       const row = this.db.prepare(`SELECT COUNT(*) AS count, MIN(created_at_ms) AS oldest
         FROM rate_limit_events WHERE rate_key=? AND created_at_ms>=?`).get(rateKey, cutoff);
       if (row.count >= limit) {
@@ -29,7 +35,7 @@ const telemetryRepository = {
       VALUES(?,?,?,?,?,?)`).run(chatId, actorId, action, outcome, JSON.stringify(details), new Date().toISOString());
   },
 
-  getTelemetrySummary({ windowHours = 24, nowMs = Date.now() } = {}) {
+  getTelemetrySummary({ windowHours = 24, nowMs = Date.now(), usdToIdr = DEFAULT_USD_TO_IDR } = {}) {
     const parsedHours = (windowHours === null || windowHours === undefined || windowHours === '')
       ? 24
       : Number(windowHours);
@@ -61,6 +67,21 @@ const telemetryRepository = {
       ORDER BY calls DESC, tier ASC
     `).all(cutoffIso);
 
+    const modelRows = this.db.prepare(`
+      SELECT
+        model_id AS modelId,
+        tier,
+        COUNT(*) AS calls,
+        COALESCE(SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END), 0) AS successCalls,
+        COALESCE(SUM(COALESCE(input_tokens, 0)), 0) AS inputTokens,
+        COALESCE(SUM(COALESCE(output_tokens, 0)), 0) AS outputTokens,
+        AVG(latency_ms) AS avgLatencyMs
+      FROM model_usage
+      WHERE created_at >= ?
+      GROUP BY tier, model_id
+      ORDER BY calls DESC, model_id ASC
+    `).all(cutoffIso);
+
     const byTier = {};
     for (const row of tierRows) {
       const key = row.tier || 'unknown';
@@ -73,14 +94,74 @@ const telemetryRepository = {
       };
     }
 
+    const byModel = {};
+    const costByTier = {};
+    let totalCostUsd = 0;
+
+    for (const row of modelRows) {
+      const modelKey = row.modelId || 'unknown';
+      const tierKey = row.tier || 'unknown';
+      const calls = Number(row.calls || 0);
+      const successCalls = Number(row.successCalls || 0);
+      const inputTokens = Number(row.inputTokens || 0);
+      const outputTokens = Number(row.outputTokens || 0);
+      const costUsd = estimateModelCostUsd({ modelId: modelKey, tier: tierKey, inputTokens, outputTokens });
+      totalCostUsd += costUsd;
+
+      if (!costByTier[tierKey]) {
+        costByTier[tierKey] = {
+          failedCalls: 0,
+          estimatedCostUsd: 0,
+          estimatedCostIdr: 0
+        };
+      }
+      costByTier[tierKey].failedCalls += Math.max(0, calls - successCalls);
+      costByTier[tierKey].estimatedCostUsd += costUsd;
+
+      if (!byModel[modelKey]) {
+        byModel[modelKey] = {
+          calls: 0,
+          successCalls: 0,
+          failedCalls: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          estimatedCostUsd: 0
+        };
+      }
+      byModel[modelKey].calls += calls;
+      byModel[modelKey].successCalls += successCalls;
+      byModel[modelKey].failedCalls += Math.max(0, calls - successCalls);
+      byModel[modelKey].inputTokens += inputTokens;
+      byModel[modelKey].outputTokens += outputTokens;
+      byModel[modelKey].estimatedCostUsd += costUsd;
+    }
+
+    for (const info of Object.values(costByTier)) {
+      info.estimatedCostUsd = Number(info.estimatedCostUsd.toFixed(6));
+      info.estimatedCostIdr = estimateCostIdr(info.estimatedCostUsd, usdToIdr);
+    }
+    for (const info of Object.values(byModel)) {
+      info.estimatedCostUsd = Number(info.estimatedCostUsd.toFixed(6));
+      info.estimatedCostIdr = estimateCostIdr(info.estimatedCostUsd, usdToIdr);
+    }
+
+    const totalCalls = Number(totals?.totalCalls || 0);
+    const successCalls = Number(totals?.successCalls || 0);
+    const roundedCostUsd = Number(totalCostUsd.toFixed(6));
+
     return {
       windowHours: safeHours,
-      totalCalls: Number(totals?.totalCalls || 0),
-      successCalls: Number(totals?.successCalls || 0),
+      totalCalls,
+      successCalls,
+      failedCalls: Math.max(0, totalCalls - successCalls),
       totalInputTokens: Number(totals?.totalInputTokens || 0),
       totalOutputTokens: Number(totals?.totalOutputTokens || 0),
       avgLatencyMs: Math.round(Number(totals?.avgLatencyMs || 0)),
-      byTier
+      estimatedCostUsd: roundedCostUsd,
+      estimatedCostIdr: estimateCostIdr(roundedCostUsd, usdToIdr),
+      byTier,
+      costByTier,
+      byModel
     };
   }
 };

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { classifyOperationalError } = require('../../../src/utils/error-policy');
+const { UserValidationError, classifyOperationalError } = require('../../../src/utils/error-policy');
 
 test('classifies delivery uncertainty as non-retryable', () => {
   const result = classifyOperationalError({
@@ -24,4 +24,13 @@ test('classifies authentication and invalid client requests as non-retryable', (
 
 test('classifies rate limits as retryable', () => {
   assert.equal(classifyOperationalError({ response: { status: 429 } }).category, 'rate_limit');
+});
+
+test('classifies UserValidationError as non-retryable with exact userMessage', () => {
+  const err = new UserValidationError('Video berdurasi 240 detik. Batas P3 adalah 180 detik.');
+  assert.deepEqual(classifyOperationalError(err), {
+    category: 'validation',
+    retryable: false,
+    userMessage: 'Video berdurasi 240 detik. Batas P3 adalah 180 detik.'
+  });
 });

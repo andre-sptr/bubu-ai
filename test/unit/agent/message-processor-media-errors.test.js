@@ -241,3 +241,111 @@ test('MessageProcessor permanent media 403 reaches InboxWorker dead-letter notif
   assert.equal(f.notices.length, 0);
   await worker.stop();
 });
+
+test('Stage 1: UserValidationError from MediaIntelligenceService / DocumentService fails immediately on attempt 1 with real message', async (t) => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { MediaIntelligenceService } = require('../../../src/media/media-service');
+  const { DocumentService } = require('../../../src/documents/document-service');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage1-userval-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const mp4 = Buffer.from('0000ftypisom0000mdat-video');
+  const mediaService = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://waha:3000' },
+    storageDir: dir,
+    maxVideoSeconds: 60,
+    httpClient: {
+      get: async () => ({
+        status: 200,
+        data: mp4,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(mp4.length) }
+      })
+    },
+    commandRunner: async (cmd) => (cmd === 'ffprobe' ? { stdout: '125\n', stderr: '' } : { stdout: '', stderr: '' })
+  });
+  const documentService = new DocumentService({
+    db: {},
+    wahaConfig: { baseUrl: 'http://waha:3000' },
+    storageDir: dir
+  });
+
+  const f = fixture({ mediaService });
+  f.processor.documentService = documentService;
+
+  const events = [
+    {
+      event_id: 'evt-over-video',
+      chat_id: OWNER,
+      payload: {
+        event: 'message',
+        payload: {
+          id: 'vid-1',
+          from: OWNER,
+          author: OWNER,
+          hasMedia: true,
+          media: { url: 'http://waha:3000/api/files/long.mp4', filename: 'long.mp4', mimetype: 'video/mp4' }
+        }
+      },
+      attempts: 1
+    },
+    {
+      event_id: 'evt-bad-pdf',
+      chat_id: OWNER,
+      payload: {
+        event: 'message',
+        payload: {
+          id: 'doc-1',
+          from: OWNER,
+          author: OWNER,
+          hasMedia: true,
+          media: { url: 'http://waha:3000/api/files/bad.exe', filename: 'bad.exe', mimetype: 'application/x-msdownload' }
+        }
+      },
+      attempts: 1
+    }
+  ];
+
+  // For bad.exe, detectMediaKind returns 'unsupported' handled directly by MessageProcessor;
+  // test DocumentService validation via .pdf with invalid signature.
+  documentService.httpClient = {
+    get: async () => ({
+      status: 200,
+      data: Buffer.from('NOT-A-PDF'),
+      headers: { 'content-type': 'application/pdf', 'content-length': '9' }
+    })
+  };
+  events[1].payload.payload.media = {
+    url: 'http://waha:3000/api/files/fake.pdf',
+    filename: 'fake.pdf',
+    mimetype: 'application/pdf'
+  };
+
+  const failures = [];
+  const deadLetters = [];
+  f.db.claimNextEvent = () => events.shift() || null;
+  f.db.failEvent = (...args) => failures.push(args);
+  f.db.finishEvent = () => assert.fail('validation error must not complete');
+
+  const worker = new InboxWorker({
+    db: f.db,
+    handler: (payload, meta) => f.processor.process(payload, meta),
+    onDeadLetter: async (info) => deadLetters.push(info),
+    logger: { warn: () => {}, error: () => {} },
+    maxAttempts: 5
+  });
+
+  await worker.tick();
+  await worker.tick();
+  await worker.stop();
+
+  assert.equal(failures[0][2], 5);
+  assert.equal(deadLetters[0].category, 'validation');
+  assert.match(deadLetters[0].message, /Video berdurasi 125 detik\. Batas P3 adalah 60 detik/);
+
+  assert.equal(failures[1][2], 5);
+  assert.equal(deadLetters[1].category, 'validation');
+  assert.match(deadLetters[1].message, /signature PDF yang valid/);
+});

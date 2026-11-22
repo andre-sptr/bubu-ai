@@ -158,7 +158,21 @@ class ApprovalManager {
           caption: item.arguments.caption || ''
         });
       } else if (item.tool_name === 'send_whatsapp_poll') {
-        await this.responseHandler.sendPoll(targetId, pollPayload);
+        const pollReceipt = await this.responseHandler.sendPoll(targetId, pollPayload);
+        if (pollReceipt?.messageId && typeof this.db?.savePoll === 'function') {
+          try {
+            this.db.savePoll({
+              pollMessageId: pollReceipt.messageId,
+              chatId: targetId,
+              scope: targetId.endsWith('@g.us') ? 'group' : 'personal',
+              question: pollPayload.name,
+              options: pollPayload.options,
+              multipleAnswers: Boolean(pollPayload.multipleAnswers)
+            });
+          } catch {
+            // Non-fatal metadata persistence after approved send succeeds.
+          }
+        }
       } else if (item.tool_name === 'send_whatsapp_location') {
         await this.responseHandler.sendLocation(targetId, locationPayload);
       } else if (item.tool_name === 'send_whatsapp_contact') {

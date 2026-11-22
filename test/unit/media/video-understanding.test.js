@@ -149,6 +149,53 @@ test('Task 2.7: video with soundtrack combines timestamped visual frames and Tas
   }
 });
 
+test('Stage 1: processVideo avoids redundant second FFmpeg WAV conversion before whisper-cli', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage1-vid-audio-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const modelPath = path.join(dir, 'ggml-base.bin');
+  const vadPath = path.join(dir, 'silero.bin');
+  fs.writeFileSync(modelPath, 'model');
+  fs.writeFileSync(vadPath, 'vad');
+
+  const ffmpegAudioTargets = [];
+  const service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    visionEnabled: false,
+    whisperModelPath: modelPath,
+    whisperVadModelPath: vadPath,
+    httpClient: {
+      get: async () => ({
+        status: 200,
+        data: MP4_BYTES,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(MP4_BYTES.length) }
+      })
+    },
+    commandRunner: async (cmd, args) => {
+      if (cmd === 'ffprobe') return { stdout: '4.0\n', stderr: '' };
+      if (cmd === 'ffmpeg') {
+        const out = args[args.length - 1];
+        if (String(out).includes('frame-%02d.jpg')) {
+          fs.writeFileSync(path.join(path.dirname(out), 'frame-01.jpg'), FRAME_1_JPEG);
+          fs.writeFileSync(path.join(path.dirname(out), 'frame-02.jpg'), FRAME_2_JPEG);
+        } else {
+          ffmpegAudioTargets.push(path.basename(out));
+          fs.writeFileSync(out, 'RIFF-wav');
+        }
+        return { stdout: '', stderr: '' };
+      }
+      if (cmd === 'whisper-cli') return { stdout: 'Satu dua tiga', stderr: '' };
+      return { stdout: '', stderr: '' };
+    }
+  });
+
+  const res = await service.processIncoming({
+    media: { url: '/api/files/clip.mp4', filename: 'clip.mp4', mimetype: 'video/mp4' }
+  });
+  assert.equal(res.transcript, 'Satu dua tiga');
+  assert.deepEqual(ffmpegAudioTargets, ['video-audio.wav']);
+});
+
 test('Task 2.7: too-short video (<2 frames or <1.5s) marks temporalStatus=insufficient_sample and states sequence limitation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-27-short-'));
   const filePath = path.join(dir, 'short.mp4');
@@ -410,4 +457,53 @@ test('Task 2.7: DM and group end-to-end video understanding links timestamps, fr
   assert.match(dmForward.sent[0].text, /Frame 1 \[t=00:00\.0\] gelas kosong.*Frame 3 \[t=00:02\.0\] gelas penuh/);
   assert.match(groupReverse.sent[0].text, /Frame 1 \[t=00:00\.0\] gelas penuh.*Frame 3 \[t=00:02\.0\] gelas kosong/);
   assert.equal(groupReverse.sent[0].chatId, GROUP);
+});
+
+test('Stage 2: processVideo skips Tesseract frame OCR when Vision succeeds, and queues concurrent videos via semaphore', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage2-vid-sem-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  let tesseractCalls = 0;
+  let activeFfmpeg = 0;
+  let maxConcurrentFfmpeg = 0;
+  const service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    visionEnabled: true,
+    httpClient: {
+      get: async () => ({
+        status: 200,
+        data: MP4_BYTES,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(MP4_BYTES.length) }
+      })
+    },
+    commandRunner: async (cmd, args) => {
+      if (cmd === 'ffprobe') return { stdout: '4.0\n', stderr: '' };
+      if (cmd === 'ffmpeg' && String(args[args.length - 1]).includes('frame-%02d.jpg')) {
+        activeFfmpeg++;
+        maxConcurrentFfmpeg = Math.max(maxConcurrentFfmpeg, activeFfmpeg);
+        await new Promise((r) => setTimeout(r, 30));
+        const framesDir = path.dirname(args[args.length - 1]);
+        fs.writeFileSync(path.join(framesDir, 'frame-01.jpg'), FRAME_1_JPEG);
+        fs.writeFileSync(path.join(framesDir, 'frame-02.jpg'), FRAME_2_JPEG);
+        activeFfmpeg--;
+        return { stdout: '', stderr: '' };
+      }
+      if (cmd === 'tesseract') {
+        tesseractCalls++;
+        return { stdout: 'SHOULD BE SKIPPED', stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    }
+  });
+
+  const [res1, res2] = await Promise.all([
+    service.processIncoming({ media: { url: '/api/files/v1.mp4', filename: 'v1.mp4', mimetype: 'video/mp4' } }),
+    service.processIncoming({ media: { url: '/api/files/v2.mp4', filename: 'v2.mp4', mimetype: 'video/mp4' } })
+  ]);
+
+  assert.equal(tesseractCalls, 0);
+  assert.equal(maxConcurrentFfmpeg, 1);
+  assert.equal(res1.visualImages.length, 2);
+  assert.equal(res2.visualImages.length, 2);
 });

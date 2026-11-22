@@ -342,3 +342,64 @@ test('MessageProcessor passes targeted sendSeen options with messageIds and grou
   });
   assert.deepEqual(seenCalls[2], ['628111111111@c.us']);
 });
+
+test('Stage 3: opt-in GROUP_PASSIVE_HISTORY buffers unmentioned group traffic and forwards it on mention', async () => {
+  const passiveBuffer = [];
+  let capturedAgentArgs = null;
+  const f = fixture();
+  f.processor.config.groupPassiveHistory = true;
+  f.processor.config.groupPassiveBufferSize = 20;
+  f.processor.db.addGroupPassiveMessage = (entry) => {
+    passiveBuffer.push(entry);
+    return true;
+  };
+  f.processor.db.getGroupPassiveMessages = () => passiveBuffer.map((item) => ({
+    sender: item.senderId,
+    content: item.content
+  }));
+  f.processor.agent.run = async (args) => {
+    capturedAgentArgs = args;
+    return { taskId: 'task-passive-1', text: 'Hasil analisis Bubu.' };
+  };
+
+  await f.processor.process(groupPayload('grp-p1', 'Jadwal rilis diundur jadi Kamis sore.'));
+  assert.equal(f.agentCalls, 0);
+  assert.equal(passiveBuffer.length, 1);
+  assert.equal(passiveBuffer[0].messageId, 'grp-p1');
+
+  await f.processor.process(groupPayload('grp-p2', 'Bubu kapan jadwal rilis terbaru?'));
+  assert.equal(capturedAgentArgs.passiveGroupMessages.length, 1);
+  assert.equal(capturedAgentArgs.passiveGroupMessages[0].content, 'Jadwal rilis diundur jadi Kamis sore.');
+});
+
+test('Stage 3: live progress reactions emit ⏳ -> ✅ on heavy tasks, ⏳ -> ❌ on errors, and stay silent on routine greetings', async () => {
+  const reactions = [];
+  const f = fixture();
+  f.processor.config.waha.progressReactions = true;
+  f.processor.responseHandler.sendReaction = async (chatId, msgId, emoji) => {
+    reactions.push({ chatId, msgId, emoji });
+    return { ok: true };
+  };
+
+  // Routine greeting -> no reaction emitted
+  await f.processor.process(groupPayload('grp-hi', 'Bubu halo.'));
+  assert.equal(reactions.length, 0);
+
+  // Heavy reasoning query -> ⏳ then ✅
+  await f.processor.process(groupPayload('grp-heavy', 'Bubu tolong analisis mendalam arsitektur microservice vs monolith'));
+  assert.deepEqual(reactions.map((r) => r.emoji), ['⏳', '✅']);
+  assert.equal(reactions[0].msgId, 'grp-heavy');
+
+  // Heavy document error -> ⏳ then ❌
+  f.processor.documentService.ingestMedia = async () => {
+    throw new Error('corrupt pdf');
+  };
+  await assert.rejects(
+    () => f.processor.process(groupPayload('grp-doc-err', 'Bubu baca dokumen', {
+      hasMedia: true,
+      media: { url: 'http://waha:3000/files/bad.pdf', filename: 'bad.pdf', mimetype: 'application/pdf' }
+    })),
+    /corrupt pdf/
+  );
+  assert.deepEqual(reactions.slice(2).map((r) => r.emoji), ['⏳', '❌']);
+});

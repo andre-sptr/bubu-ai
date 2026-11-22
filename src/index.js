@@ -22,6 +22,7 @@ const { DocumentService } = require('./documents/document-service');
 const { WebSearchService, WebFetchService } = require('./web/web-service');
 const { MemoryService } = require('./memory/memory-service');
 const { MediaIntelligenceService } = require('./media/media-service');
+const { cleanupOrphanStorageFiles } = require('./utils/storage-cleanup');
 
 function cleanupStaleTempDirs({
   tmpRoot = os.tmpdir(),
@@ -116,6 +117,7 @@ async function main() {
   db.recoverStaleToolExecutions();
   db.recoverStaleTaskResponses();
   cleanupStaleTempDirs({ logger });
+  cleanupOrphanStorageFiles({ db, storageDir: config.storageDir, logger });
   const waha = new WahaClient(config.waha);
   const sessionMonitor = new WahaSessionMonitor({ session: config.waha.session, botJid: config.botJid });
   const syncResult = await sessionMonitor.syncFromWaha(waha, { logger });
@@ -144,6 +146,7 @@ async function main() {
     ghostscriptBin: config.documents.ghostscriptBin,
     tesseractBin: config.media.tesseractBin,
     ffmpegBin: config.media.ffmpegBin,
+    memoryService,
     logger
   });
   const mediaService = new MediaIntelligenceService({
@@ -196,23 +199,42 @@ async function main() {
   let shuttingDown = false;
   const worker = new InboxWorker({
     db,
-    handler: (payload) => processor.process(payload),
+    handler: (payload, meta) => processor.process(payload, meta),
     logger,
     pollMs: config.inbox.pollMs,
     maxAttempts: config.inbox.maxAttempts,
     staleMs: config.inbox.staleMs,
     maxConcurrentJobs: config.agent.maxConcurrentJobs,
+    storageDir: config.storageDir,
     onDeadLetter: createDeadLetterNotifier({ config, db, waha, responseHandler, logger })
   }).start();
   processor.worker = worker;
-  const reminderWorker = new ReminderWorker({ db, waha, responseHandler, logger });
+  const reminderWorker = new ReminderWorker({
+    db,
+    waha,
+    responseHandler,
+    logger,
+    timezone: config.appTimezone,
+    briefingEnabled: config.briefing?.enabled,
+    briefingHour: config.briefing?.hour,
+    ownerJid: config.ownerJid
+  });
   reminderWorker.start();
+
+  const sessionSyncTimer = setInterval(() => {
+    if (shuttingDown) return;
+    sessionMonitor.syncFromWaha(waha, { logger }).catch((err) => {
+      logger.warn({ error: err?.message }, 'Periodic WAHA session sync failed');
+    });
+  }, 5 * 60 * 1000);
+  sessionSyncTimer.unref?.();
 
   const app = buildApp({
     config,
     db,
     logger,
     worker,
+    reminderWorker,
     sessionMonitor,
     isShuttingDown: () => shuttingDown
   });
@@ -228,15 +250,33 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'Shutting down Bubu v2');
-    await app.close();
-    await reminderWorker.stop();
-    await worker.stop();
-    waha.close?.();
-    db.close();
+    clearInterval(sessionSyncTimer);
+    const forceExitTimer = setTimeout(() => {
+      logger.error({ signal }, 'Forced exit after shutdown timeout');
+      process.exit(1);
+    }, 12000);
+    forceExitTimer.unref?.();
+    try {
+      await app.close();
+      await reminderWorker.stop();
+      await worker.stop();
+      provider.close?.();
+      waha.close?.();
+      db.close();
+    } finally {
+      clearTimeout(forceExitTimer);
+    }
     process.exit(0);
   }
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('unhandledRejection', (reason) => {
+    logger.error({ err: reason instanceof Error ? reason : new Error(String(reason)) }, 'Unhandled promise rejection');
+  });
+  process.on('uncaughtException', (err) => {
+    logger.fatal?.({ err }, 'Uncaught exception; shutting down');
+    shutdown('uncaughtException').catch(() => process.exit(1));
+  });
 }
 
 if (require.main === module) {
@@ -246,4 +286,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, cleanupStaleTempDirs, createDeadLetterNotifier };
+module.exports = { main, cleanupStaleTempDirs, cleanupOrphanStorageFiles, createDeadLetterNotifier };

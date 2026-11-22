@@ -642,3 +642,184 @@ test('readDocumentPages returns hasMorePages false when requested page is out of
   assert.deepEqual(lastPage.returnedPages, [3]);
   assert.equal(lastPage.hasMorePages, false);
 });
+
+test('Stage 1: Rupiah parsing, full-file analyze_spreadsheet beyond maxExtractChars, and clean create_spreadsheet summary', async (t) => {
+  const { DatabaseStore } = require('../../../src/db/database');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage1-sheet-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  // 1. Indonesian Rupiah parsing with non-000 thousands and ordinary decimal preservation
+  assert.equal(parseSpreadsheetNumber('Rp 150.500'), 150500);
+  assert.equal(parseSpreadsheetNumber('IDR 25.250'), 25250);
+  assert.equal(parseSpreadsheetNumber('(Rp 10.250)'), -10250);
+  assert.equal(parseSpreadsheetNumber('12.345'), 12.345);
+
+  const mixedColCsv = [
+    'Cabang,Nominal,Rasio',
+    'A,Rp 150.000,12.345',
+    'B,25.250,1.500'
+  ].join('\n');
+  const mixedAnalysis = analyzeSpreadsheetText(mixedColCsv, { filename: 'rupiah.csv' });
+  const nominalStats = mixedAnalysis.columns.find((c) => c.name === 'Nominal').numericStats;
+  const rasioStats = mixedAnalysis.columns.find((c) => c.name === 'Rasio').numericStats;
+  assert.equal(nominalStats.sum, 175250);
+  assert.equal(rasioStats.sum, 13.845);
+
+  // 2. Full-file analyze_spreadsheet beyond maxExtractChars (200 chars DB cap, 30 rows on disk)
+  const db = new DatabaseStore(path.join(root, 'sheet.sqlite'));
+  const storageDir = path.join(root, 'storage');
+  try {
+    const csvLines = ['Item,Nominal'];
+    let expectedSum = 0;
+    for (let i = 1; i <= 30; i++) {
+      const val = i * 1000 + 500;
+      expectedSum += val;
+      csvLines.push(`Item-${String(i).padStart(2, '0')},"Rp ${val.toLocaleString('id-ID')}"`);
+    }
+    const fullCsvBuf = Buffer.from(csvLines.join('\n'), 'utf8');
+    const docSvc = new DocumentService({
+      db,
+      wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+      storageDir,
+      maxExtractChars: 200,
+      httpClient: {
+        get: async () => ({
+          status: 200,
+          data: fullCsvBuf,
+          headers: { 'content-type': 'text/csv', 'content-length': String(fullCsvBuf.length) }
+        })
+      }
+    });
+
+    const ingested = await docSvc.ingestMedia({
+      media: { url: '/api/files/budget.csv', filename: 'budget.csv', mimetype: 'text/csv' },
+      scope: 'personal',
+      ownerId: '628111@c.us',
+      sourceEventId: 'evt-big-csv'
+    });
+    assert.ok(ingested.extractedText.length <= 200);
+
+    const tools = createDocumentTools({
+      db,
+      documentService: docSvc,
+      approvalManager: { create: async () => ({ pendingApproval: true, approvalId: 'ap-1' }) },
+      waha: { sendFile: async () => ({ id: 'm1' }) }
+    });
+    const analyzeTool = tools.find((item) => item.name === 'analyze_spreadsheet');
+    const fullRes = await analyzeTool.execute(
+      { documentId: ingested.id },
+      { scope: 'personal', requesterId: '628111@c.us', chatId: '628111@c.us' }
+    );
+    assert.equal(fullRes.sourceMode, 'full_file');
+    assert.equal(fullRes.truncated, false);
+    assert.equal(fullRes.analysis.totalRows, 30);
+    assert.equal(fullRes.analysis.columns.find((c) => c.name === 'Nominal').numericStats.sum, expectedSum);
+
+    // 3. Re-analyzing a create_spreadsheet-generated XLSX must not include FORMULAS row
+    const createSpreadsheet = tools.find((item) => item.name === 'create_spreadsheet');
+    await createSpreadsheet.execute({
+      title: 'Rekap',
+      headers: ['Item', 'Nilai'],
+      rows: [['A', 100], ['B', 200]],
+      formulas: { B4: 'SUM(B2:B3)' }
+    }, {
+      taskId: 't-gen-xlsx',
+      scope: 'personal',
+      requesterId: '628111@c.us',
+      chatId: '628111@c.us'
+    });
+    const docs = db.listDocuments({ scope: 'personal', ownerId: '628111@c.us', limit: 10 });
+    const createdDoc = docs.find((d) => d.filename === 'Rekap.xlsx');
+    assert.ok(createdDoc);
+    const storedCreated = db.getDocument(createdDoc.id, 'personal', '628111@c.us', null);
+    assert.equal(storedCreated.extracted_text.includes('FORMULAS:'), false);
+    const fromStoredSummary = analyzeSpreadsheetText(storedCreated.extracted_text, { filename: 'Rekap.xlsx' });
+    assert.equal(fromStoredSummary.totalRows, 2);
+    const reanalyzed = await analyzeTool.execute(
+      { documentId: createdDoc.id },
+      { scope: 'personal', requesterId: '628111@c.us', chatId: '628111@c.us' }
+    );
+    assert.equal(reanalyzed.analysis.totalRows, 2);
+    assert.equal(reanalyzed.analysis.columns.find((c) => c.name === 'Nilai').numericStats.sum, 300);
+  } finally {
+    db.close();
+  }
+});
+
+test('Stage 2: chunkDocumentText, hybrid semantic+lexical search_document RAG, and OCR AsyncSemaphore queuing work end-to-end', async (t) => {
+  const { DatabaseStore } = require('../../../src/db/database');
+  const { chunkDocumentText } = require('../../../src/documents/parsers/chunker');
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage2-doc-rag-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const chunks = chunkDocumentText(
+    '--- [HALAMAN 1] ---\n' + 'Pendahuluan umum. '.repeat(90) + '\n\n' +
+    '--- [HALAMAN 2] ---\nKlausul denda keterlambatan vendor berlaku setelah tujuh hari kalender.',
+    { chunkChars: 600, overlapChars: 100 }
+  );
+  assert.ok(chunks.length >= 2);
+  assert.equal(chunks[chunks.length - 1].pageNumber, 2);
+
+  const db = new DatabaseStore(path.join(root, 'rag.sqlite'));
+  t.after(() => db.close());
+
+  let activeOcr = 0;
+  let maxConcurrentOcr = 0;
+  const docSvc = new DocumentService({
+    db,
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: root,
+    embedder: async (text) => (/penalti|denda|keterlambatan|keterlambat/i.test(text) ? [0, 1] : [1, 0]),
+    commandRunner: async () => ({ stdout: 'Scanned text content', stderr: '' })
+  });
+  docSvc.renderPdfPagesToImages = async (_pdfPath, workDir) => {
+    activeOcr++;
+    maxConcurrentOcr = Math.max(maxConcurrentOcr, activeOcr);
+    await new Promise((r) => setTimeout(r, 25));
+    const p1 = path.join(workDir, 'page-001.jpg');
+    fs.writeFileSync(p1, 'jpg');
+    activeOcr--;
+    return [p1];
+  };
+
+  // Concurrent ocrPdfPages calls queue safely via AsyncSemaphore instead of immediately throwing busy
+  const [ocr1, ocr2] = await Promise.all([
+    docSvc.ocrPdfPages({ buffer: Buffer.from('%PDF-1.4'), digitalPages: [''], totalPages: 1 }),
+    docSvc.ocrPdfPages({ buffer: Buffer.from('%PDF-1.4'), digitalPages: [''], totalPages: 1 })
+  ]);
+  assert.equal(maxConcurrentOcr, 1);
+  assert.match(ocr1, /Scanned text content/);
+  assert.match(ocr2, /Scanned text content/);
+
+  // Hybrid RAG semantic+lexical match even when query phrasing differs from exact chunk tokens
+  const docId = '77777777-7777-4777-8777-777777777777';
+  const docText = '--- [HALAMAN 1] ---\nProfil perusahaan vendor resmi.\n\n--- [HALAMAN 2] ---\nKlausul sanksi keterlambatan pembayaran dihitung harian.';
+  db.saveDocument({
+    id: docId,
+    scope: 'personal',
+    ownerId: '628111@c.us',
+    filename: 'kontrak-rag.pdf',
+    mimeType: 'application/pdf',
+    filePath: path.join(root, 'kontrak.pdf'),
+    fileSize: 200,
+    extractedText: docText
+  });
+  await docSvc.indexDocumentChunks({
+    documentId: docId,
+    scope: 'personal',
+    ownerId: '628111@c.us',
+    extractedText: docText
+  });
+
+  const tools = createDocumentTools({ db, documentService: docSvc, approvalManager: {}, waha: {} });
+  const searchTool = tools.find((item) => item.name === 'search_document');
+  const ragRes = await searchTool.execute(
+    { query: 'aturan penalti telat bayar', documentId: docId },
+    { scope: 'personal', requesterId: '628111@c.us', chatId: '628111@c.us' }
+  );
+  assert.equal(ragRes.matches.length, 1);
+  assert.equal(ragRes.matches[0].id, docId);
+  assert.equal(ragRes.matches[0].matchedPages.includes(2), true);
+  assert.match(ragRes.matches[0].excerpt, /sanksi keterlambatan/);
+});

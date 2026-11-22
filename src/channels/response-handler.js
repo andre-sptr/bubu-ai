@@ -1,3 +1,5 @@
+const dns = require('node:dns/promises');
+const net = require('node:net');
 const { formatWhatsAppText, splitWhatsAppMessage } = require('./whatsapp-formatter');
 const { isPrivateHost } = require('../web/web-service');
 
@@ -22,6 +24,30 @@ function validateExternalPreviewUrl(url) {
     throw new Error('Link preview URL host is not allowed.');
   }
   return rawUrl;
+}
+
+async function assertExternalPreviewUrlSafe(url, { dnsLookup = null, logger = null } = {}) {
+  const validUrl = validateExternalPreviewUrl(url);
+  const parsed = new URL(validUrl);
+  if (net.isIP(parsed.hostname)) {
+    return validUrl;
+  }
+  const lookupFn = dnsLookup || dns.lookup;
+  let resolved;
+  try {
+    resolved = await lookupFn(parsed.hostname, { all: true, verbatim: true });
+  } catch (err) {
+    const code = String(err?.code || '').toUpperCase();
+    if (!dnsLookup && process.env.NODE_ENV !== 'production' && ['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code)) {
+      logger?.warn?.({ host: parsed.hostname, code }, 'Skipping strict link preview DNS resolution offline');
+      return validUrl;
+    }
+    throw new Error('Link preview URL host could not be resolved safely.');
+  }
+  if (!Array.isArray(resolved) || resolved.length === 0 || resolved.some((entry) => isPrivateHost(entry.address))) {
+    throw new Error('Link preview URL host resolves to a private network and is not allowed.');
+  }
+  return validUrl;
 }
 
 const DETERMINISTIC_FAILURE_CODES = new Set(['ENOENT', 'EACCES', 'EISDIR']);
@@ -62,12 +88,13 @@ function messageIdOf(response) {
 }
 
 class ResponseHandler {
-  constructor({ waha, mediaService = null, config = null, logger = null } = {}) {
+  constructor({ waha, mediaService = null, config = null, logger = null, dnsLookup = null } = {}) {
     if (!waha) throw new Error('ResponseHandler requires a WAHA client.');
     this.waha = waha;
     this.mediaService = mediaService;
     this.config = config;
     this.logger = logger || { warn: () => {}, error: () => {} };
+    this.dnsLookup = dnsLookup;
   }
 
   async _deliver({ type, chatId, meta = {}, sendFn, errorMessage }) {
@@ -314,7 +341,7 @@ class ResponseHandler {
     if (typeof this.waha.sendLinkCustomPreview !== 'function') {
       throw new Error('The configured WAHA client does not support link preview delivery.');
     }
-    const validUrl = validateExternalPreviewUrl(url);
+    const validUrl = await assertExternalPreviewUrlSafe(url, { dnsLookup: this.dnsLookup, logger: this.logger });
     const formattedText = text !== undefined
       ? (text ? formatWhatsAppText(text) : '')
       : validUrl;
@@ -556,4 +583,11 @@ class ResponseHandler {
   }
 }
 
-module.exports = { ResponseHandler, ResponseDeliveryError, messageIdOf, classifyDeliveryStatus };
+module.exports = {
+  ResponseHandler,
+  ResponseDeliveryError,
+  messageIdOf,
+  classifyDeliveryStatus,
+  validateExternalPreviewUrl,
+  assertExternalPreviewUrlSafe
+};

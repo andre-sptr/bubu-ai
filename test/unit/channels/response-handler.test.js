@@ -419,3 +419,31 @@ test('Stage 1 Phase 4 outbound methods (link_preview, edit, delete, forward) val
     (err) => err instanceof ResponseDeliveryError && err.deliveryStatus === 'failed' && err.type === 'edit'
   );
 });
+
+test('Stage 1: sendLinkPreview blocks DNS resolutions to private networks and fails closed when dnsLookup errors', async () => {
+  for (const resolved of [
+    [{ address: '127.0.0.1', family: 4 }],
+    [{ address: '10.3.14.216', family: 4 }],
+    [{ address: '::ffff:7f00:1', family: 6 }]
+  ]) {
+    const calls = [];
+    const handler = new ResponseHandler({
+      waha: { sendLinkCustomPreview: async (...args) => calls.push(args) },
+      dnsLookup: async () => resolved
+    });
+    await assert.rejects(
+      () => handler.sendLinkPreview('chat@c.us', { url: 'https://rebind.nip.io/secret' }),
+      /private network/i
+    );
+    assert.equal(calls.length, 0);
+  }
+
+  const failingDnsHandler = new ResponseHandler({
+    waha: { sendLinkCustomPreview: async () => assert.fail('must not call WAHA') },
+    dnsLookup: async () => { throw Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' }); }
+  });
+  await assert.rejects(
+    () => failingDnsHandler.sendLinkPreview('chat@c.us', { url: 'https://unknown.invalid/test' }),
+    /could not be resolved safely/i
+  );
+});

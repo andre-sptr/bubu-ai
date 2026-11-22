@@ -1008,3 +1008,377 @@ test('Phase 6 pruneHistoryAndQueue, getTelemetrySummary, and classifyEventPriori
     assert.equal(classifyEventPriority({ chatId: '123@g.us', senderId: owner, text: 'Bubu halo' }, owner), 5);
   } finally { f.close(); }
 });
+
+test('Stage 1: Schema v13 adds wa_message_id + telemetry indexes, upgrades partial DBs, and enforces canonical @lid eventId guard', async () => {
+  const { InboxWorker } = require('../../src/workers/inbox-worker');
+  const { MessageProcessor } = require('../../src/agent/message-processor');
+  const { WahaSessionMonitor } = require('../../src/channels/waha/session-monitor');
+
+  // 1. Fresh DB has v13 columns, indexes, isBotOutboundMessage, and findDocumentBySourceEvent
+  const f = fixture();
+  try {
+    assert.equal(MIGRATIONS.some((m) => m.version === 13), true);
+    const msgCols = new Set(f.db.db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name));
+    assert.equal(msgCols.has('wa_message_id'), true);
+    for (const idxName of ['idx_messages_wa_id', 'idx_model_usage_created', 'idx_audit_logs_created']) {
+      const idx = f.db.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?").get(idxName);
+      assert.ok(idx, `Expected index ${idxName}`);
+    }
+
+    f.db.addMessage({
+      chatId: '123@g.us', scope: 'group', role: 'user', senderId: '6282@c.us',
+      content: 'halo', eventId: 'evt-u1', waMessageId: 'raw-user-msg-1'
+    });
+    f.db.addMessage({
+      chatId: '123@g.us', scope: 'group', role: 'assistant',
+      content: 'hai', eventId: 'evt-u1', waMessageId: '3EB0BOTMSG1'
+    });
+    assert.equal(f.db.isBotOutboundMessage('123@g.us', '3EB0BOTMSG1'), true);
+    assert.equal(f.db.isBotOutboundMessage('123@g.us', 'raw-user-msg-1'), false);
+    assert.equal(f.db.isBotOutboundMessage('999@g.us', '3EB0BOTMSG1'), false);
+
+    f.db.saveDocument({
+      id: 'doc-src-1', scope: 'personal', ownerId: '6281@c.us',
+      filename: 'a.pdf', mimeType: 'application/pdf', filePath: '/tmp/a.pdf',
+      fileSize: 10, extractedText: 'text', sourceEventId: 'raw-lid-evt-key'
+    });
+    assert.equal(
+      f.db.findDocumentBySourceEvent({ scope: 'personal', ownerId: '6281@c.us', sourceEventIds: ['missing', 'raw-lid-evt-key'] }).id,
+      'doc-src-1'
+    );
+    assert.equal(
+      f.db.findDocumentBySourceEvent({ scope: 'group', chatId: '123@g.us', sourceEventIds: ['raw-lid-evt-key'] }),
+      null
+    );
+
+    // 2. Canonical eventId preserved across @lid resolution so uncertain tasks block requeueDeadEvent
+    const owner = '628111111111@c.us';
+    const ownerLid = '232701932138501@lid';
+    const rawPayload = {
+      event: 'message',
+      payload: { id: 'wa-lid-1', from: ownerLid, author: ownerLid, body: 'Kirim dong' }
+    };
+    const webhookEventId = 'canonical-lid-event-1';
+    f.db.enqueueEvent({
+      eventId: webhookEventId,
+      chatId: ownerLid,
+      senderId: ownerLid,
+      payload: rawPayload,
+      priority: 2
+    });
+    const monitor = new WahaSessionMonitor({ session: 'default' });
+    const processor = new MessageProcessor({
+      config: {
+        ownerJid: owner,
+        botJid: '628999@c.us',
+        groupPolicy: 'all',
+        groupRequireMention: true,
+        groupMediaRequireMention: false,
+        agent: { enabled: true, messageRateLimit: 10, messageRateWindowMs: 60000 },
+        media: { enabled: false, voiceReplyDefault: false },
+        documents: { maxExtractChars: 50000 },
+        waha: { baseUrl: 'http://127.0.0.1:3000' }
+      },
+      db: f.db,
+      waha: { resolveLid: async (lid) => (lid === ownerLid ? owner : lid) },
+      sessionMonitor: monitor,
+      responseHandler: {
+        sendAssistantResponse: async () => {
+          throw Object.assign(new Error('WAHA timeout'), { name: 'ResponseDeliveryError', deliveryStatus: 'uncertain' });
+        }
+      },
+      agent: {
+        run: async ({ text, chatId, requesterId, scope, sourceEventId }) => {
+          const taskId = `task-for-${sourceEventId}`;
+          f.db.createTask({ id: taskId, sourceEventId, chatId, requesterId, scope, requestText: text });
+          f.db.queueTaskResponse(taskId, 'Balasan');
+          return { taskId, text: 'Balasan' };
+        }
+      },
+      approvalManager: {},
+      provider: {},
+      router: {},
+      documentService: {},
+      memoryService: null,
+      logger: { warn: () => {}, error: () => {} }
+    });
+
+    const worker = new InboxWorker({
+      db: f.db,
+      handler: (payload, meta) => processor.process(payload, meta),
+      logger: { warn: () => {}, error: () => {} }
+    });
+    await worker.tick();
+    await worker.stop();
+
+    assert.equal(monitor.getOwnerLid(), ownerLid);
+    const taskRow = f.db.db.prepare('SELECT source_event_id, response_status FROM tasks WHERE source_event_id=?').get(webhookEventId);
+    assert.ok(taskRow);
+    assert.equal(taskRow.response_status, 'uncertain');
+    assert.deepEqual(f.db.requeueDeadEvent(webhookEventId), { requeued: false, reason: 'delivery_uncertain' });
+  } finally { f.close(); }
+
+  // 3. Upgrade pre-v13 DB that includes messages, model_usage, and audit_logs
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-v13-upgrade-'));
+  try {
+    const Database = require('better-sqlite3');
+    const dbPath = path.join(dir, 'v13-upgrade.sqlite');
+    const rawDb = new Database(dbPath);
+    rawDb.exec(`
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, scope TEXT NOT NULL, role TEXT NOT NULL, sender_id TEXT, content TEXT NOT NULL, event_id TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE model_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, model_id TEXT NOT NULL, tier TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, latency_ms INTEGER, outcome TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, actor_id TEXT, action TEXT NOT NULL, outcome TEXT NOT NULL, details_json TEXT, created_at TEXT NOT NULL);
+    `);
+    for (let v = 1; v <= 12; v++) {
+      rawDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)').run(v, '2026-01-01T00:00:00.000Z');
+    }
+    rawDb.close();
+    const upgraded = new DatabaseStore(dbPath);
+    try {
+      const msgCols = new Set(upgraded.db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name));
+      assert.equal(msgCols.has('wa_message_id'), true);
+      assert.ok(upgraded.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_model_usage_created'").get());
+      assert.ok(upgraded.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_audit_logs_created'").get());
+    } finally {
+      upgraded.close();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Stage 2: Schema v14 Float32 BLOB migration, LRU vector cache, Unicode 2-char tokenizer, maxActive cap, rate-limit isolation, extended pruning, and lock heartbeat', () => {
+  const { encodeEmbeddingBlob, decodeEmbeddingBlob } = require('../../src/utils/vector');
+
+  // 1. Upgrade legacy DB with embedding_json -> Float32 BLOB migration
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-v14-upgrade-'));
+  try {
+    const Database = require('better-sqlite3');
+    const dbPath = path.join(dir, 'v14-upgrade.sqlite');
+    const rawDb = new Database(dbPath);
+    rawDb.exec(`
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      CREATE TABLE memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL, owner_id TEXT, chat_id TEXT, kind TEXT NOT NULL DEFAULT 'fact',
+        content TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'test', created_at TEXT NOT NULL,
+        memory_type TEXT NOT NULL DEFAULT 'fact', title TEXT, embedding_json TEXT,
+        importance INTEGER NOT NULL DEFAULT 3, project_id TEXT, metadata_json TEXT NOT NULL DEFAULT '{}',
+        last_accessed_at TEXT, updated_at TEXT, status TEXT NOT NULL DEFAULT 'active', superseded_by INTEGER
+      );
+      INSERT INTO memories (scope, owner_id, content, created_at, updated_at, last_accessed_at, embedding_json)
+      VALUES ('personal', 'owner@c.us', 'Kantor di Jakarta Timur', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', '[0.6, 0.8]');
+    `);
+    for (let v = 1; v <= 13; v++) {
+      rawDb.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)').run(v, '2026-01-01T00:00:00.000Z');
+    }
+    rawDb.close();
+
+    const upgraded = new DatabaseStore(dbPath);
+    try {
+      const row = upgraded.db.prepare('SELECT embedding_json, embedding_blob FROM memories WHERE id=1').get();
+      assert.equal(row.embedding_json, null);
+      const vec = decodeEmbeddingBlob(row.embedding_blob);
+      assert.ok(vec instanceof Float32Array);
+      assert.ok(Math.abs(vec[0] - 0.6) < 0.001 && Math.abs(vec[1] - 0.8) < 0.001);
+    } finally {
+      upgraded.close();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // 2. Full v14 store features
+  const f = fixture();
+  try {
+    assert.equal(MIGRATIONS.some((m) => m.version === 14), true);
+    assert.ok(f.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='document_chunks'").get());
+    assert.ok(f.db.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_inbox_priority_ready'").get());
+
+    // 2-char Unicode terms (AI, WA, RF) & workspace vector cache
+    f.db.saveMemory({
+      scope: 'personal', ownerId: 'owner@c.us',
+      content: 'Proyek RF link planning lewat WA', embedding: [1, 0, 0]
+    });
+    const rfHits = f.db.searchMemoriesSemantic({ scope: 'personal', ownerId: 'owner@c.us', query: 'RF WA' });
+    assert.equal(rfHits.length, 1);
+    assert.equal(rfHits[0].lexicalScore, 1);
+
+    // Warm cache hit & auto-invalidation on write
+    f.db.searchMemoriesSemantic({ scope: 'personal', ownerId: 'owner@c.us', query: 'RF', queryEmbedding: [1, 0, 0] });
+    assert.ok(f.db._memoryVectorCache.size >= 1);
+    f.db.saveMemory({
+      scope: 'personal', ownerId: 'owner@c.us',
+      content: 'Server AI di AWS', embedding: [0, 1, 0]
+    });
+    const aiHits = f.db.searchMemoriesSemantic({ scope: 'personal', ownerId: 'owner@c.us', query: 'AI', queryEmbedding: [0, 1, 0] });
+    assert.equal(aiHits[0].content, 'Server AI di AWS');
+
+    // maxActive consolidation trims lowest-importance oldest overflow
+    for (let i = 1; i <= 4; i++) {
+      f.db.saveMemory({
+        scope: 'personal', ownerId: 'owner@c.us',
+        content: `Item ${i}`, importance: i
+      });
+    }
+    const trimmed = f.db.consolidateWorkspaceMemories({
+      scope: 'personal', ownerId: 'owner@c.us', maxActive: 3
+    });
+    assert.equal(trimmed.archivedOverflowCount, 3);
+    assert.equal(f.db.listMemories({ scope: 'personal', ownerId: 'owner@c.us', status: 'active' }).length, 3);
+
+    // consumeRateLimit key isolation
+    const now = Date.now();
+    f.db.consumeRateLimit('daily:key', { limit: 5, windowMs: 86400000, now: now - 120000 });
+    f.db.consumeRateLimit('short:key', { limit: 5, windowMs: 60000, now });
+    const dailyRemaining = f.db.db.prepare('SELECT COUNT(*) AS c FROM rate_limit_events WHERE rate_key=?').get('daily:key').c;
+    assert.equal(dailyRemaining, 1);
+
+    // touchEventLock & excludeEventIds on recoverStaleEvents
+    f.db.enqueueEvent({ eventId: 'evt-live-1', chatId: 'c1@c.us', senderId: 'c1@c.us', payload: {} });
+    f.db.claimNextEvent();
+    const oldLock = new Date(Date.now() - 200000).toISOString();
+    f.db.db.prepare('UPDATE inbox_events SET locked_at=? WHERE event_id=?').run(oldLock, 'evt-live-1');
+    assert.equal(f.db.recoverStaleEvents(120000, { excludeEventIds: ['evt-live-1'] }), 0);
+    assert.equal(f.db.touchEventLock('evt-live-1'), true);
+    assert.equal(f.db.recoverStaleEvents(120000), 0);
+
+    // Extended pruneHistoryAndQueue cleans tasks/tool_executions/approvals/extractions/rate_limit_events
+    const oldIso = new Date(now - 40 * 86400000).toISOString();
+    f.db.createTask({ id: 't-old', chatId: 'c@c.us', requesterId: 'c@c.us', scope: 'personal', requestText: 'old' });
+    f.db.beginToolExecution({ idempotencyKey: 'te-old', taskId: 't-old', toolName: 'save_note' });
+    f.db.completeToolExecution('te-old', { ok: true });
+    f.db.createApproval({
+      id: 'ap-old', taskId: 't-old', chatId: 'c@c.us', requesterId: 'c@c.us',
+      toolName: 'send_whatsapp_message', arguments: {}, expiresAt: oldIso
+    });
+    f.db.denyApproval('ap-old');
+    f.db.updateTask('t-old', { status: 'completed' });
+    f.db.db.prepare('UPDATE tasks SET updated_at=? WHERE id=?').run(oldIso, 't-old');
+    f.db.db.prepare('UPDATE tool_executions SET updated_at=? WHERE idempotency_key=?').run(oldIso, 'te-old');
+    f.db.db.prepare('UPDATE approvals SET updated_at=? WHERE id=?').run(oldIso, 'ap-old');
+    f.db.recordMemoryExtraction({ sourceEventId: 'ext-old', status: 'completed', extractedCount: 1 });
+    f.db.db.prepare('UPDATE memory_extraction_runs SET created_at=? WHERE source_event_id=?').run(oldIso, 'ext-old');
+    f.db.consumeRateLimit('old:key', { limit: 5, windowMs: 60000, now: now - 30 * 3600000 });
+
+    const prunedExt = f.db.pruneHistoryAndQueue({ nowMs: now, includeExtendedCounts: true });
+    assert.equal(prunedExt.deletedTasks, 1);
+    assert.equal(prunedExt.deletedToolExecutions, 1);
+    assert.equal(prunedExt.deletedApprovals, 1);
+    assert.equal(prunedExt.deletedMemoryExtractions, 1);
+    assert.ok(prunedExt.deletedRateLimitEvents >= 1);
+    assert.ok(encodeEmbeddingBlob([1, 2, 3]) instanceof Buffer);
+  } finally { f.close(); }
+});
+
+test('Stage 3: Migration v15 supports passive group ring buffer, poll tallying with isolation, recurring reminders, briefing data, and detailed approvals', () => {
+  const f = fixture();
+  try {
+    assert.equal(MIGRATIONS[MIGRATIONS.length - 1].version, 15);
+
+    // 1. Group passive buffer ring cap + dedup + pruning
+    for (let i = 1; i <= 7; i++) {
+      const added = f.db.addGroupPassiveMessage({
+        chatId: 'grp1@g.us',
+        senderId: `6280${i}@c.us`,
+        messageId: `gm-${i}`,
+        content: `Obrolan ${i}`,
+        maxBuffer: 5
+      });
+      assert.equal(added, true);
+    }
+    assert.equal(f.db.addGroupPassiveMessage({
+      chatId: 'grp1@g.us',
+      senderId: '62807@c.us',
+      messageId: 'gm-7',
+      content: 'Obrolan 7',
+      maxBuffer: 5
+    }), false);
+    const passive = f.db.getGroupPassiveMessages('grp1@g.us', 10);
+    assert.equal(passive.length, 5);
+    assert.equal(passive[0].content, 'Obrolan 3');
+    assert.equal(passive[4].content, 'Obrolan 7');
+
+    const oldIso = new Date(Date.now() - 20 * 86400000).toISOString();
+    f.db.db.prepare('UPDATE group_passive_messages SET created_at=? WHERE message_id=?').run(oldIso, 'gm-3');
+    const pruned = f.db.pruneHistoryAndQueue({ includeExtendedCounts: true });
+    assert.equal(pruned.deletedGroupPassiveMessages, 1);
+
+    // 2. Polls, votes, vote updates, unvotes, and group isolation
+    f.db.savePoll({
+      pollMessageId: 'poll-1',
+      chatId: 'grp1@g.us',
+      scope: 'group',
+      question: 'Jadwal deploy?',
+      options: ['Malam ini', 'Besok pagi'],
+      multipleAnswers: false
+    });
+    f.db.recordPollVote({ pollMessageId: 'poll-1', voterId: '6281@c.us', selectedOptions: ['Malam ini'] });
+    f.db.recordPollVote({ pollMessageId: 'poll-1', voterId: '6282@c.us', selectedOptions: ['Malam ini'] });
+    f.db.recordPollVote({ pollMessageId: 'poll-1', voterId: '6282@c.us', selectedOptions: ['Besok pagi'] }); // change vote
+    f.db.recordPollVote({ pollMessageId: 'poll-1', voterId: '6283@c.us', selectedOptions: [] }); // unvote
+
+    const pollRes = f.db.getPollResults({ pollMessageId: 'poll-1', chatId: 'grp1@g.us', scope: 'group' });
+    assert.equal(pollRes.found, true);
+    assert.equal(pollRes.totalVoters, 2);
+    assert.equal(pollRes.tally.find((t) => t.option === 'Malam ini').votes, 1);
+    assert.equal(pollRes.tally.find((t) => t.option === 'Besok pagi').votes, 1);
+
+    const forbidden = f.db.getPollResults({ pollMessageId: 'poll-1', chatId: 'other@g.us', scope: 'group' });
+    assert.equal(forbidden.found, false);
+    assert.equal(forbidden.reason, 'cross_chat_forbidden');
+    assert.equal(f.db.listPolls({ chatId: 'grp1@g.us', scope: 'group' }).length, 1);
+
+    // 3. Recurring reminders + app settings + briefing data + detailed approvals
+    const dueNow = new Date(Date.now() - 1000).toISOString();
+    const remId = f.db.createReminder({
+      chatId: 'owner@c.us',
+      requesterId: 'owner@c.us',
+      message: 'Cek backup',
+      dueAt: dueNow,
+      recurrence: 'daily'
+    });
+    const claimed = f.db.claimDueReminders(new Date().toISOString());
+    assert.equal(claimed.length, 1);
+    assert.equal(claimed[0].recurrence, 'daily');
+    const nextDue = new Date(Date.now() + 86400000).toISOString();
+    assert.equal(f.db.rescheduleRecurringReminder(remId, nextDue), true);
+    const listedRem = f.db.listReminders({ chatId: 'owner@c.us', requesterId: 'owner@c.us' });
+    assert.equal(listedRem[0].recurrence, 'daily');
+    assert.equal(listedRem[0].due_at, nextDue);
+
+    f.db.setAppSetting('daily_briefing_last_date', '2026-11-23');
+    assert.equal(f.db.getAppSetting('daily_briefing_last_date'), '2026-11-23');
+
+    f.db.createUserTask({
+      id: '11111111-1111-4111-8111-111111111111',
+      scope: 'personal',
+      ownerId: 'owner@c.us',
+      title: 'Fix kritikal',
+      priority: 'urgent'
+    });
+    f.db.createReminder({
+      chatId: 'owner@c.us',
+      requesterId: 'owner@c.us',
+      message: 'Standup pagi',
+      dueAt: new Date(Date.now() + 3600000).toISOString()
+    });
+    const briefing = f.db.getDailyBriefingData({ ownerId: 'owner@c.us', chatId: 'owner@c.us' });
+    assert.equal(briefing.tasks.length, 1);
+    assert.equal(briefing.reminders.length, 2);
+    assert.equal(briefing.reminders[0].message, 'Standup pagi');
+
+    f.db.createApproval({
+      id: 'ap-det-1',
+      chatId: 'owner@c.us',
+      requesterId: 'owner@c.us',
+      toolName: 'send_whatsapp_message',
+      arguments: { targetId: '62899@c.us', message: 'Halo partner' },
+      expiresAt: new Date(Date.now() + 60000).toISOString()
+    });
+    const detailed = f.db.listPendingApprovalsDetailed('owner@c.us');
+    assert.equal(detailed.length, 1);
+    assert.equal(detailed[0].arguments.targetId, '62899@c.us');
+  } finally { f.close(); }
+});

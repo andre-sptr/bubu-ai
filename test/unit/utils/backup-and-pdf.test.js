@@ -7,8 +7,10 @@ const Database = require('better-sqlite3');
 
 const { runBackup, pruneOldBackups, verifySqliteIntegrity } = require('../../../scripts/backup');
 const {
+  escapePdfString,
   splitOversizedToken,
   wrapTextToWidth,
+  wrapCellLines,
   buildPdf14Buffer
 } = require('../../../src/documents/generators/pdf-generator');
 
@@ -183,4 +185,56 @@ test('buildPdf14Buffer wraps multi-line Markdown table cells with dynamic row he
   assert.match(pdfText, /financial-audit-/);
   // Spilled cleanly across multiple pages
   assert.match(pdfText, /Halaman 1 dari [2-9]/);
+});
+
+test('Stage 2: runBackup excludes storage/inbound and *.tmp files while preserving storage/generated', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage2-backup-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const sourcePath = path.join(root, 'data', 'bubu.sqlite');
+  const storageDir = path.join(root, 'storage');
+  const backupDir = path.join(root, 'backups');
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  fs.mkdirSync(path.join(storageDir, 'generated'), { recursive: true });
+  fs.mkdirSync(path.join(storageDir, 'inbound', 'ff'), { recursive: true });
+  fs.writeFileSync(path.join(storageDir, 'generated', 'report.pdf'), 'keep-doc');
+  fs.writeFileSync(path.join(storageDir, 'generated', 'draft.pdf.tmp'), 'skip-tmp');
+  fs.writeFileSync(path.join(storageDir, 'inbound', 'ff', 'video.mp4'), 'skip-inbound');
+
+  const db = new Database(sourcePath);
+  db.exec('CREATE TABLE t (x INTEGER);');
+  db.close();
+
+  const res = await runBackup({ sourcePath, backupDir, storageDir, keepCount: 2, logger: { info: () => {} } });
+  assert.equal(fs.existsSync(path.join(res.storageBackup, 'generated', 'report.pdf')), true);
+  assert.equal(fs.existsSync(path.join(res.storageBackup, 'draft.pdf.tmp')), false);
+  assert.equal(fs.existsSync(path.join(res.storageBackup, 'inbound')), false);
+});
+
+test('Stage 3: pdf-generator transliterates Unicode symbols, marks truncated cells with ellipsis, and repeats table header across pages', () => {
+  const escaped = escapePdfString('Status: ✓ Lulus | ✗ Gagal | Target → 100% | ≥ €50 ± 5° ™');
+  assert.equal(escaped.includes('[v]'), true);
+  assert.equal(escaped.includes('[x]'), true);
+  assert.equal(escaped.includes('->'), true);
+  assert.equal(escaped.includes('>='), true);
+  assert.equal(escaped.includes('EUR50'), true);
+  assert.equal(escaped.includes('+/- 5 deg'), true);
+  assert.equal(escaped.includes('\\(TM\\)'), true);
+
+  const clipped = wrapCellLines('Baris satu dua tiga empat lima enam tujuh delapan sembilan sepuluh sebelas dua belas', 15, 2);
+  assert.equal(clipped.length, 2);
+  assert.equal(clipped[1].endsWith('...'), true);
+
+  const manyRows = Array.from({ length: 40 }, (_, idx) => `| Row-${idx + 1} | Keterangan tabel panjang baris ${idx + 1} | OK |`);
+  const multiPagePdf = buildPdf14Buffer({
+    title: 'Tabel Multi Halaman',
+    content: [
+      '| HeaderKolomUnik | DeskripsiItem | Status |',
+      '|---|---|---|',
+      ...manyRows
+    ].join('\n')
+  }).toString('latin1');
+
+  const headerOccurrences = multiPagePdf.match(/\(HeaderKolomUnik\)/g) || [];
+  assert.ok(headerOccurrences.length >= 2, `Expected repeated table header on page break, saw ${headerOccurrences.length}`);
 });

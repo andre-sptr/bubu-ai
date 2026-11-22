@@ -4,6 +4,8 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { runCommand } = require('../utils/process-runner');
+const { UserValidationError } = require('../utils/error-policy');
+const { AsyncSemaphore } = require('../utils/semaphore');
 const {
   safeFilename,
   sanitizeAxiosError,
@@ -55,6 +57,8 @@ class MediaIntelligenceService {
     whisperVadModelPath = '',
     piperBin = 'piper',
     piperModelPath = '',
+    mediaLockTimeoutMs = 90000,
+    videoFrameOcrWithVision = false,
     httpClient = null,
     commandRunner = runCommand,
     logger
@@ -63,22 +67,34 @@ class MediaIntelligenceService {
       wahaConfig, storageDir, maxFileBytes, visionEnabled, maxVisionBytes, maxVisionDimension,
       maxAudioSeconds, maxVideoSeconds, maxVideoFrames,
       tesseractBin, ffmpegBin, ffprobeBin, whisperBin, whisperModelPath, whisperLanguage, whisperVadModelPath,
-      piperBin, piperModelPath, httpClient, commandRunner, logger
+      piperBin, piperModelPath, videoFrameOcrWithVision, httpClient, commandRunner, logger
     });
     this.audioBusy = false;
     this.videoBusy = false;
+    this.audioSemaphore = new AsyncSemaphore({
+      concurrency: 1,
+      maxQueue: 8,
+      acquireTimeoutMs: mediaLockTimeoutMs,
+      busyMessage: 'Audio processing sedang sibuk. Silakan coba kembali beberapa saat lagi.'
+    });
+    this.videoSemaphore = new AsyncSemaphore({
+      concurrency: 1,
+      maxQueue: 4,
+      acquireTimeoutMs: mediaLockTimeoutMs,
+      busyMessage: 'Video processing sedang sibuk. Silakan coba kembali beberapa saat lagi.'
+    });
     fs.mkdirSync(storageDir, { recursive: true, mode: 0o700 });
   }
 
   async download(media) {
-    if (!media?.url) throw new Error('WAHA tidak menyediakan media.url. Aktifkan media download pada WAHA.');
+    if (!media?.url) throw new UserValidationError('WAHA tidak menyediakan media.url. Aktifkan media download pada WAHA.');
 
     const url = normalizeMediaUrl(media.url, this.wahaConfig.baseUrl);
     const rawFilename = media.filename || media.fileName || path.basename(url.pathname);
     let filename = safeFilename(rawFilename || 'whatsapp-media', 'whatsapp-media');
     const kind = detectMediaKind(filename, media.mimetype);
     if (!['image', 'audio', 'video'].includes(kind)) {
-      throw new Error('Media bukan gambar, audio, atau video yang didukung.');
+      throw new UserValidationError('Media bukan gambar, audio, atau video yang didukung.');
     }
 
     const ext = resolveMediaExtension(filename, media.mimetype, kind);
@@ -101,12 +117,12 @@ class MediaIntelligenceService {
     }
 
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Unduhan media ditolak dengan HTTP ${response.status}. Redirect tidak diikuti.`);
+      throw new UserValidationError(`Unduhan media ditolak dengan HTTP ${response.status}. Redirect tidak diikuti.`);
     }
 
     const contentLength = Number(response.headers?.['content-length']);
     if (Number.isFinite(contentLength) && contentLength > this.maxFileBytes) {
-      throw new Error('Ukuran media melewati batas sebelum file disimpan.');
+      throw new UserValidationError('Ukuran media melewati batas sebelum file disimpan.');
     }
 
     const responseMime = response.headers?.['content-type'] || '';
@@ -119,10 +135,10 @@ class MediaIntelligenceService {
 
     const buffer = Buffer.from(response.data);
     if (!buffer.length || buffer.length > this.maxFileBytes) {
-      throw new Error('Ukuran media kosong atau melewati batas.');
+      throw new UserValidationError('Ukuran media kosong atau melewati batas.');
     }
     if (!validateMediaSignature(buffer, ext, kind)) {
-      throw new Error('Signature file tidak cocok dengan tipe media yang dikirim.');
+      throw new UserValidationError('Signature file tidak cocok dengan tipe media yang dikirim.');
     }
 
     const id = crypto.randomUUID();
@@ -161,7 +177,7 @@ class MediaIntelligenceService {
     return result.stdout.trim();
   }
 
-  async transcribeAudio(filePath, workDir) {
+  async transcribeAudio(filePath, workDir, { skipConvert = false } = {}) {
     if (!this.whisperModelPath) {
       throw new Error('Transkripsi suara belum aktif. Isi WHISPER_MODEL_PATH pada .env.');
     }
@@ -175,16 +191,19 @@ class MediaIntelligenceService {
       throw new Error('Silero VAD model tidak ditemukan pada WHISPER_VAD_MODEL_PATH.');
     }
 
-    const duration = await this.getDuration(filePath).catch(() => null);
-    if (duration && duration > this.maxAudioSeconds) {
-      throw new Error(`Audio berdurasi ${Math.ceil(duration)} detik. Batas P3 adalah ${this.maxAudioSeconds} detik.`);
-    }
+    let wavPath = filePath;
+    if (!skipConvert) {
+      const duration = await this.getDuration(filePath).catch(() => null);
+      if (duration && duration > this.maxAudioSeconds) {
+        throw new UserValidationError(`Audio berdurasi ${Math.ceil(duration)} detik. Batas P3 adalah ${this.maxAudioSeconds} detik.`);
+      }
 
-    const wavPath = path.join(workDir, 'audio-16khz.wav');
-    await this.commandRunner(this.ffmpegBin, [
-      '-nostdin', '-y', '-i', filePath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
-      '-t', String(this.maxAudioSeconds), wavPath
-    ], { timeoutMs: 90000, maxOutput: 100000 });
+      wavPath = path.join(workDir, 'audio-16khz.wav');
+      await this.commandRunner(this.ffmpegBin, [
+        '-nostdin', '-y', '-i', filePath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
+        '-t', String(this.maxAudioSeconds), wavPath
+      ], { timeoutMs: 90000, maxOutput: 100000 });
+    }
 
     const args = [
       '-m', this.whisperModelPath,
@@ -222,7 +241,7 @@ class MediaIntelligenceService {
       await this.commandRunner(this.ffmpegBin, [
         '-nostdin', '-y', '-i', filePath,
         '-frames:v', '1',
-        '-vf', `scale='min(${this.maxVisionDimension},iw)':-2`,
+        '-vf', `scale='min(${this.maxVisionDimension},iw)':'min(${this.maxVisionDimension},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`,
         '-q:v', '4',
         outPath
       ], { timeoutMs: 45000, maxOutput: 100000 });
@@ -338,7 +357,7 @@ class MediaIntelligenceService {
     const durationSeconds = duration !== null ? Number(duration.toFixed(2)) : null;
 
     if (durationSeconds && durationSeconds > this.maxVideoSeconds) {
-      throw new Error(`Video berdurasi ${Math.ceil(durationSeconds)} detik. Batas P3 adalah ${this.maxVideoSeconds} detik.`);
+      throw new UserValidationError(`Video berdurasi ${Math.ceil(durationSeconds)} detik. Batas P3 adalah ${this.maxVideoSeconds} detik.`);
     }
 
     const framesDir = path.join(workDir, 'frames');
@@ -360,8 +379,6 @@ class MediaIntelligenceService {
       const timestampSeconds = Number((i * interval).toFixed(2));
       const timestampLabel = formatTimestampSeconds(timestampSeconds);
       const framePath = path.join(framesDir, frameFiles[i]);
-      const text = await this.ocrImage(framePath).catch((error) => `[OCR error: ${error.message}]`);
-      if (text) frameTexts.push(`Frame ${frameIndex} [t=${timestampLabel}]:\n${text}`);
 
       let visualImage = null;
       if (this.visionEnabled) {
@@ -388,6 +405,12 @@ class MediaIntelligenceService {
         }
       }
 
+      const shouldRunFrameOcr = !visualImage || this.videoFrameOcrWithVision === true;
+      const text = shouldRunFrameOcr
+        ? await this.ocrImage(framePath).catch((error) => `[OCR error: ${error.message}]`)
+        : '';
+      if (text) frameTexts.push(`Frame ${frameIndex} [t=${timestampLabel}]:\n${text}`);
+
       frames.push({
         index: frameIndex,
         filename: frameFiles[i],
@@ -402,29 +425,38 @@ class MediaIntelligenceService {
     const audioPath = path.join(workDir, 'video-audio.wav');
     if (this.whisperModelPath && this.whisperVadModelPath &&
         fs.existsSync(this.whisperModelPath) && fs.existsSync(this.whisperVadModelPath)) {
-      let acquiredAudioLock = false;
+      let releaseSoundtrackAudio = null;
+      let canRunAudio = audioLockOwned;
       if (!audioLockOwned) {
-        if (this.audioBusy) {
+        if (this.audioBusy && this.audioSemaphore.activeCount === 0) {
           this.logger?.warn?.('Audio processor busy; skipping video soundtrack transcription');
         } else {
-          this.audioBusy = true;
-          acquiredAudioLock = true;
+          try {
+            releaseSoundtrackAudio = await this.audioSemaphore.acquire();
+            this.audioBusy = true;
+            canRunAudio = true;
+          } catch {
+            this.logger?.warn?.('Audio processor busy; skipping video soundtrack transcription');
+          }
         }
       }
-      if (audioLockOwned || acquiredAudioLock) {
+      if (canRunAudio) {
         try {
           await this.commandRunner(this.ffmpegBin, [
             '-nostdin', '-y', '-i', file.filePath, '-vn', '-t', String(this.maxVideoSeconds),
             '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', audioPath
           ], { timeoutMs: 90000, maxOutput: 100000 }).catch(() => null);
           if (fs.existsSync(audioPath)) {
-            transcript = await this.transcribeAudio(audioPath, workDir).catch((error) => {
+            transcript = await this.transcribeAudio(audioPath, workDir, { skipConvert: true }).catch((error) => {
               this.logger?.warn({ error: error.message }, 'Video audio transcription failed');
               return '';
             });
           }
         } finally {
-          if (acquiredAudioLock) this.audioBusy = false;
+          if (releaseSoundtrackAudio) {
+            this.audioBusy = false;
+            releaseSoundtrackAudio();
+          }
         }
       }
     }
@@ -476,22 +508,57 @@ class MediaIntelligenceService {
   }
 
   async processIncoming({ media }) {
-    const file = await this.download(media);
+    if (!media?.url) {
+      throw new UserValidationError('WAHA tidak menyediakan media.url. Aktifkan media download pada WAHA.');
+    }
+
+    let preliminaryName = media.filename || media.fileName || '';
+    if (!preliminaryName) {
+      try {
+        preliminaryName = path.basename(normalizeMediaUrl(media.url, this.wahaConfig.baseUrl).pathname);
+      } catch {
+        preliminaryName = '';
+      }
+    }
+    const preliminaryKind = detectMediaKind(preliminaryName, media.mimetype);
+    const wantsVideo = preliminaryKind === 'video';
+    const wantsAudio = preliminaryKind === 'audio' || (wantsVideo && Boolean(this.whisperModelPath));
+
+    let releaseVideo = null;
+    let releaseAudio = null;
+    let ownsVideoFlag = false;
+    let ownsAudioFlag = false;
+
+    const acquireLocks = async (needVideo, needAudio) => {
+      if (needVideo && !releaseVideo) {
+        if (this.videoBusy && this.videoSemaphore.activeCount === 0) {
+          throw new Error('Video processing sedang sibuk. Silakan coba kembali beberapa saat lagi.');
+        }
+        releaseVideo = await this.videoSemaphore.acquire();
+        this.videoBusy = true;
+        ownsVideoFlag = true;
+      }
+      if (needAudio && !releaseAudio) {
+        if (this.audioBusy && this.audioSemaphore.activeCount === 0) {
+          throw new Error(needVideo
+            ? 'Video processing sedang sibuk. Silakan coba kembali beberapa saat lagi.'
+            : 'Audio processing sedang sibuk. Silakan coba kembali beberapa saat lagi.');
+        }
+        releaseAudio = await this.audioSemaphore.acquire();
+        this.audioBusy = true;
+        ownsAudioFlag = true;
+      }
+    };
+
+    let file = null;
     let workDir = null;
-    const isAudio = file.kind === 'audio';
-    const isVideo = file.kind === 'video';
-    if (isAudio && this.audioBusy) {
-      await cleanupInboundFile(file.filePath, this.storageDir);
-      throw new Error('Audio processing sedang sibuk. Silakan coba kembali beberapa saat lagi.');
-    }
-    if (isVideo && (this.videoBusy || (this.whisperModelPath && this.audioBusy))) {
-      await cleanupInboundFile(file.filePath, this.storageDir);
-      throw new Error('Video processing sedang sibuk. Silakan coba kembali beberapa saat lagi.');
-    }
-    const locksAudio = isAudio || (isVideo && Boolean(this.whisperModelPath));
-    if (locksAudio) this.audioBusy = true;
-    if (isVideo) this.videoBusy = true;
     try {
+      await acquireLocks(wantsVideo, wantsAudio);
+      file = await this.download(media);
+      const isAudio = file.kind === 'audio';
+      const isVideo = file.kind === 'video';
+      await acquireLocks(isVideo, isAudio || (isVideo && Boolean(this.whisperModelPath)));
+
       workDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'bubu-p3-'));
       let result;
       if (file.kind === 'image') result = await this.processImage(file, workDir);
@@ -499,15 +566,17 @@ class MediaIntelligenceService {
       else if (file.kind === 'video') {
         result = await this.processVideo(file, workDir, {
           declaredDurationSeconds: media?.durationSeconds ?? media?.duration,
-          audioLockOwned: locksAudio
+          audioLockOwned: ownsAudioFlag
         });
       }
       return { ...result, mediaId: file.id, fileSize: file.fileSize };
     } finally {
       if (workDir) await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
-      await cleanupInboundFile(file.filePath, this.storageDir);
-      if (locksAudio) this.audioBusy = false;
-      if (isVideo) this.videoBusy = false;
+      if (file?.filePath) await cleanupInboundFile(file.filePath, this.storageDir);
+      if (ownsAudioFlag) this.audioBusy = false;
+      if (ownsVideoFlag) this.videoBusy = false;
+      releaseAudio?.();
+      releaseVideo?.();
     }
   }
 
@@ -520,10 +589,11 @@ class MediaIntelligenceService {
     if (!cleanText) {
       throw new Error('Teks respons suara tidak boleh kosong.');
     }
+    const spokenText = sanitizeTextForSpeech(cleanText) || 'Berikut hasil yang sudah disiapkan pada teks.';
     const wavPath = path.join(workDir, 'reply.wav');
     const oggPath = path.join(workDir, 'reply.ogg');
     await this.commandRunner(this.piperBin, ['--model', this.piperModelPath, '--output_file', wavPath], {
-      input: cleanText.slice(0, 5000), timeoutMs: 90000, maxOutput: 100000
+      input: spokenText, timeoutMs: 90000, maxOutput: 100000
     });
     await this.commandRunner(this.ffmpegBin, [
       '-nostdin', '-y', '-i', wavPath, '-c:a', 'libopus', '-b:a', '32k', '-ar', '48000', '-ac', '1', oggPath
@@ -546,8 +616,35 @@ class MediaIntelligenceService {
   }
 }
 
+function sanitizeTextForSpeech(text) {
+  const raw = String(text ?? '').replace(/\r\n?/g, '\n').trim();
+  if (!raw) return '';
+  let out = raw
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/!?\[([^\]]*)\]\((https?:\/\/[^\s)]+)(?:\s+["'][^)]*["'])?\)/g, (_m, label) => label || 'tautan terlampir')
+    .replace(/https?:\/\/\S+/gi, 'tautan terlampir')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/^[ \t]*#{1,6}[ \t]+/gm, '')
+    .replace(/^[ \t]*>[ \t]?/gm, '')
+    .replace(/^[ \t]*(?:-{3,}|\*{3,}|_{3,}|━{3,})[ \t]*$/gm, '')
+    .replace(/^[ \t]*[-*•+][ \t]+/gm, '')
+    .replace(/\*\*\*([^*\n]+)\*\*\*/g, '$1')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/__([^_\n]+)__/g, '$1')
+    .replace(/~~([^~\n]+)~~/g, '$1')
+    .replace(/(?<![\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])/g, '$1')
+    .replace(/(?<![\w_])_(?=\S)([^_\n]*?\S)_(?![\w_])/g, '$1');
+  out = out
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n+ */g, '. ')
+    .replace(/\.\s*\./g, '.')
+    .trim();
+  return out.slice(0, 5000);
+}
+
 module.exports = {
   MediaIntelligenceService,
+  sanitizeTextForSpeech,
   detectMediaKind,
   extensionFromMime,
   resolveMediaExtension,

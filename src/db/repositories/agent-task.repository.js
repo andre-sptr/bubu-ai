@@ -132,6 +132,32 @@ const agentTaskRepository = {
     `).all(chatId, now);
   },
 
+  listPendingApprovalsDetailed(chatId) {
+    const now = new Date().toISOString();
+    return this.db.prepare(`
+      SELECT id, task_id, tool_name, arguments_json, expires_at, created_at
+      FROM approvals
+      WHERE chat_id=? AND status='pending' AND expires_at>?
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).all(chatId, now).map((row) => {
+      let args = {};
+      try {
+        args = JSON.parse(row.arguments_json || '{}');
+      } catch {
+        args = {};
+      }
+      return {
+        id: row.id,
+        task_id: row.task_id,
+        tool_name: row.tool_name,
+        arguments: args,
+        expires_at: row.expires_at,
+        created_at: row.created_at
+      };
+    });
+  },
+
   claimApproval(id, ownerId, configuredOwnerId) {
     if (ownerId !== configuredOwnerId) return null;
     const now = new Date().toISOString();

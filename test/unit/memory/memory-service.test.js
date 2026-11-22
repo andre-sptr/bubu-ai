@@ -231,3 +231,76 @@ test('captureFromTurn extracts JSON from prose and forwards valid workspace supe
   assert.equal(remembered[0].superseded, 7);
   assert.equal(remembered[1].superseded, null);
 });
+
+test('Stage 1: captureFromTurn supplies existing workspace memories, passes AbortSignal, and logs model_usage', async () => {
+  const usageLogs = [];
+  let seenMessages = null;
+  let seenSignal = null;
+  const db = {
+    hasMemoryExtraction: () => false,
+    recordMemoryExtraction: () => {},
+    searchMemories: () => [{ id: 12, title: 'Drink', content: 'Suka kopi hitam', memory_type: 'preference' }],
+    listMemories: () => [],
+    getMemory: ({ id }) => (id === 12 ? { id: 12 } : null),
+    supersedeMemory: (args) => ({ oldId: args.oldId, newId: 13 }),
+    logModelUsage: (entry) => usageLogs.push(entry)
+  };
+  const service = new MemoryService({
+    db,
+    provider: {
+      embed: async () => [1, 0],
+      chat: async ({ messages, signal }) => {
+        seenMessages = messages;
+        seenSignal = signal;
+        return {
+          model: 'fast-m',
+          usage: { prompt_tokens: 50, completion_tokens: 20 },
+          message: {
+            content: JSON.stringify({
+              memories: [{ title: 'Drink', content: 'Sekarang suka teh', memoryType: 'preference', importance: 4, supersedesId: 12 }]
+            })
+          }
+        };
+      }
+    },
+    router: { select: () => ({ tier: 'fast', model: 'fast-m' }) },
+    logger: { warn: () => {} }
+  });
+
+  const okRes = await service.captureFromTurn({
+    scope: 'personal',
+    ownerId: 'owner',
+    userText: 'Ingat mulai sekarang saya minum teh saja',
+    assistantText: 'Dicatat!',
+    sourceEventId: 'evt-sup-stage1'
+  });
+  assert.equal(okRes.captured, 1);
+  assert.ok(seenSignal instanceof AbortSignal);
+  assert.match(seenMessages[0].content, /"supersedesId"/);
+  assert.match(seenMessages[1].content, /Existing workspace memories:/);
+  assert.match(seenMessages[1].content, /Suka kopi hitam/);
+  assert.equal(usageLogs.length, 1);
+  assert.equal(usageLogs[0].outcome, 'success');
+
+  const errService = new MemoryService({
+    db: {
+      hasMemoryExtraction: () => false,
+      recordMemoryExtraction: () => {},
+      searchMemories: () => [],
+      listMemories: () => [],
+      logModelUsage: (entry) => usageLogs.push(entry)
+    },
+    provider: { chat: async () => { throw new Error('provider down'); } },
+    router: { select: () => ({ tier: 'fast', model: 'fast-m' }) },
+    logger: { warn: () => {} }
+  });
+  await errService.captureFromTurn({
+    scope: 'personal',
+    ownerId: 'owner',
+    userText: 'Ingat catatan penting ini',
+    assistantText: 'OK',
+    sourceEventId: 'evt-err-stage1'
+  });
+  assert.equal(usageLogs.length, 2);
+  assert.equal(usageLogs[1].outcome, 'error');
+});

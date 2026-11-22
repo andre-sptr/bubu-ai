@@ -256,3 +256,70 @@ test('ApprovalManager formats prompts, validates arguments, and sends approved p
   });
   assert.equal(deliveries.length, 3);
 });
+
+test('Stage 3: /approvals lists active items and /approve or /deny works without ID when exactly one pending approval exists', async () => {
+  const { handleSlashCommand, RECOGNIZED_SLASH_COMMANDS } = require('../../../src/agent/command-handler');
+  assert.equal(RECOGNIZED_SLASH_COMMANDS.has('/approvals'), true);
+
+  const sent = [];
+  const resolved = [];
+  let pending = [
+    {
+      id: 'solo1234',
+      tool_name: 'send_whatsapp_message',
+      arguments: { targetId: '628222@c.us', message: 'Halo tim' },
+      expires_at: new Date(Date.now() + 180000).toISOString()
+    }
+  ];
+  const processor = {
+    config: { ownerJid: '6281@c.us', appTimezone: 'Asia/Jakarta' },
+    responseHandler: { sendText: async (text, chatId) => sent.push({ text, chatId }) },
+    approvalManager: {
+      resolve: async (req) => {
+        resolved.push(req);
+        pending = pending.filter((p) => p.id !== req.id);
+        return { ok: true, sent: req.approved };
+      }
+    },
+    db: {
+      listPendingApprovalsDetailed: () => pending,
+      addMessage: () => true
+    }
+  };
+
+  // /approvals lists the single pending approval
+  await handleSlashCommand(processor, {
+    text: '/approvals', msg: { chatId: '6281@c.us' }, senderId: '6281@c.us', owner: true, isGroup: false, scope: 'personal', eventId: 'e1'
+  });
+  assert.match(sent[0].text, /Persetujuan Tertunda \(1\)/);
+  assert.match(sent[0].text, /solo1234/);
+  assert.match(sent[0].text, /628222@c\.us/);
+
+  // /approve without ID auto-resolves single active item
+  await handleSlashCommand(processor, {
+    text: '/approve', msg: { chatId: '6281@c.us' }, senderId: '6281@c.us', owner: true, isGroup: false, scope: 'personal', eventId: 'e2'
+  });
+  assert.deepEqual(resolved[0], { id: 'solo1234', actorId: '6281@c.us', approved: true });
+  assert.match(sent[1].text, /Persetujuan solo1234 berhasil/);
+
+  // Multiple pending -> lists options without executing
+  pending = [
+    { id: 'aa11', tool_name: 'send_whatsapp_message', arguments: { targetId: '6283@c.us', message: 'Satu' }, expires_at: new Date(Date.now() + 60000).toISOString() },
+    { id: 'bb22', tool_name: 'send_whatsapp_file', arguments: { targetId: '6284@c.us', filename: 'lap.pdf' }, expires_at: new Date(Date.now() + 60000).toISOString() }
+  ];
+  await handleSlashCommand(processor, {
+    text: '/deny', msg: { chatId: '6281@c.us' }, senderId: '6281@c.us', owner: true, isGroup: false, scope: 'personal', eventId: 'e3'
+  });
+  assert.equal(resolved.length, 1);
+  assert.match(sent[2].text, /Ada 2 persetujuan aktif/);
+  assert.match(sent[2].text, /aa11/);
+  assert.match(sent[2].text, /bb22/);
+
+  // Single pending -> /deny without ID denies it
+  pending = [pending[0]];
+  await handleSlashCommand(processor, {
+    text: '/deny', msg: { chatId: '6281@c.us' }, senderId: '6281@c.us', owner: true, isGroup: false, scope: 'personal', eventId: 'e4'
+  });
+  assert.deepEqual(resolved[1], { id: 'aa11', actorId: '6281@c.us', approved: false });
+  assert.match(sent[3].text, /dibatalkan/);
+});

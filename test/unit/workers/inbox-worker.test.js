@@ -368,3 +368,69 @@ test('createDeadLetterNotifier drops non-owner @lid and enforces groupPolicy on 
   assert.equal(resolveCalls, 1);
   assert.deepEqual(sent, [['Allowed group', '120363000000000000@g.us', 'text']]);
 });
+
+test('Stage 2: worker sends touchEventLock heartbeats, excludes in-flight events from stale sweeps, and cleans orphan storage', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage2-worker-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const { cleanupOrphanStorageFiles } = require('../../../src/utils/storage-cleanup');
+
+  // 1. Heartbeat + excludeEventIds
+  const touched = [];
+  const staleExcludeCalls = [];
+  let releaseJob;
+  const jobGate = new Promise((r) => { releaseJob = r; });
+
+  const worker = new InboxWorker({
+    db: {
+      claimNextEvent: () => ({ event_id: 'long-evt-1', chat_id: 'c@c.us', sender_id: 'c@c.us', payload: {}, attempts: 1 }),
+      touchEventLock: (id) => { touched.push(id); return true; },
+      recoverStaleEvents: (_ms, opts) => { staleExcludeCalls.push(opts?.excludeEventIds || []); return 0; },
+      finishEvent: () => {}
+    },
+    handler: async () => { await jobGate; },
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    maxConcurrentJobs: 2,
+    heartbeatIntervalMs: 15,
+    staleSweepIntervalMs: 0
+  });
+
+  const runPromise = worker.tick();
+  await new Promise((r) => setTimeout(r, 55));
+  worker.sweepStaleIfDue(Date.now() + 100);
+  releaseJob();
+  await runPromise;
+
+  assert.ok(touched.length >= 2);
+  assert.deepEqual(staleExcludeCalls[staleExcludeCalls.length - 1], ['long-evt-1']);
+
+  // 2. Storage cleanup deletes stale inbound & orphan files while keeping DB-referenced documents
+  const activeDir = path.join(root, 'aa');
+  const generatedDir = path.join(root, 'generated');
+  const inboundDir = path.join(root, 'inbound', 'bb');
+  fs.mkdirSync(activeDir, { recursive: true });
+  fs.mkdirSync(generatedDir, { recursive: true });
+  fs.mkdirSync(inboundDir, { recursive: true });
+
+  const keepFile = path.join(activeDir, 'keep.pdf');
+  const orphanFile = path.join(generatedDir, 'orphan.pdf');
+  const staleInboundFile = path.join(inboundDir, 'temp.mp4');
+  fs.writeFileSync(keepFile, 'keep');
+  fs.writeFileSync(orphanFile, 'orphan');
+  fs.writeFileSync(staleInboundFile, 'inbound');
+
+  const oldDate = new Date(Date.now() - 48 * 3600000);
+  for (const fp of [keepFile, orphanFile, staleInboundFile]) {
+    fs.utimesSync(fp, oldDate, oldDate);
+  }
+
+  const sweep = cleanupOrphanStorageFiles({
+    db: { listDocumentFilePaths: () => [keepFile] },
+    storageDir: root,
+    maxAgeMs: 24 * 3600000
+  });
+  assert.equal(sweep.removedInbound, 1);
+  assert.equal(sweep.removedOrphans, 1);
+  assert.equal(fs.existsSync(keepFile), true);
+  assert.equal(fs.existsSync(orphanFile), false);
+  assert.equal(fs.existsSync(staleInboundFile), false);
+});

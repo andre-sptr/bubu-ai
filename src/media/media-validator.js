@@ -1,5 +1,6 @@
 const path = require('node:path');
 const { normalizeMimeType, isGenericMime } = require('../utils/media-http');
+const { UserValidationError } = require('../utils/error-policy');
 
 const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff']);
 const AUDIO_EXT = new Set(['.ogg', '.oga', '.opus', '.mp3', '.m4a', '.aac', '.wav', '.flac', '.amr', '.webm']);
@@ -100,16 +101,16 @@ function resolveMediaExtension(filename, mimetype, kind) {
   if (!ext || GENERIC_EXTENSIONS.has(ext)) {
     ext = mapped;
   } else if (!EXTENSION_MIMES[ext]) {
-    throw new Error('Ekstensi file media tidak didukung.');
+    throw new UserValidationError('Ekstensi file media tidak didukung.');
   }
 
   if (!ext || !EXTENSION_MIMES[ext]) {
-    throw new Error('Ekstensi media tidak dapat ditentukan dari MIME type.');
+    throw new UserValidationError('Ekstensi media tidak dapat ditentukan dari MIME type.');
   }
 
   const allowedMimes = acceptedMimesForExtension(ext, kind);
   if (mime && !isGenericMime(mime) && !allowedMimes.includes(mime)) {
-    throw new Error(`MIME type ${mime} tidak sesuai dengan ekstensi ${ext}.`);
+    throw new UserValidationError(`MIME type ${mime} tidak sesuai dengan ekstensi ${ext}.`);
   }
 
   const extensionKind = ext === '.webm' ? kind :
@@ -118,7 +119,7 @@ function resolveMediaExtension(filename, mimetype, kind) {
     VIDEO_EXT.has(ext) ? 'video' : 'unsupported';
 
   if (extensionKind !== kind) {
-    throw new Error('Ekstensi file tidak sesuai dengan kategori media.');
+    throw new UserValidationError('Ekstensi file tidak sesuai dengan kategori media.');
   }
 
   return ext;

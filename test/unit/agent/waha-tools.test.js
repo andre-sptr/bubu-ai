@@ -732,3 +732,44 @@ test('Stage 2 Phase 4 tools (send_link_preview, edit_bot_message, delete_bot_mes
     untrusted: true
   });
 });
+
+test('Stage 1: edit_bot_message and delete_bot_message verify raw GOWS messageIds against db.isBotOutboundMessage', async () => {
+  const h = makeWahaHarness();
+  const recorded = new Set(['123@g.us:3EB0BOTMSG123']);
+  const tools = createWahaTools({
+    waha: h.waha,
+    responseHandler: h.responseHandler,
+    approvalManager: h.approvalManager,
+    db: {
+      isBotOutboundMessage: (chatId, msgId) => recorded.has(`${chatId}:${msgId}`)
+    }
+  });
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+
+  await assert.rejects(
+    () => byName.edit_bot_message.execute(
+      { messageId: '3EB0USERMSG999', text: 'Nope' },
+      { chatId: '123@g.us', scope: 'group' }
+    ),
+    (err) => err.deliveryStatus === 'failed' && /recorded in this chat/i.test(err.message)
+  );
+  await assert.rejects(
+    () => byName.delete_bot_message.execute(
+      { messageId: '3EB0USERMSG999' },
+      { chatId: '123@g.us', scope: 'group' }
+    ),
+    (err) => err.deliveryStatus === 'failed' && /recorded in this chat/i.test(err.message)
+  );
+
+  const editOk = await byName.edit_bot_message.execute(
+    { messageId: '3EB0BOTMSG123', text: 'Updated' },
+    { chatId: '123@g.us', scope: 'group' }
+  );
+  assert.equal(editOk.edited, true);
+
+  const deleteOk = await byName.delete_bot_message.execute(
+    { messageId: '3EB0BOTMSG123' },
+    { chatId: '123@g.us', scope: 'group' }
+  );
+  assert.equal(deleteOk.deleted, true);
+});

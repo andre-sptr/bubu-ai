@@ -1,4 +1,8 @@
+const http = require('node:http');
+const https = require('node:https');
+const axios = require('axios');
 const { sanitizeAxiosError } = require('../utils/media-http');
+const { STATIC_DYNAMIC_BOUNDARY } = require('../agent/prompt-builder');
 
 const ALLOWED_VISION_DATA_URL = /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=\r\n]+)$/i;
 const DEFAULT_MAX_VISION_BYTES = 10 * 1024 * 1024;
@@ -13,11 +17,16 @@ function validateImageDataUrl(url, maxBytes = DEFAULT_MAX_VISION_BYTES) {
   if (!match) {
     throw new Error('Unsupported visual payload format; only data:image/(jpeg|png|webp);base64 is permitted');
   }
-  const decoded = Buffer.from(match[2], 'base64');
-  if (!decoded.length || decoded.length > maxBytes) {
-    throw new Error(`Visual payload size (${decoded.length} bytes) is empty or exceeds limit (${maxBytes} bytes)`);
+  const b64 = match[2].replace(/[\r\n]+/g, '');
+  if (!b64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length % 4 === 1) {
+    throw new Error('Unsupported visual payload format; only data:image/(jpeg|png|webp);base64 is permitted');
   }
-  return `data:image/${match[1].toLowerCase() === 'jpg' ? 'jpeg' : match[1].toLowerCase()};base64,${decoded.toString('base64')}`;
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  const decodedLength = Math.floor((b64.length * 3) / 4) - padding;
+  if (!decodedLength || decodedLength <= 0 || decodedLength > maxBytes) {
+    throw new Error(`Visual payload size (${decodedLength} bytes) is empty or exceeds limit (${maxBytes} bytes)`);
+  }
+  return `data:image/${match[1].toLowerCase() === 'jpg' ? 'jpeg' : match[1].toLowerCase()};base64,${b64}`;
 }
 
 function sanitizeMessagesForProvider(messages, { maxImageBytes = DEFAULT_MAX_VISION_BYTES } = {}) {
@@ -41,16 +50,41 @@ function sanitizeMessagesForProvider(messages, { maxImageBytes = DEFAULT_MAX_VIS
 }
 
 class SumopodProvider {
-  constructor({ baseUrl, apiKey, timeoutMs = 60000, maxImageBytes = DEFAULT_MAX_VISION_BYTES, httpClient = null }) {
+  constructor({
+    baseUrl,
+    apiKey,
+    timeoutMs = 60000,
+    maxImageBytes = DEFAULT_MAX_VISION_BYTES,
+    promptCaching = false,
+    httpClient = null
+  }) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.apiKey = apiKey;
     this.timeoutMs = timeoutMs;
     this.maxImageBytes = maxImageBytes;
+    this.promptCaching = Boolean(promptCaching);
     this.httpClient = httpClient;
+    if (!httpClient) {
+      this.httpAgent = new http.Agent({ keepAlive: true });
+      this.httpsAgent = new https.Agent({ keepAlive: true });
+      this._axios = axios.create({
+        httpAgent: this.httpAgent,
+        httpsAgent: this.httpsAgent
+      });
+    } else {
+      this.httpAgent = null;
+      this.httpsAgent = null;
+      this._axios = null;
+    }
+  }
+
+  close() {
+    this.httpAgent?.destroy?.();
+    this.httpsAgent?.destroy?.();
   }
 
   client() {
-    return this.httpClient || require('axios');
+    return this.httpClient || this._axios;
   }
 
   headers() {
@@ -70,7 +104,7 @@ class SumopodProvider {
   }
 
 
-  async embed({ input, model = 'gemini/gemini-embedding-001', timeoutMs = 12000 }) {
+  async embed({ input, model = 'gemini/gemini-embedding-001', timeoutMs = 12000, signal = null }) {
     let response;
     try {
       response = await this.client().post(`${this.baseUrl}/embeddings`, {
@@ -78,7 +112,8 @@ class SumopodProvider {
         input: Array.isArray(input) ? input : [input]
       }, {
         headers: this.headers(),
-        timeout: timeoutMs
+        timeout: timeoutMs,
+        ...(signal ? { signal } : {})
       });
     } catch (error) {
       throw sanitizeAxiosError(error);
@@ -90,9 +125,29 @@ class SumopodProvider {
     return vector.map(Number);
   }
 
-  async chat({ model, messages, tools, temperature, maxTokens = 1800 }) {
+  async chat({ model, messages, tools, temperature, maxTokens = 1800, signal = null }) {
     if (!model) throw new Error('No model configured for selected task tier');
-    const safeMessages = sanitizeMessagesForProvider(messages, { maxImageBytes: this.maxImageBytes });
+    const safeMessages = sanitizeMessagesForProvider(messages, { maxImageBytes: this.maxImageBytes })
+      .map((msg) => {
+        if (msg?.role !== 'system' || typeof msg.content !== 'string' || !msg.content.includes(STATIC_DYNAMIC_BOUNDARY)) {
+          return msg;
+        }
+        const [staticPart, ...rest] = msg.content.split(STATIC_DYNAMIC_BOUNDARY);
+        const dynamicPart = rest.join('\n');
+        if (this.promptCaching && /^claude/i.test(model)) {
+          return {
+            ...msg,
+            content: [
+              { type: 'text', text: staticPart, cache_control: { type: 'ephemeral' } },
+              ...(dynamicPart ? [{ type: 'text', text: dynamicPart }] : [])
+            ]
+          };
+        }
+        return {
+          ...msg,
+          content: dynamicPart ? `${staticPart}\n${dynamicPart}` : staticPart
+        };
+      });
     const body = { model, messages: safeMessages, max_tokens: maxTokens };
     // Do not force temperature by default: newer Claude models use adaptive
     // thinking and may reject temperature/top_p parameters at the provider layer.
@@ -101,7 +156,9 @@ class SumopodProvider {
     let response;
     try {
       response = await this.client().post(`${this.baseUrl}/chat/completions`, body, {
-        headers: this.headers(), timeout: this.timeoutMs
+        headers: this.headers(),
+        timeout: this.timeoutMs,
+        ...(signal ? { signal } : {})
       });
     } catch (error) {
       throw sanitizeAxiosError(error);

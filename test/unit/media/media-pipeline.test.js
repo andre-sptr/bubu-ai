@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { MediaIntelligenceService, detectMediaKind, extensionFromMime, resolveMediaExtension, validateMediaSignature, runCommand } = require('../../../src/media/media-service');
+const { MediaIntelligenceService, sanitizeTextForSpeech, detectMediaKind, extensionFromMime, resolveMediaExtension, validateMediaSignature, runCommand } = require('../../../src/media/media-service');
 
 test('detects image, audio, video and documents using MIME precedence', () => {
   assert.equal(detectMediaKind('attachment.bin','image/jpeg'),'image');
@@ -452,4 +452,102 @@ test('validateMediaSignature avoids copying Buffer and handles Uint8Array inputs
     Buffer.from = origFrom;
   }
   assert.equal(validateMediaSignature(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), '.jpg', 'image'), true);
+});
+
+test('Stage 1: prepareVisualImage clamps both width and height, and sanitizeTextForSpeech cleans Markdown/URLs for Piper TTS', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage1-media-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const piperModel = path.join(dir, 'id.onnx');
+  fs.writeFileSync(piperModel, 'onnx-fixture');
+  const inputImg = path.join(dir, 'tall.jpg');
+  fs.writeFileSync(inputImg, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+
+  const commands = [];
+  const service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    maxVisionDimension: 1280,
+    piperModelPath: piperModel,
+    commandRunner: async (cmd, args, opts) => {
+      commands.push({ cmd, args, opts });
+      if (cmd === 'ffmpeg' && args.includes('libopus')) {
+        fs.writeFileSync(args[args.length - 1], 'OggS-audio');
+      }
+      if (cmd === 'ffmpeg' && args.includes('-vf')) {
+        fs.writeFileSync(args[args.length - 1], Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+      }
+      return { stdout: '', stderr: '' };
+    }
+  });
+
+  const vis = await service.prepareVisualImage(inputImg, dir);
+  assert.equal(vis.ok, true);
+  const vfArg = commands[0].args[commands[0].args.indexOf('-vf') + 1];
+  assert.match(vfArg, /min\(1280,iw\)/);
+  assert.match(vfArg, /min\(1280,ih\)/);
+  assert.match(vfArg, /force_original_aspect_ratio=decrease/);
+
+  const rawSpeech = '## Ringkasan\n**Penting:** cek [panduan](https://example.com/a) atau https://example.com/b.\n```js\nconst x = 1;\n```';
+  const cleaned = sanitizeTextForSpeech(rawSpeech);
+  assert.equal(cleaned.includes('https://'), false);
+  assert.equal(cleaned.includes('const x'), false);
+  assert.equal(cleaned.includes('**'), false);
+  assert.match(cleaned, /Ringkasan/);
+  assert.match(cleaned, /panduan/);
+  assert.match(cleaned, /tautan terlampir/);
+
+  await service.synthesizeSpeech(rawSpeech, dir);
+  const piperCall = commands.find((c) => c.cmd === 'piper');
+  assert.equal(piperCall.opts.input, cleaned);
+});
+
+test('Stage 2: concurrent processIncoming audio calls queue safely via AsyncSemaphore instead of failing busy', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-stage2-audio-sem-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const model = path.join(dir, 'ggml-base.bin');
+  const vad = path.join(dir, 'silero.bin');
+  fs.writeFileSync(model, 'model');
+  fs.writeFileSync(vad, 'vad');
+
+  let activeWhisper = 0;
+  let maxConcurrentWhisper = 0;
+  const service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    whisperModelPath: model,
+    whisperVadModelPath: vad,
+    httpClient: {
+      get: async () => ({
+        status: 200,
+        data: Buffer.from('OggS-audio-fixture'),
+        headers: { 'content-type': 'audio/ogg', 'content-length': '18' }
+      })
+    },
+    commandRunner: async (cmd, args) => {
+      if (cmd === 'ffprobe') return { stdout: '3.0' };
+      if (cmd === 'ffmpeg') {
+        fs.writeFileSync(args[args.length - 1], 'wav');
+        return { stdout: '' };
+      }
+      if (cmd === 'whisper-cli') {
+        activeWhisper++;
+        maxConcurrentWhisper = Math.max(maxConcurrentWhisper, activeWhisper);
+        await new Promise((r) => setTimeout(r, 30));
+        activeWhisper--;
+        return { stdout: 'Transkrip sukses' };
+      }
+      return { stdout: '' };
+    }
+  });
+
+  const [a, b] = await Promise.all([
+    service.processIncoming({ media: { url: '/api/files/a1.ogg', filename: 'a1.ogg', mimetype: 'audio/ogg' } }),
+    service.processIncoming({ media: { url: '/api/files/a2.ogg', filename: 'a2.ogg', mimetype: 'audio/ogg' } })
+  ]);
+
+  assert.equal(maxConcurrentWhisper, 1);
+  assert.equal(a.extractedText, 'Transkrip sukses');
+  assert.equal(b.extractedText, 'Transkrip sukses');
+  assert.equal(service.audioBusy, false);
 });

@@ -296,3 +296,52 @@ test('processor stops before Agent when audio VAD reports no speech', async () =
   assert.equal(f.calls.sent.length, 1);
   assert.match(f.calls.sent[0][0], /tidak mendeteksi ucapan/i);
 });
+
+test('Stage 1: typing keepalive stops before post-delivery memory capture runs', async () => {
+  const timeline = [];
+  const f = makeFixture();
+  f.processor.waha.createTypingKeepalive = () => ({
+    start: async () => timeline.push('typing:start'),
+    stop: async () => timeline.push('typing:stop')
+  });
+  f.processor.responseHandler.sendAssistantResponse = async () => {
+    timeline.push('send:assistant');
+    return { ok: true, messageId: 'wa-msg-order-1' };
+  };
+  f.processor.memoryService.captureFromTurn = async () => {
+    timeline.push('memory:capture');
+    return { captured: 0 };
+  };
+
+  await f.processor.process({
+    event: 'message',
+    payload: { id: 'order-evt-1', from: OWNER, author: OWNER, body: 'Ingat ini penting' }
+  });
+
+  assert.deepEqual(timeline, ['typing:start', 'send:assistant', 'typing:stop', 'memory:capture']);
+});
+
+test('Stage 2: greeting fast-path skips memoryService.retrieve and projectContext', async () => {
+  const f = makeFixture();
+  let retrieveCalls = 0;
+  let projectCalls = 0;
+  f.processor.memoryService.retrieve = async () => {
+    retrieveCalls++;
+    return [];
+  };
+  f.processor.memoryService.projectContext = async () => {
+    projectCalls++;
+    return [];
+  };
+
+  await f.processor.process({
+    event: 'message',
+    payload: { id: 'greet-evt-1', from: OWNER, author: OWNER, body: 'Halo Bubu' }
+  });
+
+  assert.equal(retrieveCalls, 0);
+  assert.equal(projectCalls, 0);
+  assert.equal(f.calls.agent.length, 1);
+  assert.deepEqual(f.calls.agent[0].memories, []);
+  assert.deepEqual(f.calls.agent[0].projects, []);
+});

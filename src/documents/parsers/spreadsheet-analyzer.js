@@ -80,7 +80,7 @@ function parseCsvText(rawText, { delimiter = 'auto' } = {}) {
   return { delimiter: delim, rows };
 }
 
-function parseSpreadsheetNumber(value) {
+function parseSpreadsheetNumber(value, { preferDotThousands = false } = {}) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   if (value === null || value === undefined) return null;
   let str = String(value).trim();
@@ -92,6 +92,7 @@ function parseSpreadsheetNumber(value) {
     negative = true;
     str = str.slice(1, -1).trim();
   }
+  const isIndonesianCurrency = /^(?:rp\.?|idr)\b|\b(?:idr|rp)$/i.test(str);
   // Strip common currency prefixes/suffixes and percent symbol
   str = str.replace(/^(?:rp\.?|idr|usd|\$|€|£)\s*/i, '').replace(/\s*(?:%|idr|rp)$/i, '').trim();
   if (!str || !/^[-+]?\d[\d.,]*$/.test(str)) return null;
@@ -133,8 +134,13 @@ function parseSpreadsheetNumber(value) {
     }
   } else if (dotCount === 1 && commaCount === 0) {
     const parts = str.split('.');
-    // In Indonesian finance tables, 150.000 or 25.000 with exactly 3 trailing zeros is thousands
-    if (parts[1].length === 3 && parts[0].length >= 1 && parts[0] !== '0' && parts[1] === '000') {
+    // Treat single dot + 3 digits as thousands when marked as Rp/IDR, column uses dot-thousands, or trailing .000
+    if (
+      parts[1].length === 3 &&
+      parts[0].length >= 1 &&
+      parts[0] !== '0' &&
+      (isIndonesianCurrency || preferDotThousands || parts[1] === '000')
+    ) {
       normalized = str.replace('.', '');
     }
   }
@@ -142,6 +148,21 @@ function parseSpreadsheetNumber(value) {
   const num = Number(normalized);
   if (!Number.isFinite(num)) return null;
   return negative ? -num : num;
+}
+
+function detectColumnUsesDotThousands(rows, colIdx) {
+  if (!Array.isArray(rows) || colIdx < 0) return false;
+  for (const row of rows) {
+    const val = String(row?.[colIdx] ?? '').trim();
+    if (!val) continue;
+    if (/^\(?(?:rp\.?|idr)\b|\b(?:idr|rp)\)?$/i.test(val)) {
+      return true;
+    }
+    if (/^[-+]?\(?(?:rp\.?\s*)?\d{1,3}(?:\.\d{3}){2,}(?:,\d+)?\)?$/i.test(val)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function parseSheetsFromExtractedText(extractedText) {
@@ -249,18 +270,20 @@ function analyzeSpreadsheetText(extractedText, {
   const maxCols = Math.max(rawHeaders.length, ...allRows.map((r) => r.length), 0);
   const headers = Array.from({ length: maxCols }, (_, idx) => String(rawHeaders[idx] || `Kolom_${idx + 1}`).trim() || `Kolom_${idx + 1}`);
   const dataRows = allRows.slice(1).map((r) => Array.from({ length: maxCols }, (_, idx) => String(r[idx] ?? '').trim()));
+  const colUsesDotThousands = headers.map((_, idx) => detectColumnUsesDotThousands(dataRows, idx));
 
   let filteredDataRows = dataRows;
   if (filterColumn && filterValue !== null && filterValue !== undefined && String(filterValue).trim() !== '') {
     const colIdx = resolveColumnIndex(headers, filterColumn);
     if (colIdx !== -1) {
+      const preferDotThousands = colUsesDotThousands[colIdx];
       const needle = String(filterValue).trim().toLowerCase();
-      const needleNum = parseSpreadsheetNumber(filterValue);
+      const needleNum = parseSpreadsheetNumber(filterValue, { preferDotThousands });
       filteredDataRows = dataRows.filter((row) => {
         const cell = String(row[colIdx] ?? '').trim();
         if (cell.toLowerCase() === needle || cell.toLowerCase().includes(needle)) return true;
         if (needleNum !== null) {
-          const cellNum = parseSpreadsheetNumber(cell);
+          const cellNum = parseSpreadsheetNumber(cell, { preferDotThousands });
           if (cellNum !== null && cellNum === needleNum) return true;
         }
         return false;
@@ -269,13 +292,14 @@ function analyzeSpreadsheetText(extractedText, {
   }
 
   const columns = headers.map((headerName, colIdx) => {
+    const preferDotThousands = colUsesDotThousands[colIdx];
     const nonEmpty = [];
     const numericValues = [];
     for (const row of filteredDataRows) {
       const val = String(row[colIdx] ?? '').trim();
       if (!val) continue;
       nonEmpty.push(val);
-      const parsedNum = parseSpreadsheetNumber(val);
+      const parsedNum = parseSpreadsheetNumber(val, { preferDotThousands });
       if (parsedNum !== null) numericValues.push(parsedNum);
     }
     let inferredType = 'empty';
@@ -299,6 +323,7 @@ function analyzeSpreadsheetText(extractedText, {
     const aggIdx = aggregateColumn
       ? resolveColumnIndex(headers, aggregateColumn)
       : columns.findIndex((c) => c.inferredType === 'numeric');
+    const aggDotThousands = aggIdx !== -1 ? colUsesDotThousands[aggIdx] : false;
     if (groupIdx !== -1) {
       const groups = new Map();
       for (const row of filteredDataRows) {
@@ -307,7 +332,7 @@ function analyzeSpreadsheetText(extractedText, {
         const entry = groups.get(key);
         entry.rowCount++;
         if (aggIdx !== -1) {
-          const num = parseSpreadsheetNumber(row[aggIdx]);
+          const num = parseSpreadsheetNumber(row[aggIdx], { preferDotThousands: aggDotThousands });
           if (num !== null) entry.values.push(num);
         }
       }
@@ -447,6 +472,7 @@ module.exports = {
   detectCsvDelimiter,
   parseCsvText,
   parseSpreadsheetNumber,
+  detectColumnUsesDotThousands,
   parseSheetsFromExtractedText,
   roundStat,
   computeNumericArrayStats,

@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { MIGRATIONS } = require('./migrations');
-const { cosineSimilarity } = require('../utils/vector');
+const { cosineSimilarity, encodeEmbeddingBlob } = require('../utils/vector');
 const { inboxRepository } = require('./repositories/inbox.repository');
 const { chatRepository } = require('./repositories/chat.repository');
 const { memoryRepository } = require('./repositories/memory.repository');
@@ -9,6 +9,7 @@ const { agentTaskRepository } = require('./repositories/agent-task.repository');
 const { productivityRepository } = require('./repositories/productivity.repository');
 const { documentRepository } = require('./repositories/document.repository');
 const { telemetryRepository } = require('./repositories/telemetry.repository');
+const { pollRepository } = require('./repositories/poll.repository');
 
 class DatabaseStore {
   constructor(databasePath) {
@@ -70,6 +71,152 @@ class DatabaseStore {
             this.db.exec('ALTER TABLE inbox_events ADD COLUMN priority INTEGER NOT NULL DEFAULT 5');
           }
         }
+        if (migration.version === 13) {
+          const tableExists = (tableName) => Boolean(
+            this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(tableName)
+          );
+          if (tableExists('messages')) {
+            const msgColumns = new Set(
+              this.db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name)
+            );
+            if (!msgColumns.has('wa_message_id')) {
+              this.db.exec('ALTER TABLE messages ADD COLUMN wa_message_id TEXT');
+            }
+            this.db.exec('CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(chat_id, wa_message_id) WHERE wa_message_id IS NOT NULL');
+          }
+          if (tableExists('model_usage')) {
+            this.db.exec('CREATE INDEX IF NOT EXISTS idx_model_usage_created ON model_usage(created_at)');
+          }
+          if (tableExists('audit_logs')) {
+            this.db.exec('CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at)');
+          }
+        }
+        if (migration.version === 14) {
+          const tableExists = (tableName) => Boolean(
+            this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(tableName)
+          );
+          if (tableExists('memories')) {
+            const memCols = new Set(
+              this.db.prepare('PRAGMA table_info(memories)').all().map((c) => c.name)
+            );
+            if (!memCols.has('embedding_blob')) {
+              this.db.exec('ALTER TABLE memories ADD COLUMN embedding_blob BLOB');
+            }
+            const legacyRows = this.db.prepare(
+              'SELECT id, embedding_json FROM memories WHERE embedding_json IS NOT NULL AND embedding_blob IS NULL'
+            ).all();
+            if (legacyRows.length > 0) {
+              const updateBlob = this.db.prepare(
+                'UPDATE memories SET embedding_blob=?, embedding_json=NULL WHERE id=?'
+              );
+              for (const row of legacyRows) {
+                try {
+                  const vec = JSON.parse(row.embedding_json);
+                  const blob = encodeEmbeddingBlob(vec);
+                  if (blob) updateBlob.run(blob, row.id);
+                } catch {
+                  // Preserve malformed rows without crashing migration.
+                }
+              }
+            }
+          }
+          if (tableExists('inbox_events')) {
+            const inboxCols = new Set(
+              this.db.prepare('PRAGMA table_info(inbox_events)').all().map((c) => c.name)
+            );
+            if (inboxCols.has('priority')) {
+              this.db.exec('DROP INDEX IF EXISTS idx_inbox_priority_ready');
+              this.db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_inbox_priority_ready
+                  ON inbox_events(status, priority ASC, created_at ASC, available_at);
+              `);
+            }
+          }
+          if (tableExists('documents')) {
+            this.db.exec(`
+              CREATE TABLE IF NOT EXISTS document_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                scope TEXT NOT NULL CHECK(scope IN ('personal','group')),
+                owner_id TEXT,
+                chat_id TEXT,
+                chunk_index INTEGER NOT NULL,
+                page_number INTEGER NOT NULL DEFAULT 1,
+                content TEXT NOT NULL,
+                embedding_blob BLOB,
+                created_at TEXT NOT NULL
+              );
+              CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_chunks_doc_idx
+                ON document_chunks(document_id, chunk_index);
+              CREATE INDEX IF NOT EXISTS idx_doc_chunks_scope
+                ON document_chunks(scope, owner_id, chat_id, document_id);
+            `);
+          }
+          if (tableExists('tasks')) {
+            this.db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at)');
+          }
+          if (tableExists('approvals')) {
+            this.db.exec('CREATE INDEX IF NOT EXISTS idx_approvals_status_updated ON approvals(status, updated_at)');
+          }
+          if (tableExists('tool_executions')) {
+            this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_executions_status_updated ON tool_executions(status, updated_at)');
+          }
+          if (tableExists('memory_extraction_runs')) {
+            this.db.exec('CREATE INDEX IF NOT EXISTS idx_memory_extraction_created ON memory_extraction_runs(created_at)');
+          }
+        }
+        if (migration.version === 15) {
+          const tableExists = (tableName) => Boolean(
+            this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(tableName)
+          );
+          if (tableExists('reminders')) {
+            const remCols = new Set(
+              this.db.prepare('PRAGMA table_info(reminders)').all().map((c) => c.name)
+            );
+            if (!remCols.has('recurrence')) {
+              this.db.exec('ALTER TABLE reminders ADD COLUMN recurrence TEXT');
+            }
+          }
+          this.db.exec(`
+            CREATE TABLE IF NOT EXISTS app_settings (
+              key TEXT PRIMARY KEY,
+              value_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS group_passive_messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              chat_id TEXT NOT NULL,
+              sender_id TEXT,
+              message_id TEXT,
+              content TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_group_passive_chat_id
+              ON group_passive_messages(chat_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_group_passive_created
+              ON group_passive_messages(created_at);
+            CREATE TABLE IF NOT EXISTS polls (
+              poll_message_id TEXT PRIMARY KEY,
+              chat_id TEXT NOT NULL,
+              scope TEXT NOT NULL CHECK(scope IN ('personal','group')),
+              question TEXT NOT NULL,
+              options_json TEXT NOT NULL,
+              multiple_answers INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_polls_chat
+              ON polls(chat_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS poll_votes (
+              poll_message_id TEXT NOT NULL,
+              voter_id TEXT NOT NULL,
+              selected_options_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(poll_message_id, voter_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_poll_votes_poll
+              ON poll_votes(poll_message_id, updated_at DESC);
+          `);
+        }
 
         this.db.exec(migration.sql);
         this.db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)')
@@ -80,7 +227,16 @@ class DatabaseStore {
     }
   }
 
-  close() { this.db.close(); }
+  close() {
+    try {
+      if (this.db?.open && !this.db.readonly) {
+        this.db.pragma('wal_checkpoint(TRUNCATE)');
+      }
+    } catch {
+      // Ignore checkpoint failures during shutdown/read-only close.
+    }
+    this.db.close();
+  }
 }
 
 Object.assign(
@@ -91,7 +247,8 @@ Object.assign(
   agentTaskRepository,
   productivityRepository,
   documentRepository,
-  telemetryRepository
+  telemetryRepository,
+  pollRepository
 );
 
 module.exports = { DatabaseStore, MIGRATIONS, cosineSimilarity };

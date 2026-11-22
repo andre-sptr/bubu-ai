@@ -218,22 +218,63 @@ class MemoryService {
       return { captured: 0, skipped: true };
     }
 
+    const started = Date.now();
+    let selected = null;
     try {
-      const selected = this.router.select('simple_question');
-      const response = await this.provider.chat({
-        model: selected.model,
-        maxTokens: 1000,
-        messages: [
-          {
-            role: 'system',
-            content: `Extract only durable information that the user explicitly states or clearly asks Bubu to remember. Do not infer sensitive personal attributes, passwords, secrets, or temporary details. ${scope === 'group' ? 'This is a shared group workspace: store only group decisions, shared project facts and group-relevant context. Never store an individual member personal preference, private detail or profile.' : 'This is the owner personal workspace: durable facts, preferences, goals and project context may be stored when explicitly stated or useful.'} Return ONLY valid JSON: {"memories":[{"title":"short title","content":"standalone fact","memoryType":"fact|preference|project|goal","importance":1}]}. If nothing durable, return {"memories":[]}.`
-          },
-          {
-            role: 'user',
-            content: `User message:\n${String(userText).slice(0, 4000)}\nAssistant response:\n${String(assistantText || '').slice(0, 2000)}`
-          }
-        ]
+      let existingRows = this.db.searchMemories?.({ scope, ownerId, chatId, query: userText, limit: 8 }) || [];
+      if (!existingRows.length && typeof this.db.listMemories === 'function') {
+        existingRows = this.db.listMemories({ scope, ownerId, chatId, status: 'active', limit: 8 }) || [];
+      }
+      const existingBrief = existingRows.slice(0, 8).map((m) => ({
+        id: m.id,
+        title: m.title || null,
+        content: String(m.content || '').slice(0, 200),
+        memoryType: m.memory_type || m.kind || 'fact'
+      }));
+
+      selected = this.router.select('simple_question');
+      const controller = new AbortController();
+      let timer;
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error('Memory extraction timed out'));
+        }, 15000);
+        timer.unref?.();
       });
+      let response;
+      try {
+        response = await Promise.race([
+          this.provider.chat({
+            model: selected.model,
+            maxTokens: 1000,
+            signal: controller.signal,
+            messages: [
+              {
+                role: 'system',
+                content: `Extract only durable information that the user explicitly states or clearly asks Bubu to remember. Do not infer sensitive personal attributes, passwords, secrets, or temporary details. ${scope === 'group' ? 'This is a shared group workspace: store only group decisions, shared project facts and group-relevant context. Never store an individual member personal preference, private detail or profile.' : 'This is the owner personal workspace: durable facts, preferences, goals and project context may be stored when explicitly stated or useful.'} When a new fact updates or replaces one of the existing workspace memories provided, include "supersedesId": <existing_id> on that memory object; otherwise omit "supersedesId". Return ONLY valid JSON: {"memories":[{"title":"short title","content":"standalone fact","memoryType":"fact|preference|project|goal","importance":1,"supersedesId":123}]}. If nothing durable, return {"memories":[]}.`
+              },
+              {
+                role: 'user',
+                content: `User message:\n${String(userText).slice(0, 4000)}\nAssistant response:\n${String(assistantText || '').slice(0, 2000)}${existingBrief.length ? `\nExisting workspace memories:\n${JSON.stringify(existingBrief).slice(0, 2000)}` : ''}`
+              }
+            ]
+          }),
+          timeoutPromise
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      this.db.logModelUsage?.({
+        taskId: null,
+        modelId: response?.model || selected.model,
+        tier: selected.tier || 'fast',
+        usage: response?.usage || null,
+        latencyMs: Date.now() - started,
+        outcome: 'success'
+      });
+
       const raw = String(response.message.content || '').trim();
       const parsed = extractJsonObject(raw);
       if (!parsed) throw new Error('Memory extractor did not return JSON');
@@ -265,6 +306,16 @@ class MemoryService {
       this.db.recordMemoryExtraction({ sourceEventId, status: 'completed', extractedCount: captured });
       return { captured, skipped: false };
     } catch (error) {
+      if (selected) {
+        this.db.logModelUsage?.({
+          taskId: null,
+          modelId: selected.model,
+          tier: selected.tier || 'fast',
+          usage: null,
+          latencyMs: Date.now() - started,
+          outcome: 'error'
+        });
+      }
       this.db.recordMemoryExtraction({ sourceEventId, status: 'failed', error: error.message });
       this.logger?.warn({ error: error.message, sourceEventId }, 'Automatic memory extraction failed');
       return { captured: 0, error: error.message };
@@ -288,7 +339,7 @@ class MemoryService {
     const projects = this.db.listProjects({
       scope, ownerId, chatId, status: 'active', limit: 20
     });
-    const terms = String(query).toLowerCase().split(/\W+/).filter((x) => x.length > 2);
+    const terms = String(query).toLowerCase().split(/[^\p{L}\p{N}_-]+/u).filter((x) => x.length >= 2);
     return projects.map((project) => ({
       ...project,
       relevance: terms.filter((term) =>

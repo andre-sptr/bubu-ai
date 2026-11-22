@@ -322,6 +322,18 @@ const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS idx_inbox_chat_status
         ON inbox_events(chat_id, status);
     `
+  },
+  {
+    version: 13,
+    sql: ''
+  },
+  {
+    version: 14,
+    sql: ''
+  },
+  {
+    version: 15,
+    sql: ''
   }
 ];
 

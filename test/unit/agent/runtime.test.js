@@ -754,3 +754,283 @@ test('runtime escalates before finalization when maxRounds is 1 and fast round r
   assert.equal(res.tier, 'balanced');
   assert.equal(res.escalatedFromTier, 'fast');
 });
+
+test('Stage 1: AgentRuntime forwards AbortSignal, aborts on timeout, and logs model_usage for errors and finalization', async () => {
+  const usageLogs = [];
+  let seenSignal = null;
+  const baseDb = () => ({
+    task: null,
+    steps: [],
+    createTask: function (t) { this.task = { ...t, status: 'running' }; return this.task; },
+    getTask: function () { return this.task; },
+    getPendingApprovalForTask: () => null,
+    countTaskSteps: function () { return this.steps.length; },
+    logModelUsage: (entry) => usageLogs.push(entry),
+    updateTask: function (_id, f) { this.task = { ...this.task, ...f }; },
+    queueTaskResponse: () => {},
+    audit: () => {},
+    addTaskStep: function (s) { this.steps.push(s); },
+    beginToolExecution: () => ({ state: 'claimed' }),
+    completeToolExecution: () => {},
+    failToolExecution: () => {}
+  });
+
+  // 1. Timeout aborts signal and logs outcome='error'
+  const dbTimeout = baseDb();
+  const timeoutRuntime = new AgentRuntime({
+    provider: {
+      chat: async ({ signal }) => {
+        seenSignal = signal;
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('aborted')));
+        });
+      }
+    },
+    router: { select: () => ({ tier: 'balanced', model: 'm-timeout' }) },
+    tools: { definitions: () => [] },
+    db: dbTimeout,
+    config: { agent: { maxRounds: 2, maxToolCalls: 2, maxToolResultChars: 500, taskTimeoutMs: 30, toolTimeoutMs: 20 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+  await assert.rejects(
+    () => timeoutRuntime.run({ text: 'Halo', chatId: '6281@c.us', requesterId: '6281@c.us', scope: 'personal', sourceEventId: 'evt-abort-1' }),
+    /timed out/
+  );
+  assert.ok(seenSignal instanceof AbortSignal);
+  assert.equal(seenSignal.aborted, true);
+  assert.equal(usageLogs.some((u) => u.outcome === 'error' && u.modelId === 'm-timeout'), true);
+
+  // 2. Round-limit finalization logs outcome='success' for both round 1 and finalCompletion
+  usageLogs.length = 0;
+  let callIdx = 0;
+  const dbFinalize = baseDb();
+  const finalizeRuntime = new AgentRuntime({
+    provider: {
+      chat: async ({ signal }) => {
+        assert.ok(signal instanceof AbortSignal);
+        callIdx++;
+        if (callIdx === 1) {
+          return {
+            model: 'm-plan',
+            usage: { prompt_tokens: 10, completion_tokens: 5 },
+            message: { role: 'assistant', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 't1', arguments: '{}' } }] }
+          };
+        }
+        return {
+          model: 'm-final',
+          usage: { prompt_tokens: 20, completion_tokens: 8 },
+          message: { role: 'assistant', content: 'Selesai.' }
+        };
+      }
+    },
+    router: { select: () => ({ tier: 'balanced', model: 'm-plan' }) },
+    tools: {
+      definitions: () => [{ type: 'function', function: { name: 't1', parameters: { type: 'object' } } }],
+      get: () => ({ scopes: ['personal'], schema: { parse: (v) => v }, execute: async () => ({ ok: true }) })
+    },
+    db: dbFinalize,
+    config: { agent: { maxRounds: 1, maxToolCalls: 4, maxToolResultChars: 500, taskTimeoutMs: 2000, toolTimeoutMs: 500 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+  await finalizeRuntime.run({ text: 'Run', chatId: '6281@c.us', requesterId: '6281@c.us', scope: 'personal', sourceEventId: 'evt-fin-log' });
+  assert.deepEqual(usageLogs.map((u) => [u.modelId, u.outcome]), [['m-plan', 'success'], ['m-final', 'success']]);
+});
+
+test('Stage 2: runtime falls back on transient 503/429 without falling back on 400 client error', async () => {
+  const { ModelRouter } = require('../../../src/agent/model-router');
+  const calls = [];
+  const usageLogs = [];
+  const db = {
+    task: null,
+    createTask: function (t) { this.task = { ...t, status: 'running' }; return this.task; },
+    getTask: function () { return this.task; },
+    getPendingApprovalForTask: () => null,
+    countTaskSteps: () => 0,
+    logModelUsage: (u) => usageLogs.push(u),
+    updateTask: function (_id, f) { this.task = { ...this.task, ...f }; },
+    queueTaskResponse: () => {},
+    audit: () => {}
+  };
+  const router = new ModelRouter({
+    balanced: { id: 'primary-sonnet', supportsTools: true },
+    summary: { id: 'backup-gemini', supportsTools: true },
+    fast: { id: 'backup-haiku', supportsTools: true }
+  });
+
+  const fallbackRuntime = new AgentRuntime({
+    provider: {
+      chat: async ({ model }) => {
+        calls.push(model);
+        if (model === 'primary-sonnet') {
+          throw Object.assign(new Error('Upstream overloaded'), { response: { status: 503 } });
+        }
+        return { model, message: { role: 'assistant', content: 'Dijawab via fallback.' }, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+      }
+    },
+    router,
+    tools: { definitions: () => [] },
+    db,
+    config: { agent: { maxRounds: 2, maxToolCalls: 2, maxToolResultChars: 500, taskTimeoutMs: 2000, toolTimeoutMs: 500 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+
+  const okRes = await fallbackRuntime.run({
+    text: 'Tolong jelaskan sistem ini.',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    scope: 'personal',
+    sourceEventId: 'evt-fallback-503'
+  });
+  assert.deepEqual(calls, ['primary-sonnet', 'backup-gemini']);
+  assert.equal(okRes.model, 'backup-gemini');
+  assert.deepEqual(usageLogs.map((u) => [u.modelId, u.outcome]), [['primary-sonnet', 'error'], ['backup-gemini', 'success']]);
+
+  calls.length = 0;
+  const db400 = { ...db, task: null };
+  const clientErrRuntime = new AgentRuntime({
+    provider: {
+      chat: async ({ model }) => {
+        calls.push(model);
+        throw Object.assign(new Error('Invalid prompt'), { response: { status: 400 } });
+      }
+    },
+    router,
+    tools: { definitions: () => [] },
+    db: db400,
+    config: { agent: { maxRounds: 2, maxToolCalls: 2, maxToolResultChars: 500, taskTimeoutMs: 2000, toolTimeoutMs: 500 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+  await assert.rejects(
+    () => clientErrRuntime.run({ text: 'Tolong jelaskan sistem ini secara rinci.', chatId: '6281@c.us', requesterId: '6281@c.us', scope: 'personal', sourceEventId: 'evt-no-fallback-400' }),
+    /Invalid prompt/
+  );
+  assert.deepEqual(calls, ['primary-sonnet']);
+});
+
+test('Stage 2: runtime runs contiguous readOnly low-risk tools in parallel while preserving barriers and request_tool_group', async () => {
+  const { ToolRegistry } = require('../../../src/agent/tool-registry');
+  const active = new Set();
+  let maxConcurrent = 0;
+  const executionOrder = [];
+
+  const registry = new ToolRegistry();
+  registry.register({
+    name: 'read_a',
+    description: 'Read A',
+    scopes: ['personal'],
+    group: 'memory',
+    risk: 'low',
+    readOnly: true,
+    schema: { parse: (v) => v },
+    parameters: { type: 'object' },
+    execute: async () => {
+      active.add('read_a');
+      maxConcurrent = Math.max(maxConcurrent, active.size);
+      await new Promise((r) => setTimeout(r, 35));
+      executionOrder.push('read_a');
+      active.delete('read_a');
+      return { from: 'A' };
+    }
+  });
+  registry.register({
+    name: 'read_b',
+    description: 'Read B',
+    scopes: ['personal'],
+    group: 'productivity',
+    risk: 'low',
+    readOnly: true,
+    schema: { parse: (v) => v },
+    parameters: { type: 'object' },
+    execute: async () => {
+      active.add('read_b');
+      maxConcurrent = Math.max(maxConcurrent, active.size);
+      await new Promise((r) => setTimeout(r, 35));
+      executionOrder.push('read_b');
+      active.delete('read_b');
+      return { from: 'B' };
+    }
+  });
+  registry.register({
+    name: 'mutate_c',
+    description: 'Mutate C',
+    scopes: ['personal'],
+    group: 'waha',
+    risk: 'external',
+    readOnly: false,
+    schema: { parse: (v) => v },
+    parameters: { type: 'object' },
+    execute: async () => {
+      assert.equal(active.size, 0, 'Mutating tool must wait until read-only batch finishes');
+      executionOrder.push('mutate_c');
+      return { ok: true, deliveryStatus: 'sent' };
+    }
+  });
+
+  const db = {
+    task: null,
+    steps: [],
+    createTask: function (t) { this.task = { ...t, status: 'running' }; return this.task; },
+    getTask: function () { return this.task; },
+    getPendingApprovalForTask: () => null,
+    countTaskSteps: function () { return this.steps.length; },
+    logModelUsage: () => {},
+    updateTask: function (_id, f) { this.task = { ...this.task, ...f }; },
+    queueTaskResponse: () => {},
+    audit: () => {},
+    addTaskStep: function (s) { this.steps.push(s); },
+    beginToolExecution: () => ({ state: 'claimed' }),
+    completeToolExecution: () => {},
+    failToolExecution: () => {}
+  };
+
+  let round = 0;
+  let seenToolsRound2 = [];
+  const runtime = new AgentRuntime({
+    provider: {
+      chat: async ({ tools }) => {
+        round++;
+        if (round === 1) {
+          return {
+            model: 'sonnet',
+            usage: {},
+            message: {
+              role: 'assistant',
+              tool_calls: [
+                { id: 'c-a', type: 'function', function: { name: 'read_a', arguments: '{}' } },
+                { id: 'c-b', type: 'function', function: { name: 'read_b', arguments: '{}' } },
+                { id: 'c-c', type: 'function', function: { name: 'mutate_c', arguments: '{}' } },
+                { id: 'c-unlock', type: 'function', function: { name: 'request_tool_group', arguments: '{"group":"waha"}' } }
+              ]
+            }
+          };
+        }
+        seenToolsRound2 = (tools || []).map((t) => t.function.name);
+        return { model: 'sonnet', usage: {}, message: { role: 'assistant', content: 'Semua selesai.' } };
+      }
+    },
+    router: { select: () => ({ tier: 'balanced', model: 'sonnet', supportsTools: true }) },
+    tools: registry,
+    db,
+    config: { agent: { maxRounds: 3, maxToolCalls: 8, maxToolResultChars: 500, taskTimeoutMs: 2000, toolTimeoutMs: 500 } },
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  });
+
+  const res = await runtime.run({
+    text: 'Jalankan tugas dan cek memori lalu kirim.',
+    chatId: '6281@c.us',
+    requesterId: '6281@c.us',
+    scope: 'personal',
+    sourceEventId: 'evt-parallel-1'
+  });
+
+  assert.equal(res.text, 'Semua selesai.');
+  assert.equal(maxConcurrent, 2);
+  assert.equal(executionOrder[2], 'mutate_c');
+  assert.deepEqual(db.steps.map((s) => [s.stepNo, s.toolName]), [
+    [1, 'read_a'],
+    [2, 'read_b'],
+    [3, 'mutate_c'],
+    [4, 'request_tool_group']
+  ]);
+  assert.equal(seenToolsRound2.includes('mutate_c'), true);
+});

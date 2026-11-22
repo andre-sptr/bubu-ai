@@ -59,7 +59,7 @@ function formatInline(input, stash) {
   // (e.g. approval prompts). Preserve it; convert inline Markdown italics.
   const standaloneWhatsAppBold = /^\s*\*[^*\n]+\*\s*$/.test(text);
   if (!standaloneWhatsAppBold) {
-    text = text.replace(/(?<!\*)\*(?!\*)([^*\n]+)\*(?!\*)/g, '_$1_');
+    text = text.replace(/(?<![\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])/g, '_$1_');
   }
 
   // Markdown strikethrough -> WhatsApp strikethrough.

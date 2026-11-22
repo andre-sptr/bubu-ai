@@ -471,3 +471,199 @@ test('/queue slash command is owner-only and supports status, dead, retry, and p
   assert.match(sent[9].text, /Model usage dihapus: 10/);
   assert.match(sent[9].text, /Audit logs dihapus: 3/);
 });
+
+test('Stage 2: SumopodProvider emits Claude cache_control across static/dynamic boundary and /usage reports cost breakdown', async () => {
+  const { SumopodProvider } = require('../../../src/providers/sumopod');
+  const { STATIC_DYNAMIC_BOUNDARY } = require('../../../src/agent/prompt-builder');
+
+  const messages = buildAgentMessages({
+    text: 'Cek jadwal',
+    scope: 'personal',
+    timezone: 'Asia/Jakarta'
+  });
+  assert.equal(messages[0].content.includes(STATIC_DYNAMIC_BOUNDARY), true);
+
+  const capturedBodies = [];
+  const httpClient = {
+    post: async (_url, body) => {
+      capturedBodies.push(body);
+      return { data: { choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: {} } };
+    }
+  };
+
+  const cachedProvider = new SumopodProvider({
+    baseUrl: 'https://sumopod.test/v1',
+    apiKey: 'secret',
+    promptCaching: true,
+    httpClient
+  });
+  await cachedProvider.chat({ model: 'claude-sonnet-5-5', messages });
+  assert.equal(Array.isArray(capturedBodies[0].messages[0].content), true);
+  assert.deepEqual(capturedBodies[0].messages[0].content[0].cache_control, { type: 'ephemeral' });
+  assert.equal(capturedBodies[0].messages[0].content[1].type, 'text');
+
+  // When promptCaching is false, SumopodProvider strips internal boundary marker into clean single string
+  const plainProvider = new SumopodProvider({
+    baseUrl: 'https://sumopod.test/v1',
+    apiKey: 'secret',
+    promptCaching: false,
+    httpClient
+  });
+  await plainProvider.chat({ model: 'claude-sonnet-5-5', messages });
+  assert.equal(typeof capturedBodies[1].messages[0].content, 'string');
+  assert.equal(capturedBodies[1].messages[0].content.includes(STATIC_DYNAMIC_BOUNDARY), false);
+
+  // /usage slash command (owner-only, duration parsing, cost formatting)
+  assert.equal(RECOGNIZED_SLASH_COMMANDS.has('/usage'), true);
+  const replies = [];
+  let requestedWindow = null;
+  const processor = {
+    config: { ownerJid: OWNER, telemetry: { usdToIdr: 16500 } },
+    responseHandler: { sendText: async (text, chatId) => replies.push({ text, chatId }) },
+    db: {
+      getTelemetrySummary: ({ windowHours }) => {
+        requestedWindow = windowHours;
+        return {
+          windowHours,
+          totalCalls: 12,
+          successCalls: 11,
+          failedCalls: 1,
+          totalInputTokens: 15000,
+          totalOutputTokens: 3000,
+          avgLatencyMs: 420,
+          estimatedCostUsd: 0.09,
+          estimatedCostIdr: 1485,
+          byTier: { balanced: { calls: 10, inputTokens: 12000, outputTokens: 2500 }, fast: { calls: 2, inputTokens: 3000, outputTokens: 500 } },
+          costByTier: { balanced: { estimatedCostUsd: 0.0735 }, fast: { estimatedCostUsd: 0.0044 } }
+        };
+      }
+    }
+  };
+
+  await handleSlashCommand(processor, {
+    text: '/usage 7d', msg: { chatId: GROUP }, senderId: MEMBER, owner: false, isGroup: true, scope: 'group', eventId: 'u1'
+  });
+  assert.match(replies[0].text, /hanya dapat diakses oleh pemilik/i);
+
+  await handleSlashCommand(processor, {
+    text: '/usage 7d', msg: { chatId: OWNER }, senderId: OWNER, owner: true, isGroup: false, scope: 'personal', eventId: 'u2'
+  });
+  assert.equal(requestedWindow, 168);
+  assert.match(replies[1].text, /168 jam terakhir/);
+  assert.match(replies[1].text, /\$0\.0900 USD/);
+  assert.match(replies[1].text, /balanced: 10 calls/);
+});
+
+test('Stage 3: passive group context block preserves history indexes, /rangkum merges passive chat, /reminder supports recurring/list/cancel, and /polls works', async () => {
+  const { createPollTools } = require('../../../src/channels/waha/poll-tools');
+
+  // 1. Prompt builder injects UNTRUSTED_GROUP_PASSIVE_CONTEXT in group scope without shifting history indexes
+  const groupMessages = buildAgentMessages({
+    text: 'Bubu rangkum topik tadi',
+    scope: 'group',
+    history: [{ role: 'user', sender: MEMBER, content: 'Halo Bubu' }],
+    passiveGroupMessages: [{ sender: MEMBER, content: 'Server staging butuh restart malam ini.' }]
+  });
+  assert.equal(groupMessages[0].role, 'system');
+  assert.equal(groupMessages[1].content, `[${MEMBER}]: Halo Bubu`);
+  assert.equal(groupMessages[2].content, 'Bubu rangkum topik tadi');
+  assert.match(groupMessages[3].content, /UNTRUSTED_GROUP_PASSIVE_CONTEXT/);
+  assert.match(groupMessages[3].content, /Server staging butuh restart malam ini\./);
+
+  // Never inject passive group context into personal scope
+  const personalMessages = buildAgentMessages({
+    text: 'Halo',
+    scope: 'personal',
+    passiveGroupMessages: [{ sender: MEMBER, content: 'Bocor?' }]
+  });
+  assert.equal(personalMessages.some((m) => String(m.content).includes('UNTRUSTED_GROUP_PASSIVE_CONTEXT')), false);
+
+  // 2. /rangkum merges passive group buffer + /reminder recurring + /reminder list/cancel + /polls
+  assert.equal(RECOGNIZED_SLASH_COMMANDS.has('/polls'), true);
+  const sent = [];
+  const createdReminders = [];
+  const cancelledIds = [];
+  let promptSentToRangkum = '';
+  const processor = {
+    config: {
+      ownerJid: OWNER,
+      appTimezone: 'Asia/Jakarta',
+      groupPassiveHistory: true,
+      groupPassiveBufferSize: 30,
+      agent: { enabled: true, taskTimeoutMs: 5000, maxOutputTokens: 1000 }
+    },
+    responseHandler: { sendText: async (text, chatId) => sent.push({ text, chatId }) },
+    router: { select: () => ({ model: 'gemini/gemini-3.1-pro-preview', tier: 'summary' }) },
+    provider: {
+      chat: async ({ messages }) => {
+        promptSentToRangkum = messages[1].content;
+        return { model: 'gemini/gemini-3.1-pro-preview', message: { content: 'Ringkasan rapat selesai.' }, usage: {} };
+      }
+    },
+    db: {
+      getHistory: () => [],
+      getGroupPassiveMessages: () => [{ sender: MEMBER, content: 'Deadline API hari Jumat jam 17:00' }],
+      createReminder: (item) => {
+        createdReminders.push(item);
+        return createdReminders.length;
+      },
+      listReminders: () => [
+        { id: 1, message: 'Cek backup', due_at: '2026-11-24T01:00:00.000Z', recurrence: 'daily' }
+      ],
+      cancelReminder: ({ id }) => {
+        cancelledIds.push(id);
+        return id === 1;
+      },
+      listPolls: () => [
+        {
+          pollMessageId: 'poll-99',
+          question: 'Makan siang?',
+          totalVoters: 3,
+          tally: [{ option: 'Sate', votes: 2 }, { option: 'Bakso', votes: 1 }]
+        }
+      ],
+      getPollResults: ({ pollMessageId }) => ({
+        found: pollMessageId === 'poll-99',
+        pollMessageId,
+        question: 'Makan siang?',
+        totalVoters: 3,
+        tally: [{ option: 'Sate', votes: 2 }, { option: 'Bakso', votes: 1 }]
+      })
+    }
+  };
+
+  await handleSlashCommand(processor, {
+    text: '/rangkum', msg: { chatId: GROUP }, senderId: MEMBER, owner: false, isGroup: true, scope: 'group', eventId: 'r1'
+  });
+  assert.match(promptSentToRangkum, /Percakapan Grup Pasif/);
+  assert.match(promptSentToRangkum, /Deadline API hari Jumat/);
+  assert.equal(sent[0].text, 'Ringkasan rapat selesai.');
+
+  await handleSlashCommand(processor, {
+    text: '/reminder daily 08:00 Cek server produksi', msg: { chatId: OWNER }, senderId: OWNER, owner: true, isGroup: false, scope: 'personal', eventId: 'rem1'
+  });
+  assert.equal(createdReminders[0].recurrence, 'daily');
+  assert.match(sent[1].text, /berulang: daily/);
+
+  await handleSlashCommand(processor, {
+    text: '/reminder list', msg: { chatId: OWNER }, senderId: OWNER, owner: true, isGroup: false, scope: 'personal', eventId: 'rem2'
+  });
+  assert.match(sent[2].text, /#1 \[daily\]/);
+
+  await handleSlashCommand(processor, {
+    text: '/reminder cancel 1', msg: { chatId: OWNER }, senderId: OWNER, owner: true, isGroup: false, scope: 'personal', eventId: 'rem3'
+  });
+  assert.deepEqual(cancelledIds, [1]);
+  assert.match(sent[3].text, /Reminder #1 dibatalkan/);
+
+  await handleSlashCommand(processor, {
+    text: '/polls', msg: { chatId: GROUP }, senderId: MEMBER, owner: false, isGroup: true, scope: 'group', eventId: 'p1'
+  });
+  assert.match(sent[4].text, /\*Makan siang\?\* \(3 pemilih\)/);
+  assert.match(sent[4].text, /Sate: 2 suara/);
+
+  const pollTools = createPollTools({ db: processor.db });
+  const toolOut = await pollTools[0].execute({ pollMessageId: 'poll-99' }, { chatId: GROUP, scope: 'group' });
+  assert.equal(toolOut.found, true);
+  assert.equal(toolOut.totalVoters, 3);
+});

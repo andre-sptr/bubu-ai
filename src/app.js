@@ -3,17 +3,21 @@ const Fastify = require('fastify');
 const helmet = require('@fastify/helmet');
 const { version } = require('../package.json');
 const { normalizeJid } = require('./config/env');
-const { normalizeIncoming, normalizeSessionStatus } = require('./channels/waha/normalizer');
+const { normalizeIncoming, normalizeSessionStatus, normalizePollVote } = require('./channels/waha/normalizer');
 const { eventKey } = require('./agent/message-processor');
 
-const OWNER_PRIORITY_COMMANDS = new Set(['/approve', '/deny', '/status', '/queue']);
+const OWNER_PRIORITY_COMMANDS = new Set(['/approve', '/deny', '/approvals', '/polls', '/status', '/queue']);
 
-function classifyEventPriority(message, ownerJid = '') {
+function classifyEventPriority(message, ownerJid = '', ownerLid = '') {
   const chatId = normalizeJid(message?.chatId || '');
   const senderId = normalizeJid(message?.senderId || chatId);
   const normalizedOwner = normalizeJid(ownerJid || '');
+  const normalizedOwnerLid = normalizeJid(ownerLid || '');
   const isGroup = chatId.endsWith('@g.us');
-  const isOwner = Boolean(normalizedOwner) && senderId === normalizedOwner;
+  const isOwner = Boolean(
+    (normalizedOwner && senderId === normalizedOwner) ||
+    (normalizedOwnerLid && senderId === normalizedOwnerLid)
+  );
   const text = String(message?.text || message?.bodyText || '').trim();
   const cmd = text.startsWith('/') ? text.split(/\s+/, 1)[0].toLowerCase() : '';
 
@@ -56,7 +60,7 @@ function verifyHmacSha512({ rawBody, secret, signatureHeader, algorithmHeader })
   return crypto.timingSafeEqual(Buffer.from(hexSignature, 'hex'), Buffer.from(expectedHex, 'hex'));
 }
 
-function buildApp({ config, db, logger, worker = null, sessionMonitor = null, isShuttingDown = null }) {
+function buildApp({ config, db, logger, worker = null, reminderWorker = null, sessionMonitor = null, isShuttingDown = null }) {
   const app = Fastify({
     loggerInstance: logger,
     bodyLimit: 2 * 1024 * 1024,
@@ -74,7 +78,7 @@ function buildApp({ config, db, logger, worker = null, sessionMonitor = null, is
     provider: 'sumopod'
   }));
 
-  const hasExtendedChecks = worker !== null || sessionMonitor !== null || isShuttingDown !== null;
+  const hasExtendedChecks = worker !== null || reminderWorker !== null || sessionMonitor !== null || isShuttingDown !== null;
 
   app.get('/ready', async (_request, reply) => {
     let sqliteOk = false;
@@ -99,16 +103,20 @@ function buildApp({ config, db, logger, worker = null, sessionMonitor = null, is
     const workerHealthy = worker && typeof worker.isHealthy === 'function'
       ? worker.isHealthy() !== false
       : true;
+    const reminderHealthy = reminderWorker && typeof reminderWorker.isHealthy === 'function'
+      ? reminderWorker.isHealthy() !== false
+      : true;
     const wahaHealthy = sessionMonitor && typeof sessionMonitor.isDegraded === 'function'
       ? !sessionMonitor.isDegraded()
       : true;
-    const ready = sqliteOk && !draining && workerHealthy && wahaHealthy;
+    const ready = sqliteOk && !draining && workerHealthy && reminderHealthy && wahaHealthy;
     if (!ready) reply.code(503);
     return {
       ready,
       checks: {
         sqlite: sqliteOk,
         worker: workerHealthy,
+        ...(reminderWorker !== null ? { reminderWorker: reminderHealthy } : {}),
         waha: wahaHealthy,
         draining
       }
@@ -188,6 +196,27 @@ function buildApp({ config, db, logger, worker = null, sessionMonitor = null, is
         return { accepted: true, event: 'session.status', status: statusEvent.status };
       }
 
+      if (explicitEvent === 'poll.vote') {
+        const vote = normalizePollVote(rawBody);
+        if (!vote || !vote.pollMessageId || !vote.voterId) {
+          reply.code(200);
+          return { accepted: true, ignored: true, eventType: 'poll.vote' };
+        }
+        let recorded = false;
+        try {
+          recorded = Boolean(db.recordPollVote?.(vote));
+        } catch (err) {
+          logger?.warn?.({ error: err?.message, pollMessageId: vote.pollMessageId }, 'Failed to persist poll vote');
+        }
+        reply.code(200);
+        return {
+          accepted: true,
+          event: 'poll.vote',
+          recorded,
+          pollMessageId: vote.pollMessageId
+        };
+      }
+
       if (explicitEvent && explicitEvent !== 'message') {
         reply.code(200);
         return { accepted: true, ignored: true, eventType: explicitEvent };
@@ -203,7 +232,8 @@ function buildApp({ config, db, logger, worker = null, sessionMonitor = null, is
       }
 
       const id = eventKey(message);
-      const priority = classifyEventPriority(message, config?.ownerJid || '');
+      const ownerLid = typeof sessionMonitor?.getOwnerLid === 'function' ? sessionMonitor.getOwnerLid() : '';
+      const priority = classifyEventPriority(message, config?.ownerJid || '', ownerLid);
       const inserted = db.enqueueEvent({
         eventId: id,
         chatId: message.chatId,

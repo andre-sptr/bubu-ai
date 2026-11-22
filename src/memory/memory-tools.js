@@ -14,6 +14,8 @@ function createMemoryTools({ db, memoryService }) {
       name: 'save_note',
       description: 'Save a note in the current workspace. Personal notes are private to the owner; group notes stay in that group.',
       scopes: ['personal', 'group'],
+      group: 'memory',
+      aliasOf: 'remember_fact',
       schema: z.object({ content: z.string().min(1).max(5000), kind: z.string().max(40).default('note') }).strict(),
       parameters: {
         type: 'object', additionalProperties: false,
@@ -47,6 +49,9 @@ function createMemoryTools({ db, memoryService }) {
       name: 'search_notes',
       description: 'Search notes only in the current workspace.',
       scopes: ['personal', 'group'],
+      group: 'memory',
+      aliasOf: 'search_memory',
+      readOnly: true,
       schema: z.object({ query: z.string().min(1).max(300) }).strict(),
       parameters: {
         type: 'object', additionalProperties: false,
@@ -65,6 +70,7 @@ function createMemoryTools({ db, memoryService }) {
       name: 'remember_fact',
       description: 'Save durable facts, preferences, goals or project context in the current workspace so Bubu can recall them in future conversations. Pass supersedeId when replacing an outdated memory. In group scope, save only shared group information, not an individual member personal details.',
       scopes: ['personal', 'group'],
+      group: 'memory',
       schema: z.object({
         title: z.string().max(160).optional(),
         content: z.string().min(3).max(1500),
@@ -131,6 +137,8 @@ function createMemoryTools({ db, memoryService }) {
       name: 'search_memory',
       description: 'Search long-term memories semantically in the current workspace. Use to recall previous facts, preferences, goals and project information.',
       scopes: ['personal', 'group'],
+      group: 'memory',
+      readOnly: true,
       schema: z.object({
         query: z.string().min(2).max(500),
         projectId: z.string().uuid().optional(),
@@ -157,6 +165,8 @@ function createMemoryTools({ db, memoryService }) {
       name: 'list_memories',
       description: 'List memories in the current workspace, optionally filtered by memoryType, projectId, or lifecycle status.',
       scopes: ['personal', 'group'],
+      group: 'memory',
+      readOnly: true,
       schema: z.object({
         memoryType: z.string().min(1).max(40).optional(),
         projectId: z.string().uuid().optional(),
@@ -186,6 +196,7 @@ function createMemoryTools({ db, memoryService }) {
       name: 'update_memory',
       description: 'Update the title, content, memoryType, importance, projectId or status of an existing memory in the current workspace.',
       scopes: ['personal', 'group'],
+      group: 'memory',
       schema: z.object({
         memoryId: z.number().int().positive(),
         title: z.string().max(160).nullable().optional(),
@@ -243,6 +254,7 @@ function createMemoryTools({ db, memoryService }) {
       name: 'forget_memory',
       description: 'Archive (soft-delete by default) or permanently delete a memory in the current workspace.',
       scopes: ['personal', 'group'],
+      group: 'memory',
       schema: z.object({
         memoryId: z.number().int().positive(),
         hard: z.boolean().optional()
@@ -267,6 +279,7 @@ function createMemoryTools({ db, memoryService }) {
       name: 'consolidate_memories',
       description: 'Deduplicate active memories, archive stale low-importance memories, and backfill missing semantic embeddings for the current workspace.',
       scopes: ['personal', 'group'],
+      group: 'memory',
       schema: z.object({
         backfillLimit: z.number().int().min(0).max(30).optional()
       }).strict(),
@@ -290,6 +303,7 @@ function createMemoryTools({ db, memoryService }) {
       name: 'create_project',
       description: 'Create a named project in the current workspace to organize related memories and ongoing work.',
       scopes: ['personal', 'group'],
+      group: 'memory',
       schema: z.object({
         name: z.string().min(2).max(120),
         description: z.string().max(1500).optional()
@@ -311,6 +325,8 @@ function createMemoryTools({ db, memoryService }) {
       name: 'list_projects',
       description: 'List projects in the current workspace.',
       scopes: ['personal', 'group'],
+      group: 'memory',
+      readOnly: true,
       schema: z.object({
         status: z.enum(['active', 'paused', 'completed', 'archived']).nullable().optional(),
         limit: z.number().int().min(1).max(30).optional()
@@ -334,6 +350,7 @@ function createMemoryTools({ db, memoryService }) {
       name: 'update_project',
       description: 'Update the name, description or status of a project in the current workspace.',
       scopes: ['personal', 'group'],
+      group: 'memory',
       schema: z.object({
         projectId: z.string().uuid(),
         name: z.string().min(2).max(120).optional(),
@@ -362,6 +379,8 @@ function createMemoryTools({ db, memoryService }) {
       name: 'list_memory_events',
       description: 'List recent episodic memory events from the current workspace.',
       scopes: ['personal', 'group'],
+      group: 'memory',
+      readOnly: true,
       schema: z.object({ limit: z.number().int().min(1).max(30).optional() }).strict(),
       parameters: {
         type: 'object', additionalProperties: false,

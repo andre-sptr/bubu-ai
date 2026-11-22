@@ -4,6 +4,9 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { runCommand } = require('../utils/process-runner');
+const { UserValidationError } = require('../utils/error-policy');
+const { AsyncSemaphore } = require('../utils/semaphore');
+const { chunkDocumentText } = require('./parsers/chunker');
 const {
   safeFilename,
   sanitizeAxiosError,
@@ -100,11 +103,11 @@ function validateExtension(filename, mimetype) {
   const ext = path.extname(filename).toLowerCase();
   const accepted = ALLOWED.get(ext);
   const mime = normalizeMimeType(mimetype);
-  if (!accepted) throw new Error('Format dokumen belum didukung. Gunakan PDF, DOCX, XLSX, XLSM, CSV, atau TXT.');
+  if (!accepted) throw new UserValidationError('Format dokumen belum didukung. Gunakan PDF, DOCX, XLSX, XLSM, CSV, atau TXT.');
   if (mime && !isGenericMime(mime) && !accepted.map((m) => m.toLowerCase()).includes(mime) &&
       !(ext === '.txt' && mime.startsWith('text/')) &&
       !(['.docx', '.xlsx', '.xlsm'].includes(ext) && mime === 'application/zip')) {
-    throw new Error(`MIME type tidak sesuai dengan ekstensi ${ext}.`);
+    throw new UserValidationError(`MIME type tidak sesuai dengan ekstensi ${ext}.`);
   }
   return ext;
 }
@@ -127,6 +130,10 @@ class DocumentService {
     pdfParser = null,
     mammothLib = null,
     commandRunner = runCommand,
+    memoryService = null,
+    embedder = null,
+    ocrLockTimeoutMs = 90000,
+    maxRagEmbedChunks = 20,
     logger = null
   }) {
     this.db = db;
@@ -145,8 +152,17 @@ class DocumentService {
     this.pdfParser = pdfParser;
     this.mammothLib = mammothLib;
     this.commandRunner = commandRunner;
+    this.memoryService = memoryService;
+    this.embedder = embedder;
+    this.maxRagEmbedChunks = Math.max(0, Number(maxRagEmbedChunks) || 20);
     this.logger = logger;
     this.ocrBusy = false;
+    this.ocrSemaphore = new AsyncSemaphore({
+      concurrency: 1,
+      maxQueue: 6,
+      acquireTimeoutMs: ocrLockTimeoutMs,
+      busyMessage: 'Pemrosesan OCR dokumen sedang sibuk. Silakan coba kembali beberapa saat lagi.'
+    });
     try {
       fs.mkdirSync(storageDir, { recursive: true, mode: 0o700 });
     } catch (err) {
@@ -166,7 +182,7 @@ class DocumentService {
     if (!path.extname(safeName)) {
       const inferredExt = documentExtensionFromMime(mimetype) ||
         documentExtensionFromMime(url.searchParams.get('mimetype'));
-      if (!inferredExt) throw new Error('Ekstensi dokumen tidak tersedia dan tidak dapat ditentukan dari MIME type.');
+      if (!inferredExt) throw new UserValidationError('Ekstensi dokumen tidak tersedia dan tidak dapat ditentukan dari MIME type.');
       safeName = `${safeName}${inferredExt}`;
     }
     const ext = validateExtension(safeName, mimetype);
@@ -187,26 +203,26 @@ class DocumentService {
     }
 
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Unduhan dokumen ditolak dengan HTTP ${response.status}. Redirect tidak diikuti.`);
+      throw new UserValidationError(`Unduhan dokumen ditolak dengan HTTP ${response.status}. Redirect tidak diikuti.`);
     }
     const contentLength = Number(response.headers?.['content-length']);
     if (Number.isFinite(contentLength) && contentLength > this.maxFileBytes) {
-      throw new Error('Ukuran dokumen melewati batas sebelum file disimpan.');
+      throw new UserValidationError('Ukuran dokumen melewati batas sebelum file disimpan.');
     }
 
     const responseMime = response.headers?.['content-type'] || '';
     validateResponseMime(mimetype, responseMime, accepted, ext);
     const buffer = Buffer.from(response.data);
-    if (!buffer.length || buffer.length > this.maxFileBytes) throw new Error('Ukuran dokumen kosong atau melebihi batas.');
+    if (!buffer.length || buffer.length > this.maxFileBytes) throw new UserValidationError('Ukuran dokumen kosong atau melebihi batas.');
     if (ext === '.pdf' && buffer.subarray(0, 5).toString('ascii') !== '%PDF-') {
-      throw new Error('File tidak memiliki signature PDF yang valid.');
+      throw new UserValidationError('File tidak memiliki signature PDF yang valid.');
     }
     if (['.docx', '.xlsx', '.xlsm'].includes(ext) &&
         !(buffer[0] === 0x50 && buffer[1] === 0x4b)) {
-      throw new Error('File Office tidak memiliki signature ZIP/Office yang valid.');
+      throw new UserValidationError('File Office tidak memiliki signature ZIP/Office yang valid.');
     }
     if (['.csv', '.txt'].includes(ext) && buffer.includes(0)) {
-      throw new Error('Dokumen teks mengandung byte NUL dan ditolak.');
+      throw new UserValidationError('Dokumen teks mengandung byte NUL dan ditolak.');
     }
 
     const id = crypto.randomUUID();
@@ -332,9 +348,10 @@ class DocumentService {
   }
 
   async ocrPdfPages({ buffer, filePath = null, digitalPages = [], totalPages = 0 }) {
-    if (this.ocrBusy) {
+    if (this.ocrBusy && this.ocrSemaphore.activeCount === 0) {
       throw new Error('Pemrosesan OCR dokumen sedang sibuk. Silakan coba kembali beberapa saat lagi.');
     }
+    const releaseOcr = await this.ocrSemaphore.acquire();
     this.ocrBusy = true;
     let workDir = null;
     try {
@@ -388,7 +405,103 @@ class DocumentService {
     } finally {
       if (workDir) await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
       this.ocrBusy = false;
+      releaseOcr();
     }
+  }
+
+  async embedText(text) {
+    const clean = String(text || '').trim().slice(0, 8000);
+    if (clean.length < 2) return null;
+    try {
+      if (typeof this.embedder === 'function') {
+        return await this.embedder(clean);
+      }
+      if (typeof this.memoryService?.embed === 'function') {
+        return await this.memoryService.embed(clean);
+      }
+    } catch (error) {
+      this.logger?.warn?.({ error: error?.message }, 'Document chunk embedding failed; using lexical fallback');
+    }
+    return null;
+  }
+
+  async indexDocumentChunks({ documentId, scope, ownerId = null, chatId = null, extractedText }) {
+    if (!documentId || typeof this.db?.replaceDocumentChunks !== 'function') return { indexed: 0 };
+    const chunks = chunkDocumentText(extractedText);
+    if (!chunks.length) return { indexed: 0 };
+    let embedStop = false;
+    const enriched = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      let embedding = null;
+      if (!embedStop && i < this.maxRagEmbedChunks) {
+        embedding = await this.embedText(chunk.content);
+        if (!embedding) embedStop = true;
+      }
+      enriched.push({ ...chunk, embedding });
+    }
+    this.db.replaceDocumentChunks({
+      documentId,
+      scope,
+      ownerId: scope === 'personal' ? ownerId : null,
+      chatId: scope === 'group' ? chatId : null,
+      chunks: enriched
+    });
+    return { indexed: enriched.length };
+  }
+
+  async extractSpreadsheetText(buffer, ext, { maxChars = null } = {}) {
+    let rawText = '';
+    if (ext === '.xlsx' || ext === '.xlsm') {
+      const ExcelJS = require('exceljs');
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(buffer);
+      const sections = [];
+      workbook.eachSheet((sheet) => {
+        sections.push(`SHEET: ${sheet.name}`);
+        sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+          const cells = Array.from(row.values.slice(1), (v) => normalizeXlsxCellValue(v));
+          if (cells.some((c) => c !== '')) {
+            sections.push(`${rowNumber}: ${cells.join(' | ')}`);
+          }
+        });
+      });
+      rawText = sections.join('\n');
+    } else if (ext === '.csv') {
+      const rawCsv = buffer.toString('utf8').replace(/\u0000/g, '').trim();
+      const parsedCsv = parseCsvText(rawCsv);
+      if (parsedCsv.rows.length > 0) {
+        rawText = [
+          'SHEET: CSV',
+          ...parsedCsv.rows.map((row, idx) => `${idx + 1}: ${row.map(sanitizeSpreadsheetCellText).join(' | ')}`)
+        ].join('\n');
+      } else {
+        rawText = rawCsv;
+      }
+    } else {
+      throw new UserValidationError('Format dokumen bukan spreadsheet (XLSX/XLSM/CSV).');
+    }
+
+    const cleaned = rawText.replace(/\u0000/g, '').trim();
+    if (maxChars !== null && maxChars !== undefined && Number.isFinite(Number(maxChars)) && Number(maxChars) > 0) {
+      const limit = Math.floor(Number(maxChars));
+      return {
+        text: cleaned.slice(0, limit),
+        truncated: cleaned.length > limit
+      };
+    }
+    return { text: cleaned, truncated: false };
+  }
+
+  async extractFullSpreadsheetFromFile(filePath, ext, { maxChars = 2 * 1024 * 1024 } = {}) {
+    const storageRoot = path.resolve(this.storageDir);
+    const resolvedTarget = path.resolve(String(filePath || ''));
+    const rel = path.relative(storageRoot, resolvedTarget);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error('Lokasi file berada di luar storage Bubu.');
+    }
+    const buffer = await fsp.readFile(resolvedTarget);
+    return this.extractSpreadsheetText(buffer, ext, { maxChars });
   }
 
   async extract({ buffer, ext, filePath = null }) {
@@ -430,41 +543,20 @@ class DocumentService {
       }
     } else if (ext === '.docx') {
       text = await extractStructuredDocxText(buffer, this.mammothLib);
-    } else if (ext === '.xlsx' || ext === '.xlsm') {
-      const ExcelJS = require('exceljs');
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.load(buffer);
-      const sections = [];
-      workbook.eachSheet((sheet) => {
-        sections.push(`SHEET: ${sheet.name}`);
-        sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-          const cells = Array.from(row.values.slice(1), (v) => normalizeXlsxCellValue(v));
-          sections.push(`${rowNumber}: ${cells.join(' | ')}`);
-        });
-      });
-      text = sections.join('\n');
-    } else if (ext === '.csv') {
-      const rawCsv = buffer.toString('utf8').replace(/\u0000/g, '').trim();
-      const parsedCsv = parseCsvText(rawCsv);
-      if (parsedCsv.rows.length > 0) {
-        text = [
-          'SHEET: CSV',
-          ...parsedCsv.rows.map((row, idx) => `${idx + 1}: ${row.map(sanitizeSpreadsheetCellText).join(' | ')}`)
-        ].join('\n');
-      } else {
-        text = rawCsv;
-      }
+    } else if (ext === '.xlsx' || ext === '.xlsm' || ext === '.csv') {
+      const sheetRes = await this.extractSpreadsheetText(buffer, ext);
+      text = sheetRes.text;
     } else if (ext === '.txt') {
       text = buffer.toString('utf8');
     }
 
     text = text.replace(/\u0000/g, '').trim();
-    if (!text) throw new Error('Dokumen berhasil diunduh tetapi teks tidak dapat diekstrak. Dokumen mungkin berupa scan/gambar.');
+    if (!text) throw new UserValidationError('Dokumen berhasil diunduh tetapi teks tidak dapat diekstrak. Dokumen mungkin berupa scan/gambar.');
     return text.slice(0, this.maxExtractChars);
   }
 
   async ingestMedia({ media, scope, ownerId, chatId, sourceEventId }) {
-    if (!media?.url) throw new Error('WAHA tidak menyediakan media.url. Pastikan media download di WAHA aktif.');
+    if (!media?.url) throw new UserValidationError('WAHA tidak menyediakan media.url. Pastikan media download di WAHA aktif.');
     const normalizedUrl = normalizeMediaUrl(media.url, this.wahaConfig.baseUrl);
     const filename = media.filename || media.fileName ||
       `document${path.extname(normalizedUrl.pathname) || documentExtensionFromMime(media.mimetype)}`;
@@ -480,7 +572,19 @@ class DocumentService {
         filePath: downloaded.filePath, fileSize: downloaded.fileSize,
         extractedText, sourceEventId
       });
-      if (record.id !== downloaded.id) await fsp.rm(downloaded.filePath, { force: true }).catch(() => {});
+      if (record.id !== downloaded.id) {
+        await fsp.rm(downloaded.filePath, { force: true }).catch(() => {});
+      } else {
+        await this.indexDocumentChunks({
+          documentId: record.id,
+          scope,
+          ownerId: scope === 'personal' ? ownerId : null,
+          chatId: scope === 'group' ? chatId : null,
+          extractedText: record.extracted_text || extractedText
+        }).catch((chunkErr) => {
+          this.logger?.warn?.({ documentId: record.id, error: chunkErr?.message }, 'Document RAG chunk indexing failed');
+        });
+      }
       return {
         ...record,
         extractedText: record.extracted_text || extractedText,

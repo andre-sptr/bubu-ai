@@ -12,6 +12,13 @@ function parsePositiveInt(value, fallback) {
   return parsed;
 }
 
+function parseHour(value, fallback = 7) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const parsed = Number(String(value).trim());
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0 || parsed > 23) return fallback;
+  return parsed;
+}
+
 function loadConfig(env = process.env) {
   const required = ['SUMOPOD_API_KEY', 'WAHA_BASE_URL', 'WAHA_SESSION', 'OWNER_JID'];
   const missing = required.filter((k) => !String(env[k] || '').trim());
@@ -51,6 +58,7 @@ function loadConfig(env = process.env) {
     host: env.HOST || '127.0.0.1',
     port: parsePositiveInt(env.PORT, 3088),
     logLevel: env.LOG_LEVEL || 'info',
+    appTimezone: String(env.APP_TIMEZONE || 'Asia/Jakarta').trim() || 'Asia/Jakarta',
     databasePath: path.resolve(env.DATABASE_PATH || './data/bubu.sqlite'),
     storageDir: path.resolve(env.STORAGE_DIR || './storage'),
     ownerJid: normalizeJid(env.OWNER_JID),
@@ -59,6 +67,12 @@ function loadConfig(env = process.env) {
     groupRequireMention: parseBool(env.GROUP_REQUIRE_MENTION, true),
     groupMediaRequireMention: parseBool(env.GROUP_MEDIA_REQUIRE_MENTION, false),
     groupProactiveEnabled: parseBool(env.GROUP_PROACTIVE_ENABLED, false),
+    groupPassiveHistory: parseBool(env.GROUP_PASSIVE_HISTORY, false),
+    groupPassiveBufferSize: Math.min(100, Math.max(5, parsePositiveInt(env.GROUP_PASSIVE_BUFFER_SIZE, 40))),
+    briefing: {
+      enabled: parseBool(env.DAILY_BRIEFING_ENABLED, false),
+      hour: parseHour(env.DAILY_BRIEFING_HOUR, 7)
+    },
     waha: {
       baseUrl: String(env.WAHA_BASE_URL).trim().replace(/\/+$/, ''),
       session: String(env.WAHA_SESSION).trim(),
@@ -68,7 +82,8 @@ function loadConfig(env = process.env) {
       webhookHmacSecret: String(env.WAHA_WEBHOOK_HMAC_SECRET || '').trim(),
       timeoutMs: parsePositiveInt(env.WAHA_TIMEOUT_MS, 15000),
       mediaTimeoutMs: parsePositiveInt(env.WAHA_MEDIA_TIMEOUT_MS, 60000),
-      typingKeepaliveMs: parsePositiveInt(env.WAHA_TYPING_KEEPALIVE_MS, 12000)
+      typingKeepaliveMs: parsePositiveInt(env.WAHA_TYPING_KEEPALIVE_MS, 12000),
+      progressReactions: parseBool(env.PROGRESS_REACTIONS_ENABLED, true)
     },
     search: {
       tavilyApiKey: env.TAVILY_API_KEY || '',
@@ -107,7 +122,11 @@ function loadConfig(env = process.env) {
       baseUrl: (env.SUMOPOD_BASE_URL || 'https://ai.sumopod.com/v1').replace(/\/+$/, ''),
       apiKey: env.SUMOPOD_API_KEY,
       timeoutMs: parsePositiveInt(env.SUMOPOD_TIMEOUT_MS, 60000),
+      promptCaching: parseBool(env.SUMOPOD_PROMPT_CACHING, false),
       models
+    },
+    telemetry: {
+      usdToIdr: parsePositiveInt(env.USD_TO_IDR_RATE, 16500)
     },
     inbox: {
       pollMs: Math.min(5000, Math.max(100, parsePositiveInt(env.INBOX_POLL_MS, 500))),
@@ -140,4 +159,4 @@ function normalizeJid(value) {
   return raw;
 }
 
-module.exports = { loadConfig, normalizeJid, parseBool, parsePositiveInt };
+module.exports = { loadConfig, normalizeJid, parseBool, parsePositiveInt, parseHour };
