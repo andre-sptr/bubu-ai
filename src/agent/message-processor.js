@@ -6,7 +6,7 @@ const { normalizeIncoming } = require('../channels/waha/normalizer');
 const { normalizeMediaUrl } = require('../utils/media-http');
 const { detectMediaKind } = require('../media/media-validator');
 const { classifyTask } = require('./model-router');
-const { handleSlashCommand, isRecognizedSlashCommand } = require('./command-handler');
+const { extractSlashCommand, handleSlashCommand, isRecognizedSlashCommand } = require('./command-handler');
 
 function eventKey(message) {
   const identity = message.eventId
@@ -44,8 +44,8 @@ function hasBotMention(message, botJidOrList = '') {
 }
 
 class MessageProcessor {
-  constructor({ config, db, waha, responseHandler = null, sessionMonitor = null, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger }) {
-    Object.assign(this, { config, db, waha, sessionMonitor, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger });
+  constructor({ config, db, waha, responseHandler = null, sessionMonitor = null, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger, pipelineEvents = null }) {
+    Object.assign(this, { config, db, waha, sessionMonitor, agent, approvalManager, provider, router, documentService, memoryService, mediaService, logger, pipelineEvents });
     this.responseHandler = responseHandler || new ResponseHandler({ waha, mediaService, config, logger });
   }
 
@@ -91,9 +91,13 @@ class MessageProcessor {
     const rawChatId = msg.chatId;
     const rawSenderId = normalizeJid(msg.senderId);
     const initialEventId = eventKey({ ...msg, chatId: rawChatId, senderId: rawSenderId });
+    const runId = String(meta?.eventId || initialEventId).slice(0, 12);
 
     const isGroup = msg.chatId.endsWith('@g.us');
-    if (isGroup && this.config.groupPolicy !== 'all') return;
+    if (isGroup && this.config.groupPolicy !== 'all') {
+      this.pipelineEvents?.discardActiveRun?.(runId);
+      return;
+    }
 
     const bodyText = String(msg.bodyText || '').trim();
     const captionText = String(msg.captionText || '').trim();
@@ -131,6 +135,7 @@ class MessageProcessor {
             this.logger?.warn?.({ chatId: msg.chatId, error: err?.message }, 'Failed to buffer passive group message');
           }
         }
+        this.pipelineEvents?.discardActiveRun?.(runId);
         return; // Ordinary group conversation remains quiet; media-only messages follow their separate policy.
       }
     }
@@ -157,7 +162,10 @@ class MessageProcessor {
     const scope = isGroup ? 'group' : (owner ? 'personal' : 'untrusted');
 
     // The personal assistant is owner-only. In groups, anyone may address Bubu.
-    if (scope === 'untrusted') return;
+    if (scope === 'untrusted') {
+      this.pipelineEvents?.discardActiveRun?.(runId);
+      return;
+    }
 
     if (owner && rawSenderId.endsWith('@lid')) {
       this.sessionMonitor?.rememberOwnerLid?.(rawSenderId);
@@ -170,6 +178,16 @@ class MessageProcessor {
       });
       if (!rate.allowed) {
         this.logger.warn({ chatId: msg.chatId, senderId, retryAfterMs: rate.retryAfterMs }, 'Message rate limit reached');
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'gate',
+          phase: 'failed',
+          label: 'Batas kecepatan pesan tercapai',
+          chatId: msg.chatId,
+          scope,
+          meta: { errorCategory: 'rate_limit', terminal: true },
+          runCompleted: true
+        });
         return;
       }
     }
@@ -230,6 +248,18 @@ class MessageProcessor {
     }
 
     const eventId = meta?.eventId || initialEventId;
+    const inputKind = msg.hasMedia
+      ? (msg.media?.isPtt ? 'voice_note' : 'media')
+      : (quoteContext?.present ? 'quote' : 'text');
+    this.pipelineEvents?.emitStage?.({
+      runId,
+      stage: 'gate',
+      phase: 'completed',
+      label: isGroup ? 'Lolos gerbang grup & presence aktif' : 'Terverifikasi DM pemilik & typing aktif',
+      chatId: msg.chatId,
+      scope,
+      meta: { isGroup, inputKind }
+    });
     const canProgressReact = Boolean(
       this.config?.waha?.progressReactions !== false &&
       msg.eventId &&
@@ -246,6 +276,7 @@ class MessageProcessor {
       }
     };
 
+    let runOutcome = 'completed';
     try {
       if (msg.hasMedia) {
         if (!msg.media?.url) {
@@ -260,15 +291,38 @@ class MessageProcessor {
           const mediaFilename = msg.media.filename || msg.media.fileName ||
             path.basename(normalizedMediaUrl.pathname);
           const mediaKind = detectMediaKind(mediaFilename, msg.media.mimetype);
+          const mediaStarted = Date.now();
           if (mediaKind === 'document') {
             await reactProgress('⏳');
             progressReacted = true;
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'multimodal',
+              phase: 'started',
+              label: 'Mengekstrak dokumen & OCR halaman',
+              chatId: msg.chatId,
+              scope,
+              meta: { mediaKind: 'document' }
+            });
             const doc = await this.documentService.ingestMedia({
               media: msg.media,
               scope,
               ownerId: scope === 'personal' ? senderId : null,
               chatId: scope === 'group' ? msg.chatId : null,
               sourceEventId: eventId
+            });
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'multimodal',
+              phase: 'completed',
+              label: 'Dokumen selesai diekstrak ke workspace',
+              chatId: msg.chatId,
+              scope,
+              meta: {
+                mediaKind: 'document',
+                extractionMode: doc.extractionMode || 'text',
+                durationMs: Date.now() - mediaStarted
+              }
             });
             attachmentEvidence = {
               kind: 'document',
@@ -293,7 +347,34 @@ class MessageProcessor {
               await reactProgress('⏳');
               progressReacted = true;
             }
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'multimodal',
+              phase: 'started',
+              label: mediaKind === 'audio'
+                ? 'Transkripsi audio Whisper.cpp + Silero VAD'
+                : mediaKind === 'video'
+                  ? 'Ekstraksi frame video FFmpeg + audio STT'
+                  : 'Normalisasi gambar & OCR Tesseract',
+              chatId: msg.chatId,
+              scope,
+              meta: { mediaKind }
+            });
             const processed = await this.mediaService.processIncoming({ media: msg.media });
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'multimodal',
+              phase: 'completed',
+              label: `Pemrosesan media ${mediaKind} selesai`,
+              chatId: msg.chatId,
+              scope,
+              meta: {
+                mediaKind,
+                ...(processed.visualMode ? { visualMode: processed.visualMode } : {}),
+                ...(Array.isArray(processed.frames) ? { frameCount: processed.frames.length } : {}),
+                durationMs: Date.now() - mediaStarted
+              }
+            });
             const extractedText = String(processed.extractedText || '').slice(
               0, this.config.documents.maxExtractChars || 30000
             );
@@ -423,12 +504,72 @@ class MessageProcessor {
         return;
       }
 
+      if (!msg.hasMedia) {
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'multimodal',
+          phase: 'bypassed',
+          label: 'Pesan teks langsung melewati stasiun media',
+          chatId: msg.chatId,
+          scope,
+          meta: { bypassed: true }
+        });
+      }
+
       if (await handleSlashCommand(this, { text, msg, senderId, owner, isGroup, scope, eventId })) {
+        const slashCommand = extractSlashCommand(text) || 'command';
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'context',
+          phase: 'bypassed',
+          label: 'Perintah slash melewati retrieval memori',
+          chatId: msg.chatId,
+          scope,
+          meta: { bypassed: true, slashCommand }
+        });
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'llm',
+          phase: 'bypassed',
+          label: 'Perintah slash tidak memanggil model AI',
+          chatId: msg.chatId,
+          scope,
+          meta: { bypassed: true, slashCommand }
+        });
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'tools',
+          phase: 'bypassed',
+          label: 'Tanpa tool loop agen',
+          chatId: msg.chatId,
+          scope,
+          meta: { bypassed: true }
+        });
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'delivery',
+          phase: 'completed',
+          label: `Respons perintah ${slashCommand} terkirim`,
+          chatId: msg.chatId,
+          scope,
+          meta: { slashCommand, outputMode: 'text' },
+          runCompleted: true
+        });
         return;
       }
 
       if (!this.config.agent.enabled) {
         await this.responseHandler.sendText('Bubu Agent sedang dinonaktifkan.', msg.chatId);
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'delivery',
+          phase: 'completed',
+          label: 'Pemberitahuan status agen terkirim',
+          chatId: msg.chatId,
+          scope,
+          meta: { outputMode: 'text' },
+          runCompleted: true
+        });
         return;
       }
 
@@ -442,17 +583,30 @@ class MessageProcessor {
         ownerId: scope === 'personal' ? senderId : null,
         chatId: scope === 'group' ? msg.chatId : null
       };
-      const isGreetingFastPath = !msg.hasMedia && !quoteContext && !captionContext && !voiceInstruction && classifyTask(text) === 'greeting';
+      const taskClass = classifyTask(text);
+      const isGreetingFastPath = !msg.hasMedia && !quoteContext && !captionContext && !voiceInstruction && taskClass === 'greeting';
       const passiveGroupMessages = isGroup &&
         this.config.groupPassiveHistory &&
         !isGreetingFastPath &&
         typeof this.db?.getGroupPassiveMessages === 'function'
         ? (this.db.getGroupPassiveMessages(msg.chatId, Math.min(20, this.config.groupPassiveBufferSize || 40)) || [])
         : [];
-      if (!progressReacted && !isGreetingFastPath && ['agent', 'reasoning'].includes(classifyTask(text))) {
+      if (!progressReacted && !isGreetingFastPath && ['agent', 'reasoning'].includes(taskClass)) {
         await reactProgress('⏳');
         progressReacted = true;
       }
+      this.pipelineEvents?.emitStage?.({
+        runId,
+        stage: 'context',
+        phase: 'started',
+        label: isGreetingFastPath
+          ? 'Jalur cepat sapaan (tanpa retrieval memori)'
+          : 'Memuat riwayat chat, memori semantik, & proyek',
+        chatId: msg.chatId,
+        scope,
+        meta: { isFastPath: isGreetingFastPath, taskClass }
+      });
+      const contextStarted = Date.now();
       const memories = !isGreetingFastPath
         ? (this.memoryService
             ? await this.memoryService.retrieve({ ...memoryContext, query: text, limit: 8 })
@@ -461,6 +615,21 @@ class MessageProcessor {
       const projects = !isGreetingFastPath && this.memoryService
         ? await this.memoryService.projectContext({ ...memoryContext, query: text, limit: 5 })
         : [];
+      this.pipelineEvents?.emitStage?.({
+        runId,
+        stage: 'context',
+        phase: 'completed',
+        label: isGreetingFastPath ? 'Konteks jalur cepat siap' : 'Konteks riwayat & memori semantik siap',
+        chatId: msg.chatId,
+        scope,
+        meta: {
+          isFastPath: isGreetingFastPath,
+          taskClass,
+          memoryCount: memories.length,
+          projectCount: projects.length,
+          durationMs: Date.now() - contextStarted
+        }
+      });
 
       const result = await this.agent.run({
         text, chatId: msg.chatId, requesterId: senderId, scope, history, memories, projects,
@@ -469,6 +638,9 @@ class MessageProcessor {
         sourceEventId: eventId,
         incomingMessageId: msg.eventId || null
       });
+      if (result?.awaitingApproval) {
+        runOutcome = 'waiting_approval';
+      }
       if (result.text) {
         const responseText = this.db.claimTaskResponse(result.taskId);
         if (responseText !== null) {
@@ -479,14 +651,50 @@ class MessageProcessor {
               defaultMode: this.config.media.voiceReplyDefault ? 'both' : 'text'
             });
 
+            const deliveryStarted = Date.now();
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'delivery',
+              phase: 'started',
+              label: outputMode === 'text'
+                ? 'Memformat & mengirim balasan teks WhatsApp'
+                : 'Menyintesis suara Piper TTS & mengirim balasan',
+              chatId: msg.chatId,
+              scope,
+              meta: {
+                outputMode,
+                ttsUsed: outputMode !== 'text',
+                ...(result?.awaitingApproval ? { approvalStatus: 'awaiting_approval' } : {})
+              }
+            });
+
             const deliveryReceipt = isGroup && msg.eventId
               ? await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode, {
                   replyTo: msg.eventId
                 })
               : await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode);
             const waMessageId = deliveryReceipt?.deliveries?.[0]?.messageId || deliveryReceipt?.messageId || null;
+            const willCaptureMemory = Boolean(this.memoryService && !msg.hasMedia && !quoteContext);
 
             this.db.finishTaskResponse(result.taskId, 'sent');
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'delivery',
+              phase: 'completed',
+              label: outputMode === 'text'
+                ? 'Balasan teks terkirim ke WhatsApp'
+                : 'Balasan suara & teks terkirim ke WhatsApp',
+              chatId: msg.chatId,
+              scope,
+              meta: {
+                outputMode,
+                ttsUsed: outputMode !== 'text',
+                chunks: deliveryReceipt?.deliveries?.[0]?.chunks || 1,
+                durationMs: Date.now() - deliveryStarted,
+                ...(result?.awaitingApproval ? { approvalStatus: 'awaiting_approval' } : {})
+              },
+              runCompleted: !willCaptureMemory && !result?.awaitingApproval
+            });
             if (progressReacted && !progressSettled) {
               progressSettled = true;
               await reactProgress('✅');
@@ -497,8 +705,17 @@ class MessageProcessor {
               ...(waMessageId ? { waMessageId } : {})
             });
             await stopTypingOnce();
-            if (this.memoryService && !msg.hasMedia && !quoteContext) {
+            if (willCaptureMemory) {
               try {
+                this.pipelineEvents?.emitStage?.({
+                  runId,
+                  stage: 'context',
+                  phase: 'progress',
+                  label: 'Menyimpan memori episodik pasca-percakapan',
+                  chatId: msg.chatId,
+                  scope,
+                  meta: { postTurn: true }
+                });
                 this.db.saveMemoryEvent({
                   ...memoryContext,
                   eventType: 'conversation_turn',
@@ -520,6 +737,15 @@ class MessageProcessor {
             }
           } catch (error) {
             this.db.finishTaskResponse(result.taskId, 'uncertain');
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'delivery',
+              phase: 'failed',
+              label: 'Pengiriman balasan WhatsApp bermasalah',
+              chatId: msg.chatId,
+              scope,
+              meta: { errorCategory: 'delivery_uncertain' }
+            });
             throw error;
           }
         }
@@ -529,12 +755,14 @@ class MessageProcessor {
         await reactProgress('✅');
       }
     } catch (error) {
+      runOutcome = 'failed';
       if (progressReacted && !progressSettled) {
         progressSettled = true;
         await reactProgress('❌');
       }
       throw error;
     } finally {
+      this.pipelineEvents?.finalizeRunIfActive?.(runId, runOutcome);
       await stopTypingOnce();
     }
   }

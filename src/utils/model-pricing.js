@@ -5,16 +5,20 @@ const MODEL_RATES_PER_1M = Object.freeze({
   sonnet: Object.freeze({ in: 3.00, out: 15.00 }),
   opus: Object.freeze({ in: 15.00, out: 75.00 }),
   gemini: Object.freeze({ in: 1.25, out: 10.00 }),
-  fast: Object.freeze({ in: 0.80, out: 4.00 }),
-  balanced: Object.freeze({ in: 3.00, out: 15.00 }),
-  coding: Object.freeze({ in: 3.00, out: 15.00 }),
-  vision: Object.freeze({ in: 3.00, out: 15.00 }),
-  reasoning: Object.freeze({ in: 15.00, out: 75.00 }),
-  summary: Object.freeze({ in: 1.25, out: 10.00 })
+  deepseekPro: Object.freeze({ in: 1.32, out: 3.96 }),
+  deepseekFlash: Object.freeze({ in: 0.30, out: 1.20 }),
+  fast: Object.freeze({ in: 1.32, out: 3.96 }),
+  balanced: Object.freeze({ in: 1.32, out: 3.96 }),
+  coding: Object.freeze({ in: 1.32, out: 3.96 }),
+  vision: Object.freeze({ in: 0.30, out: 1.20 }),
+  reasoning: Object.freeze({ in: 1.32, out: 3.96 }),
+  summary: Object.freeze({ in: 1.32, out: 3.96 })
 });
 
 function getModelRates(modelId = '', tier = '') {
   const id = String(modelId || '').toLowerCase();
+  if (id.includes('deepseek') && id.includes('flash')) return MODEL_RATES_PER_1M.deepseekFlash;
+  if (id.includes('deepseek')) return MODEL_RATES_PER_1M.deepseekPro;
   if (id.includes('haiku')) return MODEL_RATES_PER_1M.haiku;
   if (id.includes('opus')) return MODEL_RATES_PER_1M.opus;
   if (id.includes('sonnet')) return MODEL_RATES_PER_1M.sonnet;

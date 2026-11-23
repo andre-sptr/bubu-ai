@@ -78,7 +78,7 @@ test('Phase 2 contract: WAHA GOWS normalizer separates bodyText, captionText, qu
   assert.equal(crossChat.quote.text, undefined);
 });
 
-test('Phase 2 contract: visual routing selects claude-sonnet-5-5 and enforces base64 data URL boundary', () => {
+test('Phase 2 contract: visual routing selects deepseek-flash and enforces base64 data URL boundary', () => {
   const cfg = loadConfig({
     SUMOPOD_API_KEY: 'test-key',
     WAHA_BASE_URL: 'http://127.0.0.1:3000',
@@ -86,7 +86,11 @@ test('Phase 2 contract: visual routing selects claude-sonnet-5-5 and enforces ba
     OWNER_JID: '628111111111@c.us'
   });
   const router = new ModelRouter(cfg.sumopod.models);
-  assert.equal(router.select('simple_question', { needsTools: true, needsVision: true }).model, 'claude-sonnet-5-5');
+  assert.equal(router.select('simple_question', { needsTools: true, needsVision: true }).model, 'deepseek-flash');
+  assert.deepEqual(
+    router.selectCandidates('simple_question', { needsTools: true, needsVision: true }).map((c) => c.model),
+    ['deepseek-flash']
+  );
 
   const sampleJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
   const dataUrl = `data:image/jpeg;base64,${sampleJpeg.toString('base64')}`;

@@ -29,11 +29,16 @@ test('uses benchmark-informed model defaults without model validation flags', ()
     WAHA_SESSION: 'default',
     OWNER_JID: '628123@c.us'
   });
-  assert.equal(c.sumopod.models.fast.id, 'claude-haiku-5-5');
-  assert.equal(c.sumopod.models.balanced.id, 'claude-sonnet-5-5');
-  assert.equal(c.sumopod.models.reasoning.id, 'claude-opus-5-5');
-  assert.equal(c.sumopod.models.coding.id, 'claude-sonnet-5-5');
-  assert.equal(c.sumopod.models.summary.id, 'gemini/gemini-3.1-pro-preview');
+  assert.equal(c.sumopod.models.fast.id, 'deepseek-v4-pro');
+  assert.equal(c.sumopod.models.fast.supportsVision, false);
+  assert.equal(c.sumopod.models.balanced.id, 'deepseek-v4-pro');
+  assert.equal(c.sumopod.models.balanced.supportsVision, false);
+  assert.equal(c.sumopod.models.reasoning.id, 'deepseek-v4-pro');
+  assert.equal(c.sumopod.models.reasoning.supportsVision, false);
+  assert.equal(c.sumopod.models.coding.id, 'deepseek-v4-pro');
+  assert.equal(c.sumopod.models.coding.supportsVision, false);
+  assert.equal(c.sumopod.models.summary.id, 'deepseek-v4-pro');
+  assert.equal(c.sumopod.models.summary.supportsVision, false);
 });
 
 
@@ -131,7 +136,8 @@ test('minimal production environment works without optional overrides', () => {
   assert.equal(c.databasePath.replace(/\\/g, '/').endsWith('/data/bubu.sqlite'), true);
   assert.equal(c.storageDir.replace(/\\/g, '/').endsWith('/storage'), true);
   assert.equal(c.sumopod.baseUrl, 'https://ai.sumopod.com/v1');
-  assert.equal(c.sumopod.models.vision.id, 'claude-sonnet-5-5');
+  assert.equal(c.sumopod.models.vision.id, 'deepseek-flash');
+  assert.equal(c.sumopod.models.vision.supportsVision, true);
   assert.equal(c.media.visionEnabled, true);
   assert.equal(c.media.maxVisionBytes, 4 * 1024 * 1024);
   assert.equal(c.media.maxVisionDimension, 1280);

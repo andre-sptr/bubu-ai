@@ -163,6 +163,62 @@ const telemetryRepository = {
       costByTier,
       byModel
     };
+  },
+
+  listRecentVisualizerRuns({ limit = 15 } = {}) {
+    const parsed = (limit === null || limit === undefined || limit === '') ? 15 : Number(limit);
+    const safeLimit = Number.isFinite(parsed) ? Math.max(1, Math.min(30, Math.trunc(parsed))) : 15;
+
+    const tasks = this.db.prepare(`
+      SELECT id, source_event_id, chat_id, scope, status, response_status, model_tier, tool_calls, created_at, updated_at
+      FROM tasks
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(safeLimit);
+
+    if (!tasks.length) return [];
+
+    const usageStmt = this.db.prepare(`
+      SELECT model_id, tier, input_tokens, output_tokens, latency_ms, outcome, created_at
+      FROM model_usage
+      WHERE task_id = ?
+      ORDER BY id ASC
+    `);
+    const stepsStmt = this.db.prepare(`
+      SELECT step_no, tool_name, status, duration_ms, created_at
+      FROM task_steps
+      WHERE task_id = ?
+      ORDER BY step_no ASC
+    `);
+
+    return tasks.map((row) => ({
+      id: row.id,
+      sourceEventId: row.source_event_id || null,
+      chatId: row.chat_id,
+      scope: row.scope,
+      status: row.status,
+      responseStatus: row.response_status,
+      modelTier: row.model_tier || null,
+      toolCalls: Number(row.tool_calls || 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      modelUsage: usageStmt.all(row.id).map((u) => ({
+        modelId: u.model_id,
+        tier: u.tier,
+        inputTokens: Number(u.input_tokens || 0),
+        outputTokens: Number(u.output_tokens || 0),
+        latencyMs: Number(u.latency_ms || 0),
+        outcome: u.outcome,
+        createdAt: u.created_at
+      })),
+      steps: stepsStmt.all(row.id).map((s) => ({
+        stepNo: Number(s.step_no || 0),
+        toolName: s.tool_name,
+        status: s.status,
+        durationMs: Number(s.duration_ms || 0),
+        createdAt: s.created_at
+      }))
+    }));
   }
 };
 

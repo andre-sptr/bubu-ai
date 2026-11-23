@@ -523,7 +523,7 @@ async function handleSlashCommand(processor, { text, msg, senderId, owner, isGro
     const result = await withTimeout(
       processor.provider.chat({
         model: selected.model,
-        maxTokens: Math.min(2000, processor.config?.agent?.maxOutputTokens || 1800),
+        maxTokens: Math.min(4096, processor.config?.agent?.maxOutputTokens || 4096),
         messages: [
           { role: 'system', content: 'Ringkas percakapan dalam bahasa Indonesia. Pisahkan keputusan, informasi penting, dan tindak lanjut. Jangan mengarang.' },
           { role: 'user', content: transcript }

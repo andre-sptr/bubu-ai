@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const { classifyTask } = require('./model-router');
 const { formatApprovalPrompt } = require('./approval-manager');
 const { REQUEST_TOOL_GROUP_NAME, ALL_TOOL_GROUPS } = require('./tool-registry');
+const { resolveToolGroup } = require('../telemetry/pipeline-events');
 const {
   SYSTEM_PROMPT,
   buildAttachmentEvidenceMessage,
@@ -61,17 +62,19 @@ function timeout(promise, ms, label, abortController = null) {
 }
 
 class AgentRuntime {
-  constructor({ provider, router, tools, db, config, logger }) {
+  constructor({ provider, router, tools, db, config, logger, pipelineEvents = null }) {
     this.provider = provider;
     this.router = router;
     this.tools = tools;
     this.db = db;
     this.config = config;
     this.logger = logger;
+    this.pipelineEvents = pipelineEvents;
   }
 
   async run({ text, chatId, requesterId, scope, history = [], memories = [], projects = [], captionContext = null, voiceInstruction = null, attachmentEvidence = null, quoteContext = null, passiveGroupMessages = [], sourceEventId = null, incomingMessageId = null }) {
     const taskId = stableTaskId(sourceEventId, text);
+    const runId = String(sourceEventId || taskId).slice(0, 12);
     const existingTask = this.db.getTask(taskId);
     if (existingTask?.status === 'completed') {
       const savedText = existingTask.result_text || '';
@@ -140,6 +143,19 @@ class AgentRuntime {
             fromModel: selected.model,
             toModel: candidate.model
           }, 'Escalating agent model tier for follow-up tool synthesis');
+          this.pipelineEvents?.emitStage?.({
+            runId,
+            stage: 'llm',
+            phase: 'progress',
+            label: 'Eskalasi tier model untuk sintesis tool',
+            chatId,
+            scope,
+            meta: {
+              escalatedFromTier: selected.tier,
+              modelTier: candidate.tier,
+              modelId: candidate.model
+            }
+          });
           selected = candidate;
         }
       } catch {
@@ -274,6 +290,19 @@ class AgentRuntime {
             toTier: nextCandidate.tier,
             error: error?.message
           }, 'Transient provider error; falling back to next model candidate');
+          this.pipelineEvents?.emitStage?.({
+            runId,
+            stage: 'llm',
+            phase: 'progress',
+            label: 'Fallback ke kandidat model berikutnya',
+            chatId,
+            scope,
+            meta: {
+              fallbackFromModel: candidate.model,
+              modelId: nextCandidate.model,
+              modelTier: nextCandidate.tier
+            }
+          });
         }
       }
       throw new Error('No model candidate succeeded');
@@ -415,6 +444,22 @@ class AgentRuntime {
         status: result?.error ? 'failed' : 'completed',
         durationMs
       });
+      this.pipelineEvents?.emitStage?.({
+        runId,
+        stage: 'tools',
+        phase: result?.pendingApproval ? 'waiting' : (result?.error ? 'failed' : 'completed'),
+        label: result?.pendingApproval
+          ? 'Menunggu persetujuan pemilik (/approve)'
+          : (result?.error ? `Tool ${toolKey} gagal` : `Hasil tool ${toolKey} diterima`),
+        chatId,
+        scope,
+        meta: {
+          toolName: toolKey,
+          toolGroup: resolveToolGroup(this.tools, name),
+          durationMs,
+          ...(result?.pendingApproval ? { pendingApproval: true } : {})
+        }
+      });
       this.db.audit({
         chatId, actorId: requesterId, action: `tool:${toolKey}`,
         outcome: result?.error ? 'failed' : 'completed',
@@ -489,6 +534,22 @@ class AgentRuntime {
           tier: selected.tier, model: selected.model, messageCount: messages.length,
           toolSchemaCount: roundTools.length
         }, 'Agent model request started');
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'llm',
+          phase: 'started',
+          label: `Memproses penalaran model Sumopod (Putaran ${round + 1})`,
+          chatId,
+          scope,
+          meta: {
+            taskClass: task,
+            modelTier: selected.tier,
+            modelId: selected.model,
+            round: round + 1,
+            maxRounds: this.config.agent.maxRounds,
+            toolSchemaCount: roundTools.length
+          }
+        });
         let completion;
         let requestStarted = Date.now();
         try {
@@ -553,6 +614,23 @@ class AgentRuntime {
           toolNames: roundToolCalls.map((item) => item.function?.name || 'unknown')
         };
         this.logger.info?.(responseMeta, 'Agent model response received');
+        this.pipelineEvents?.emitStage?.({
+          runId,
+          stage: 'llm',
+          phase: roundToolCalls.length === 0 ? 'completed' : 'progress',
+          label: roundToolCalls.length === 0 ? 'Jawaban final selesai disusun' : 'Model memilih pemanggilan tool',
+          chatId,
+          scope,
+          meta: {
+            modelTier: selected.tier,
+            modelId: completion.model || selected.model,
+            round: round + 1,
+            latencyMs: Date.now() - requestStarted,
+            inputTokens: completion.usage?.prompt_tokens ?? 0,
+            outputTokens: completion.usage?.completion_tokens ?? 0,
+            toolCount: roundToolCalls.length
+          }
+        });
         if (['length', 'max_tokens', 'max_output_tokens'].includes(
           String(completion.finishReason || '').toLowerCase()
         )) {
@@ -584,6 +662,17 @@ class AgentRuntime {
           }
         }
         if (roundToolCalls.length === 0) {
+          if (calls === 0) {
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'tools',
+              phase: 'bypassed',
+              label: 'Tidak memerlukan eksekusi tool',
+              chatId,
+              scope,
+              meta: { bypassed: true }
+            });
+          }
           const answer = String(assistantMessage.content || '').trim()
             || 'Maaf, Bubu belum menghasilkan jawaban. Silakan coba sekali lagi dengan instruksi yang lebih spesifik.';
           this.db.updateTask(taskId, {
@@ -648,6 +737,23 @@ class AgentRuntime {
             const baseStep = step;
             calls += batch.length;
             step += batch.length;
+            const batchNames = batch.map((c) => c.function?.name || 'unknown');
+            const batchGroups = [...new Set(batchNames.map((n) => resolveToolGroup(this.tools, n)))];
+            this.pipelineEvents?.emitStage?.({
+              runId,
+              stage: 'tools',
+              phase: 'started',
+              label: 'Menjalankan batch tool paralel (read-only)',
+              chatId,
+              scope,
+              meta: {
+                parallel: true,
+                parallelTools: batchNames,
+                toolGroups: batchGroups,
+                toolGroup: batchGroups[0] || 'core',
+                toolCount: batch.length
+              }
+            });
             const outcomes = await Promise.all(batch.map((c) => runToolCall(c, completion.model)));
             for (let b = 0; b < batch.length; b++) {
               const exitResult = recordToolOutcome({
@@ -665,6 +771,20 @@ class AgentRuntime {
           const call = roundToolCalls[idx];
           calls++;
           step++;
+          const singleToolName = call.function?.name || 'unknown';
+          this.pipelineEvents?.emitStage?.({
+            runId,
+            stage: 'tools',
+            phase: 'started',
+            label: `Menjalankan tool ${singleToolName}`,
+            chatId,
+            scope,
+            meta: {
+              parallel: false,
+              toolName: singleToolName,
+              toolGroup: resolveToolGroup(this.tools, singleToolName)
+            }
+          });
           const outcome = await runToolCall(call, completion.model);
           const exitResult = recordToolOutcome({
             call,
@@ -692,7 +812,7 @@ class AgentRuntime {
           }
         ],
         toolsDefs: undefined,
-        maxTokens: 1200,
+        maxTokens: 2400,
         label: 'Final response request',
         timeoutMessage: 'Agent task timed out before final response',
         taskForRouting: task === 'greeting' ? 'general_chat' : task,

@@ -9,12 +9,14 @@ class InboxWorker {
     maxConcurrentJobs = 1,
     pruneIntervalMs = 3600000,
     heartbeatIntervalMs = null,
-    storageDir = null
+    storageDir = null,
+    pipelineEvents = null
   }) {
     this.db = db;
     this.handler = handler;
     this.logger = logger;
     this.onDeadLetter = onDeadLetter;
+    this.pipelineEvents = pipelineEvents;
     this.pollMs = pollMs;
     this.maxAttempts = maxAttempts;
     this.staleMs = staleMs;
@@ -129,6 +131,27 @@ class InboxWorker {
     this.activeCount += 1;
     this.running = this.activeCount > 0;
     this.inFlightEventIds.add(event.event_id);
+    const runId = String(event?.event_id || '').slice(0, 12);
+    const scope = String(event?.chat_id || '').endsWith('@g.us') ? 'group' : 'personal';
+    const queueStats = this.db.getQueueStats?.() || null;
+    this.pipelineEvents?.emitStage?.({
+      runId,
+      stage: 'queue',
+      phase: 'started',
+      label: 'Worker mengklaim pesan dari antrean FIFO',
+      chatId: event.chat_id,
+      scope,
+      meta: {
+        priority: event.priority ?? 5,
+        attempts: event.attempts ?? 1,
+        ...(queueStats ? {
+          queuePending: queueStats.pendingCount,
+          queueProcessing: queueStats.processingCount,
+          queueFailed: queueStats.failedCount,
+          queueDead: queueStats.deadCount
+        } : {})
+      }
+    });
     let heartbeatTimer = null;
     if (typeof this.db?.touchEventLock === 'function' && this.heartbeatIntervalMs > 0) {
       heartbeatTimer = setInterval(() => {
@@ -147,6 +170,15 @@ class InboxWorker {
         senderId: event.sender_id
       });
       this.db.finishEvent(event.event_id);
+      this.pipelineEvents?.emitStage?.({
+        runId,
+        stage: 'queue',
+        phase: 'completed',
+        label: 'Event antrean selesai diproses',
+        chatId: event.chat_id,
+        scope
+      });
+      this.pipelineEvents?.finalizeRunIfActive?.(runId, 'completed');
     } catch (error) {
       const policy = classifyOperationalError(error);
       const terminal = !policy.retryable || event.attempts >= this.maxAttempts;
@@ -159,6 +191,19 @@ class InboxWorker {
         attemptsForState,
         this.maxAttempts
       );
+      this.pipelineEvents?.emitStage?.({
+        runId,
+        stage: 'queue',
+        phase: 'failed',
+        label: terminal ? 'Event dipindahkan ke dead-letter' : 'Penjadwalan ulang retry terbatas',
+        chatId: event.chat_id,
+        scope,
+        meta: {
+          errorCategory: policy.category,
+          attempts: event.attempts,
+          terminal
+        }
+      });
 
       const log = {
         eventId: event.event_id,

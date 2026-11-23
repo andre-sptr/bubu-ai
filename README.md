@@ -15,6 +15,7 @@ Rebuild bersih (tanpa kode atau data Bubu v1) untuk asisten AI WhatsApp hybrid (
 | **Phase 4** | Native WhatsApp Outbound Features (Task 4.1–4.8) | **Kode & Unit Test Selesai** | 14 tools native WAHA (reaksi, polling, lokasi, vCard, link preview, edit/delete pesan bot, persetujuan lintas-chat, info grup, cek nomor, riwayat DM, & monitor sesi/identitas bot) |
 | **Phase 5** | Advanced Agent & Memory Lifecycle (Task 5.1–5.8) | **Kode & Unit Test Selesai** | Siklus hidup memori (12 memory tools), migrasi v11, budget prompt JSON-aman, eskalasi tier dinamis, & perintah `/memory` |
 | **Phase 6** | Queue Redesign & End-to-End Hardening (Task 6.1–6.8) | **Kode & Unit Test Selesai** | Antrean prioritas + FIFO per-chat, konkurensi multi-slot terbatas, `/queue`, retensi & cleanup temp, backup terverifikasi `integrity_check`, PDF token/table wrapping, & normalisasi XLSX |
+| **Observatorium 3D & Model** | 3D Pipeline Visualizer (`waha.andresptr.site`) & DeepSeek V4 | **Aktif di Produksi** | Telemetri SSE `/api/visualizer/*` tersanitasi, kantor futuristik 3D + padang rumput (`Three.js`), kontrol simulasi 1-baris, serta routing default `deepseek-v4-pro` / `deepseek-flash` |
 
 ---
 
@@ -24,13 +25,13 @@ Informasi lingkungan produksi target:
 
 | Komponen | Spesifikasi / Lokasi di VPS | Catatan Operasional |
 |---|---|---|
-| **Direktori Proyek** | `/www/wwwroot/bot-project/bubu` | Dikelola dengan PM2 (`ecosystem.config.cjs`, proses `bubu`, `max_memory_restart: 1G`). |
-| **Kapasitas Server** | **2 vCPU**, **1,9 GiB RAM total**, **23,7 GiB disk bebas** | Dilindungi single-concurrency guard (`audioBusy` & `videoBusy`) pada `MediaIntelligenceService` dan `maxConcurrentJobs = 1` (dapat dikonfigurasi via `AGENT_MAX_CONCURRENT_JOBS` dengan serialisasi FIFO per chat). |
-| **Runtime Node.js** | **Node.js v24.22.1** (`engines: >=22.0.0`) | `better-sqlite3` v12+ menyediakan prebuilt binary Node.js 24 tanpa kompilasi C++ lokal. |
-| **Endpoint Layanan** | `http://127.0.0.1:3088` (`/webhook`, `/health`, `/ready`) | Readiness memverifikasi koneksi SQLite dan status worker. |
-| **Database** | SQLite (`./data/bubu.sqlite`), **Schema Version 12** | Mode WAL + Foreign Keys aktif; backup online terverifikasi `PRAGMA integrity_check` & rotasi retensi melalui `npm run backup`. |
+| **Direktori Proyek** | `/opt/apps/bubu-ai` | Dikelola dengan PM2 (`ecosystem.config.cjs`, proses `bubu`, `max_memory_restart: 1G`). |
+| **Kapasitas Server** | **2 vCPU**, **7,5 GiB RAM**, Ubuntu `24.04.5 LTS` | Dijalankan bersama `1Panel + OpenResty`; dilindungi single-concurrency guard (`audioBusy` & `videoBusy`) pada `MediaIntelligenceService` dan `maxConcurrentJobs = 1` (dapat dikonfigurasi via `AGENT_MAX_CONCURRENT_JOBS` dengan serialisasi FIFO per chat). |
+| **Runtime Node.js** | **Node.js v26.13.1** (`engines: >=22.0.0`) | `better-sqlite3` v12+ menyediakan prebuilt binary tanpa kompilasi C++ lokal. |
+| **Endpoint Layanan** | `http://127.0.0.1:3088` (`/webhook`, `/health`, `/ready`, `/api/visualizer/*`) | Readiness memverifikasi SQLite & worker. Bridge webhook internal Docker-to-host di `10.3.14.216:3089` (ACL `172.19/20.0.0/16`); frontend publik `https://waha.andresptr.site` hanya mem-proxy `/api/visualizer/snapshot` & `/api/visualizer/stream` (tanpa `/webhook`). |
+| **Database** | SQLite (`./data/bubu.sqlite`), **Schema Version 12** | Mode WAL + Foreign Keys aktif; backup online terverifikasi `PRAGMA integrity_check` & rotasi retensi melalui `npm run backup` (cron harian `03:00`). |
 | **Storage Dokumen & Media** | `./storage` (`./storage/inbound`, `./storage/generated`) | Berada di luar public web root (`mode 0700`); file media masuk & direktori kerja sementara dihapus otomatis di blok `finally`. |
-| **WAHA Gateway** | **WAHA 2026.10.1 · CORE · GOWS · WORKING** | Event aktif: `message` dan `session.status`. Mendukung unduhan media lokal, pengiriman teks/file/gambar/video, `sendVoice`, serta presence (`sendSeen`, `startTyping`, `stopTyping`). |
+| **WAHA Gateway** | **WAHA 2026.10.1 · CORE · GOWS · WORKING** | Event aktif: `message`, `session.status`, dan `poll.vote`. Mendukung unduhan media lokal, pengiriman teks/file/gambar/video, `sendVoice`, serta presence (`sendSeen`, `startTyping`, `stopTyping`). |
 | **FFmpeg & FFprobe** | **v6.1.1** (`ffmpeg`, `ffprobe`, encoder `libopus` aktif) | Normalisasi gambar JPEG (`<=1280px`), ekstraksi frame video ber-timestamp, konversi audio WAV 16 kHz mono, dan encoding voice note OGG/Opus 48 kHz 32 kbps. |
 | **OCR Lokal** | **Tesseract v5.3.4** (`tesseract`, bahasa `ind+eng`) | Digunakan sebagai suplemen teks pada gambar/video dan fallback berlabel `[OCR_FALLBACK]`. |
 | **STT + VAD Lokal** | **Whisper.cpp** (`/opt/whisper.cpp/build/bin/whisper-cli`)<br>Model: `/opt/whisper.cpp/models/ggml-base.bin`<br>VAD: `/opt/whisper.cpp/models/ggml-silero-v6.2.0.bin` | Berjalan dengan `--vad -vt 0.50 -vspd 250 -vsd 500 -vp 100 -t 2 -ng`. Audio tanpa ucapan menghasilkan `noSpeech: true` dan berhenti sebelum memanggil Agent. |
@@ -66,13 +67,15 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 
 | Tier | Default Model ID | Kegunaan Utama |
 |---|---|---|
-| `fast` | `claude-haiku-5-5` | Pertanyaan singkat, sapaan, klasifikasi ringan |
-| `balanced` | `claude-sonnet-5-5` | Tugas asisten harian, eksekusi tool umum |
-| `vision` | `claude-sonnet-5-5` | Pemahaman visual gambar & rangkaian frame video (`needsVision: true`) |
-| `coding` | `claude-sonnet-5-5` | Pembuatan dan debugging kode |
-| `reasoning` | `claude-opus-5-5` | Perencanaan multi-langkah kompleks & penalaran mendalam |
-| `summary` | `gemini/gemini-3.1-pro-preview` | Ringkasan konteks panjang (`/rangkum`, dokumen besar) |
+| `fast` | `deepseek-v4-pro` | Pertanyaan singkat, sapaan, klasifikasi ringan |
+| `balanced` | `deepseek-v4-pro` | Tugas asisten harian, eksekusi tool umum |
+| `vision` | `deepseek-flash` | Pemahaman visual gambar & rangkaian frame video (`needsVision: true`) |
+| `coding` | `deepseek-v4-pro` | Pembuatan dan debugging kode |
+| `reasoning` | `deepseek-v4-pro` | Perencanaan multi-langkah kompleks & penalaran mendalam |
+| `summary` | `deepseek-v4-pro` | Ringkasan konteks panjang (`/rangkum`, dokumen besar) |
 | `embedding` | `gemini/gemini-embedding-001` | Vektor memori semantik (`POST /embeddings` dengan circuit-breaker 5 menit ke pencarian leksikal) |
+
+- **Gating Kemampuan & Ruang Token Thinking:** Seluruh tier teks (`fast`, `balanced`, `reasoning`, `coding`, `summary`) menandai `supportsVision: false` sehingga pesan dengan lampiran gambar/frame video (`needsVision: true`) selalu dirutekan ke `deepseek-flash` (`supportsVision: true`). Karena `deepseek-v4-pro` memproduksi `reasoning_content` yang ikut menghitung batas `max_tokens`, pemanggilan ekstraksi memori (`src/memory/memory-service.js`: `2048` token / timeout `25000` ms), finalizer batas putaran (`src/agent/runtime.js`: `2400` token), dan perintah `/rangkum` (`src/agent/command-handler.js`: hingga `4096` token) diberi ruang token tambahan, serta estimasi biaya `/usage` didukung tarif `deepseekPro` dan `deepseekFlash` di [`src/utils/model-pricing.js`](src/utils/model-pricing.js).
 
 ---
 
@@ -88,7 +91,7 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
   - Memori, riwayat percakapan, task, proyek, preferensi `/voice`, dan file dokumen terisolasi ketat per workspace (`personal` vs `group` per `chat_id`).
 
 ### B. Multimodal WhatsApp Penuh (Phase 2)
-- **Pemahaman Gambar (`Task 2.6`):** Gambar dinormalisasi dengan FFmpeg (`<=1280px`, `<=4 MiB` JPEG), divalidasi signature magic-byte, dan dikirim sebagai `data:image/jpeg;base64` ke model vision `claude-sonnet-5-5` bersama suplemen OCR Tesseract (`ind+eng`). URL privat WAHA diblokir di `SumopodProvider`. Jika vision gagal/nonaktif, otomatis beralih ke `[OCR_FALLBACK]`.
+- **Pemahaman Gambar (`Task 2.6`):** Gambar dinormalisasi dengan FFmpeg (`<=1280px`, `<=4 MiB` JPEG), divalidasi signature magic-byte, dan dikirim sebagai `data:image/jpeg;base64` ke model vision `deepseek-flash` bersama suplemen OCR Tesseract (`ind+eng`). URL privat WAHA diblokir di `SumopodProvider`. Jika vision gagal/nonaktif, otomatis beralih ke `[OCR_FALLBACK]`.
 - **Pemahaman Visual-Temporal Video (`Task 2.7`):** Mengekstrak hingga `8` sampel frame ber-timestamp (`Frame #k [t=MM:SS.s]`), menggabungkan analisis visual frame + OCR frame + transkripsi soundtrack audio (Silero VAD + Whisper), merekonsiliasi durasi metadata WAHA vs FFprobe, serta menandai video terlalu pendek (`<2` frame atau `<1,5` detik) sebagai `temporalStatus: 'insufficient_sample'`.
 - **Voice Note Masuk & Keluar (`Task 2.5`):**
   - Voice note (PTT) masuk ditranskripsikan sebagai instruksi suara pengguna saat ini; file audio biasa diperlakukan sebagai bukti lampiran (`[UNTRUSTED_ATTACHMENT_EVIDENCE]`).
@@ -126,16 +129,25 @@ Sumopod (`https://ai.sumopod.com/v1`) adalah satu-satunya provider LLM dan embed
 - **Pengerasan Backup Produksi (`scripts/backup.js`):** `runBackup` memvalidasi keberadaan DB sumber, menolak jalur `backupDir` dan `storageDir` yang identik atau bersarang satu sama lain, membuka DB dengan `{ readonly: true, fileMustExist: true, timeout: 10000 }`, menulis ke `.tmp`, memverifikasi `PRAGMA integrity_check === 'ok'`, mengatur izin `0o600`, melakukan rename atomik, menyalin `storageDir`, dan memutar cadangan lama melalui `pruneOldBackups(backupDir, keepCount)`.
 - **Pembungkusan Token Panjang PDF & Normalisasi Sel XLSX/CSV (`src/documents/generators/pdf-generator.js`, `src/documents/document-service.js`):** `splitOversizedToken` dan `wrapTextToWidth` memastikan tidak ada baris/URL yang melebihi batas lebar, dan tabel Markdown `buildPdf14Buffer` membungkus sel hingga 4 baris dengan tinggi baris dinamis (`Math.max(20, maxCellLines * 11 + 8)`). Ekstraksi spreadsheet menormalisasi `richText`, `Date` (ISO), `error`, hasil formula, baris baru (`\r?\n`), dan karakter pipa (`|` → `│`) agar kolom `spreadsheet-analyzer.js` tetap presisi.
 
+### G. Observatorium Pipeline 3D Real-Time & Telemetri SSE (`waha.andresptr.site`)
+- **Telemetri Read-Only & Sanitasi Privasi (`src/telemetry/pipeline-events.js`, `src/app.js`, `src/db/repositories/telemetry.repository.js`):** `PipelineEventBus` mengelola ring buffer bounded dan menyiarkan event live terstruktur ke `GET /api/visualizer/snapshot` dan `GET /api/visualizer/stream` (SSE). Seluruh payload disanitasi ketat: identitas chat dianonimkan menjadi `DM-xxxx` / `GRP-xxxx` tanpa teks WhatsApp mentah, JID/nomor telepon, argumen tool, atau estimasi biaya, serta mendukung pembatasan klien SSE (`VISUALIZER_MAX_SSE_CLIENTS`) dan token opsional (`VISUALIZER_ACCESS_TOKEN`).
+- **Observatorium 3D Kantor Futuristik & Padang Rumput (`web/`, `scripts/deploy-web.sh`, `deploy/`):** Aplikasi React + TypeScript + Vite + Three.js yang di-deploy ke `https://waha.andresptr.site`:
+  - *Arsitektur Eksterior & Ruang:* Paviliun futuristik dua tingkat dengan teras batu, dua kolam pantul depan, jembatan masuk berundak, kanopi kaca portal samping, dinding tirai kaca panorama di fasad belakang, mahkota atap logam dengan 9 rusuk eksoskeleton C-frame dan panel surya, serta padang rumput berbukit 3D (`web/src/scene/meadowEnvironment.ts`) lengkap dengan rumput instanced, pepohonan, semak, dan batu alam.
+  - *Zoning 8 Ruangan & Interior:* Lantai terzonasi per stasiun (lobby terrazzo, raised-access floor teknis, lab akustik, arsip kayu hangat, dan Command Rotunda `Inti AI`), koridor jalur fiber-optic berlapis kaca, partisi kaca ber-celah kabel, konsol pembatas kantilever, lounge & huddle sayap kiri-kanan, serta dukungan tema Gelap/Terang.
+  - *Kontrol Interaktif & Aksesibilitas:* Mode `Live WhatsApp` (SSE) dan `Simulasi` 1-baris ringkas, preset kamera (`Ikuti`, `Panorama`, `Inti AI`), panel `Inspektor Pipeline` responsif, fallback WebGL 2D, dan favicon seragam dengan `andresptr.site`.
+
 ---
 
 ## 6. Struktur Direktori Proyek
 
 ```text
-bubu/
+bubu-ai/
 ├── data/                                   # Database SQLite lokal (bubu.sqlite, WAL/SHM — gitignored)
-├── scripts/                                # Skrip operasional, cek sintaks, & regresi otomatis
+├── deploy/                                 # Konfigurasi referensi OpenResty vhost, proxy /api/visualizer, & header keamanan
+├── scripts/                                # Skrip operasional, build/deploy web, cek sintaks, & regresi otomatis
 │   ├── backup.js                           # Online backup SQLite terverifikasi integrity_check + rotasi storage
 │   ├── check-syntax.js                     # Pemeriksaan sintaks seluruh file JS/CJS
+│   ├── deploy-web.sh                       # Typecheck, build web/, & sync statis ke waha.andresptr.site
 │   ├── list-models.js                      # Cek katalog model Sumopod
 │   ├── phase1-regression.sh                # Gate regresi otomatis Phase 1
 │   ├── phase2-regression.sh                # Gate regresi otomatis Phase 2
@@ -154,16 +166,29 @@ bubu/
 │   ├── memory/                             # Memori semantik & proyek (MemoryService, memory-tools.js)
 │   ├── productivity/                       # Tools task, reminder, & pengiriman pesan DM tervalidasi (productivity-tools.js)
 │   ├── providers/                          # SumopodProvider (OpenAI-compatible + image_url sanitizer)
-│   ├── utils/                              # Utilitas bersama (error-policy, media-http, process-runner, rate-limiter, vector, zod-loader)
+│   ├── telemetry/                          # PipelineEventBus & sanitasi payload telemetri visualizer (pipeline-events.js)
+│   ├── utils/                              # Utilitas bersama (error-policy, media-http, model-pricing, process-runner, rate-limiter, vector, zod-loader)
 │   ├── web/                                # Pencarian & fetch web aman (WebSearchService, WebFetchService, web-tools.js)
 │   ├── workers/                            # Background worker (InboxWorker, ReminderWorker)
-│   ├── app.js                              # Server HTTP Fastify (/webhook, /health, /ready)
+│   ├── app.js                              # Server HTTP Fastify (/webhook, /health, /ready, /api/visualizer/*)
 │   └── index.js                            # Bootstrap aplikasi & graceful shutdown
 ├── storage/                                # Penyimpanan privat dokumen & media sementara (isi gitignored)
-└── test/
-    ├── contracts/                          # Kontrak regresi lintas-fase (phase1, phase2, phase4, phase5, & phase6)
-    ├── integration/                        # Tes integrasi SQLite & migrasi (database.test.js)
-    └── unit/                               # Unit test terorganisir per domain (agent, channels, config, documents, media, memory, utils, web, workers)
+├── test/
+│   ├── contracts/                          # Kontrak regresi lintas-fase (phase1, phase2, phase4, phase5, & phase6)
+│   ├── integration/                        # Tes integrasi SQLite & migrasi (database.test.js)
+│   └── unit/                               # Unit test per domain (agent, channels, config, documents, media, memory, telemetry, utils, web, workers)
+│       ├── channels/app-visualizer.test.js
+│       ├── telemetry/pipeline-events.test.js
+│       └── utils/model-pricing.test.js
+└── web/                                    # Frontend Observatorium Alur 3D (React + TypeScript + Vite + Three.js)
+    ├── public/                             # Aset favicon & apple-touch-icon (sinkron dengan andresptr.site)
+    └── src/
+        ├── components/                     # TopBar, InspectorPanel, SimulationControls, StageStepper, WebGLFallback, Icons
+        ├── data/                           # Definisi 8 stasiun (stages.ts) & skenario simulasi (simulations.ts)
+        ├── hooks/                          # Stream SSE & state simulasi (useVisualizerStream.ts)
+        ├── scene/                          # PipelineScene, officeEnvironment, meadowEnvironment, stations, conduits, packets, materials
+        ├── styles/                         # Token warna & layout responsif (tokens.css, app.css)
+        └── types/                          # Tipe TypeScript pipeline & telemetri (pipeline.ts)
 ```
 
 ---
@@ -182,7 +207,11 @@ npm run test:unit
 npm run test:integration
 npm run test:contracts
 
-# 4. Jalankan gate regresi Phase 1–6 di VPS
+# 4. Typecheck, build, & deploy frontend Observatorium 3D (waha.andresptr.site)
+cd web && npx tsc --noEmit && npm run build
+bash scripts/deploy-web.sh
+
+# 5. Jalankan gate regresi Phase 1–6 di VPS
 npm run test:phase1
 npm run test:phase2
 npm run test:phase3
@@ -190,7 +219,7 @@ npm run test:phase4
 npm run test:phase5
 npm run test:phase6
 
-# 5. Restart layanan melalui PM2 & cek kesehatan
+# 6. Restart layanan melalui PM2 & cek kesehatan
 pm2 restart bubu
 curl -s http://127.0.0.1:3088/health
 curl -s http://127.0.0.1:3088/ready

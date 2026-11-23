@@ -23,6 +23,7 @@ const { WebSearchService, WebFetchService } = require('./web/web-service');
 const { MemoryService } = require('./memory/memory-service');
 const { MediaIntelligenceService } = require('./media/media-service');
 const { cleanupOrphanStorageFiles } = require('./utils/storage-cleanup');
+const { PipelineEventBus } = require('./telemetry/pipeline-events');
 
 function cleanupStaleTempDirs({
   tmpRoot = os.tmpdir(),
@@ -118,6 +119,8 @@ async function main() {
   db.recoverStaleTaskResponses();
   cleanupStaleTempDirs({ logger });
   cleanupOrphanStorageFiles({ db, storageDir: config.storageDir, logger });
+  const pipelineEvents = new PipelineEventBus();
+  pipelineEvents.hydrateFromDatabase(db);
   const waha = new WahaClient(config.waha);
   const sessionMonitor = new WahaSessionMonitor({ session: config.waha.session, botJid: config.botJid });
   const syncResult = await sessionMonitor.syncFromWaha(waha, { logger });
@@ -190,10 +193,10 @@ async function main() {
     webSearch,
     webFetch
   });
-  const agent = new AgentRuntime({ provider, router, tools, db, config, logger });
+  const agent = new AgentRuntime({ provider, router, tools, db, config, logger, pipelineEvents });
   const processor = new MessageProcessor({
     config, db, waha, responseHandler, sessionMonitor, agent, approvalManager, provider, router,
-    documentService, memoryService, mediaService, logger
+    documentService, memoryService, mediaService, logger, pipelineEvents
   });
 
   let shuttingDown = false;
@@ -206,6 +209,7 @@ async function main() {
     staleMs: config.inbox.staleMs,
     maxConcurrentJobs: config.agent.maxConcurrentJobs,
     storageDir: config.storageDir,
+    pipelineEvents,
     onDeadLetter: createDeadLetterNotifier({ config, db, waha, responseHandler, logger })
   }).start();
   processor.worker = worker;
@@ -236,6 +240,7 @@ async function main() {
     worker,
     reminderWorker,
     sessionMonitor,
+    pipelineEvents,
     isShuttingDown: () => shuttingDown
   });
   await app.listen({ host: config.host, port: config.port });

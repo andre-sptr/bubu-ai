@@ -32,11 +32,11 @@ function loadConfig(env = process.env) {
   // Optional MODEL_* overrides are available, so routine model selection needs no
   // per-tier capability flags or manual smoke-test configuration.
   const modelDefaults = {
-    fast: 'claude-haiku-5-5',
-    balanced: 'claude-sonnet-5-5',
-    reasoning: 'claude-opus-5-5',
-    coding: 'claude-sonnet-5-5',
-    summary: 'gemini/gemini-3.1-pro-preview'
+    fast: 'deepseek-v4-pro',
+    balanced: 'deepseek-v4-pro',
+    reasoning: 'deepseek-v4-pro',
+    coding: 'deepseek-v4-pro',
+    summary: 'deepseek-v4-pro'
   };
   const models = {};
   for (const [tier, defaultId] of Object.entries(modelDefaults)) {
@@ -44,11 +44,11 @@ function loadConfig(env = process.env) {
     models[tier] = {
       id: String(env[envKey] || defaultId).trim(),
       supportsTools: true,
-      ...(tier === 'balanced' ? { supportsVision: true } : {})
+      supportsVision: false
     };
   }
   models.vision = {
-    id: String(env.MODEL_VISION || models.balanced.id).trim(),
+    id: String(env.MODEL_VISION || 'deepseek-flash').trim(),
     supportsTools: true,
     supportsVision: true
   };
@@ -145,6 +145,11 @@ function loadConfig(env = process.env) {
       messageRateLimit: parsePositiveInt(env.MESSAGE_RATE_LIMIT, 10),
       messageRateWindowMs: parsePositiveInt(env.MESSAGE_RATE_WINDOW_MS, 60000),
       approvalTtlMinutes: parsePositiveInt(env.APPROVAL_TTL_MINUTES, 5)
+    },
+    visualizer: {
+      enabled: parseBool(env.VISUALIZER_ENABLED, true),
+      accessToken: String(env.VISUALIZER_ACCESS_TOKEN || '').trim(),
+      maxSseClients: Math.min(100, Math.max(1, parsePositiveInt(env.VISUALIZER_MAX_SSE_CLIENTS, 30)))
     }
   });
 }

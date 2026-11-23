@@ -239,7 +239,7 @@ class MemoryService {
         timer = setTimeout(() => {
           controller.abort();
           reject(new Error('Memory extraction timed out'));
-        }, 15000);
+        }, 25000);
         timer.unref?.();
       });
       let response;
@@ -247,7 +247,7 @@ class MemoryService {
         response = await Promise.race([
           this.provider.chat({
             model: selected.model,
-            maxTokens: 1000,
+            maxTokens: 2048,
             signal: controller.signal,
             messages: [
               {
