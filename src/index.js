@@ -76,6 +76,7 @@ function cleanupStaleTempDirs({
 function createDeadLetterNotifier({ config, db, waha, responseHandler, logger }) {
   return async ({ event, message, category }) => {
     const incoming = normalizeIncoming(event?.payload || {});
+    if (incoming.isSticker) return;
     let chatId = normalizeJid(event?.chat_id || incoming.chatId);
     if (!chatId) return;
     if (chatId.endsWith('@lid') && typeof waha?.resolveLid === 'function') {
@@ -94,7 +95,11 @@ function createDeadLetterNotifier({ config, db, waha, responseHandler, logger })
       defaultMode: config.media?.voiceReplyDefault ? 'both' : 'text'
     });
     logger?.warn?.({ eventId: event?.event_id, chatId, category }, 'Sending terminal processing notice');
-    await responseHandler.sendAssistantResponse(message, chatId, mode);
+    if (chatId.endsWith('@g.us') && incoming.eventId) {
+      await responseHandler.sendAssistantResponse(message, chatId, mode, { replyTo: incoming.eventId });
+    } else {
+      await responseHandler.sendAssistantResponse(message, chatId, mode);
+    }
   };
 }
 
@@ -182,6 +187,7 @@ async function main() {
     ? new WebSearchService({ apiKey: config.search.tavilyApiKey, maxResults: config.search.maxResults })
     : null;
   const webFetch = new WebFetchService();
+  let worker = null;
   const tools = registerAllTools({
     db,
     approvalManager,
@@ -191,7 +197,9 @@ async function main() {
     memoryService,
     documentService,
     webSearch,
-    webFetch
+    webFetch,
+    config,
+    worker: { getStats: () => worker?.getStats?.() || null }
   });
   const agent = new AgentRuntime({ provider, router, tools, db, config, logger, pipelineEvents });
   const processor = new MessageProcessor({
@@ -200,7 +208,7 @@ async function main() {
   });
 
   let shuttingDown = false;
-  const worker = new InboxWorker({
+  worker = new InboxWorker({
     db,
     handler: (payload, meta) => processor.process(payload, meta),
     logger,
@@ -262,6 +270,7 @@ async function main() {
     }, 12000);
     forceExitTimer.unref?.();
     try {
+      app.closeVisualizerStreams?.();
       await app.close();
       await reminderWorker.stop();
       await worker.stop();

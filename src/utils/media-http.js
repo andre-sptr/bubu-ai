@@ -88,25 +88,38 @@ function normalizeMediaUrl(mediaUrl, wahaBaseUrl) {
   return media;
 }
 
+function buildMimeValidationError(message, { declared, received, label }) {
+  const error = new UserValidationError(message);
+  error.declaredMime = declared || '';
+  error.responseMime = received || '';
+  error.mediaLabel = label || '';
+  return error;
+}
+
 function validateResponseMime(declaredMime, responseMime, acceptedMimes, label) {
   const declared = normalizeMimeType(declaredMime);
   const received = normalizeMimeType(responseMime);
   const accepted = new Set((acceptedMimes || []).map((m) => m.toLowerCase()));
+  const isCompatibleAlias = (mime) =>
+    (mime === 'application/zip' && ['.docx', '.xlsx', '.xlsm'].includes(label)) ||
+    (mime === 'video/webm' && label === '.webm');
+  const isDeclaredAccepted = !declared || isGenericMime(declared) || !accepted.size ||
+    accepted.has(declared) || isCompatibleAlias(declared);
+  const isReceivedAccepted = !received || isGenericMime(received) || !accepted.size ||
+    accepted.has(received) || isCompatibleAlias(received);
 
-  if (declared && !isGenericMime(declared) && accepted.size && !accepted.has(declared) &&
-      !(declared === 'application/zip' && ['.docx', '.xlsx', '.xlsm'].includes(label))) {
-    throw new UserValidationError(`MIME type media tidak didukung untuk ${label}.`);
+  if (!isDeclaredAccepted) {
+    throw buildMimeValidationError(`MIME type media tidak didukung untuk ${label}.`, { declared, received, label });
   }
-  if (received && !isGenericMime(received) && accepted.size && !accepted.has(received)) {
-    // application/zip is a common generic container MIME for OOXML files.
-    if (!(received === 'application/zip' && ['.docx', '.xlsx', '.xlsm'].includes(label))) {
-      throw new UserValidationError(`Content-Type unduhan tidak sesuai dengan ${label}.`);
-    }
+  if (!isReceivedAccepted) {
+    throw buildMimeValidationError(`Content-Type unduhan tidak sesuai dengan ${label}.`, { declared, received, label });
   }
+  const sameExtensionAliases = accepted.size > 0 &&
+    (accepted.has(declared) || isCompatibleAlias(declared)) &&
+    (accepted.has(received) || isCompatibleAlias(received));
   if (declared && received && !isGenericMime(declared) && !isGenericMime(received) &&
-      declared !== received && !(received === 'application/zip' &&
-        ['.docx', '.xlsx', '.xlsm'].includes(label))) {
-    throw new UserValidationError('MIME type webhook berbeda dengan Content-Type hasil unduhan.');
+      declared !== received && !sameExtensionAliases && !isCompatibleAlias(received)) {
+    throw buildMimeValidationError('MIME type webhook berbeda dengan Content-Type hasil unduhan.', { declared, received, label });
   }
 }
 

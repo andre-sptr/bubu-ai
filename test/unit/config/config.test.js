@@ -29,7 +29,7 @@ test('uses benchmark-informed model defaults without model validation flags', ()
     WAHA_SESSION: 'default',
     OWNER_JID: '628123@c.us'
   });
-  assert.equal(c.sumopod.models.fast.id, 'deepseek-v4-pro');
+  assert.equal(c.sumopod.models.fast.id, 'deepseek-flash');
   assert.equal(c.sumopod.models.fast.supportsVision, false);
   assert.equal(c.sumopod.models.balanced.id, 'deepseek-v4-pro');
   assert.equal(c.sumopod.models.balanced.supportsVision, false);
@@ -61,7 +61,7 @@ test('P3 media configuration has safe defaults and optional local models', () =>
 });
 
 
-test('group routing defaults to mention-gated text and accepts media-only group messages', () => {
+test('group routing defaults to mention-gated text/media and passive history buffering', () => {
   const c = loadConfig({
     SUMOPOD_API_KEY: 'key',
     WAHA_BASE_URL: 'http://localhost:3000',
@@ -71,18 +71,21 @@ test('group routing defaults to mention-gated text and accepts media-only group 
   });
   assert.equal(c.botJid, '628987654321@c.us');
   assert.equal(c.groupRequireMention, true);
-  assert.equal(c.groupMediaRequireMention, false);
+  assert.equal(c.groupMediaRequireMention, true);
+  assert.equal(c.groupPassiveHistory, true);
 });
 
-test('group media can optionally require a detectable bot mention', () => {
+test('group media and passive history defaults can be explicitly disabled via env', () => {
   const c = loadConfig({
     SUMOPOD_API_KEY: 'key',
     WAHA_BASE_URL: 'http://localhost:3000',
     WAHA_SESSION: 'default',
     OWNER_JID: '628123456789',
-    GROUP_MEDIA_REQUIRE_MENTION: 'true'
+    GROUP_MEDIA_REQUIRE_MENTION: 'false',
+    GROUP_PASSIVE_HISTORY: 'false'
   });
-  assert.equal(c.groupMediaRequireMention, true);
+  assert.equal(c.groupMediaRequireMention, false);
+  assert.equal(c.groupPassiveHistory, false);
 });
 
 

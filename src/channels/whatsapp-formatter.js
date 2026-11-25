@@ -89,13 +89,28 @@ function formatTable(lines, start, stash) {
 
   while (index < lines.length && lines[index].trim().startsWith('|')) {
     const cells = splitTableRow(lines[index]);
-    const fields = headers.map((header, column) => {
-      const value = cells[column] ?? '';
-      if (!value) return null;
-      return `*${formatInline(header, stash)}:* ${formatInline(value, stash)}`;
-    }).filter(Boolean);
     rowNumber++;
-    output.push(`${rowNumber}. ${fields.join('\n')}`);
+    if (headers.length >= 3) {
+      const primaryValue = cells[0] ?? '';
+      const restFields = headers.slice(1).map((header, idx) => {
+        const value = cells[idx + 1] ?? '';
+        if (!value) return null;
+        return `   • *${formatInline(header, stash)}:* ${formatInline(value, stash)}`;
+      }).filter(Boolean);
+      if (primaryValue) {
+        const heading = `${rowNumber}. *${formatInline(primaryValue, stash)}*`;
+        output.push(restFields.length ? `${heading}\n${restFields.join('\n')}` : heading);
+      } else if (restFields.length) {
+        output.push(`${rowNumber}.\n${restFields.join('\n')}`);
+      }
+    } else {
+      const fields = headers.map((header, column) => {
+        const value = cells[column] ?? '';
+        if (!value) return null;
+        return `*${formatInline(header, stash)}:* ${formatInline(value, stash)}`;
+      }).filter(Boolean);
+      output.push(`${rowNumber}. ${fields.join('\n')}`);
+    }
     index++;
   }
 

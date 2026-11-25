@@ -7,6 +7,9 @@ const MODEL_RATES_PER_1M = Object.freeze({
   gemini: Object.freeze({ in: 1.25, out: 10.00 }),
   deepseekPro: Object.freeze({ in: 1.32, out: 3.96 }),
   deepseekFlash: Object.freeze({ in: 0.30, out: 1.20 }),
+  gpt54Nano: Object.freeze({ in: 0.15, out: 0.60 }),
+  gpt54Mini: Object.freeze({ in: 0.40, out: 1.60 }),
+  gpt54: Object.freeze({ in: 2.50, out: 15.00 }),
   fast: Object.freeze({ in: 1.32, out: 3.96 }),
   balanced: Object.freeze({ in: 1.32, out: 3.96 }),
   coding: Object.freeze({ in: 1.32, out: 3.96 }),
@@ -19,6 +22,9 @@ function getModelRates(modelId = '', tier = '') {
   const id = String(modelId || '').toLowerCase();
   if (id.includes('deepseek') && id.includes('flash')) return MODEL_RATES_PER_1M.deepseekFlash;
   if (id.includes('deepseek')) return MODEL_RATES_PER_1M.deepseekPro;
+  if (id.includes('gpt-5.4-nano')) return MODEL_RATES_PER_1M.gpt54Nano;
+  if (id.includes('gpt-5.4-mini')) return MODEL_RATES_PER_1M.gpt54Mini;
+  if (id.includes('gpt-5.4')) return MODEL_RATES_PER_1M.gpt54;
   if (id.includes('haiku')) return MODEL_RATES_PER_1M.haiku;
   if (id.includes('opus')) return MODEL_RATES_PER_1M.opus;
   if (id.includes('sonnet')) return MODEL_RATES_PER_1M.sonnet;

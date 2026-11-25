@@ -380,6 +380,14 @@ async function handleSlashCommand(processor, { text, msg, senderId, owner, isGro
       processor.db.addMessage({
         chatId: msg.chatId,
         scope,
+        role: 'user',
+        senderId,
+        content: trimmed,
+        eventId
+      });
+      processor.db.addMessage({
+        chatId: msg.chatId,
+        scope,
         role: 'assistant',
         content: approvalReply,
         eventId

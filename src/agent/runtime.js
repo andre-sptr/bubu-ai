@@ -209,6 +209,7 @@ class AgentRuntime {
         return this.tools.definitionsForContext(scope, {
           task: activeTask,
           text: combinedText,
+          quoteText: quoteContext?.text || '',
           hasAttachment: Boolean(attachmentEvidence),
           hasRecentDocuments: recentDocuments.length > 0,
           hasQuote: Boolean(quoteContext?.present),

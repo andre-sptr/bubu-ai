@@ -345,9 +345,18 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     }
   };
 
+  const isDirectPersonalDelivery = (ctx) =>
+    ctx?.scope === 'personal' &&
+    Boolean(ctx?.chatId) &&
+    Boolean(ctx?.requesterId) &&
+    ctx.chatId === ctx.requesterId;
+
+  const canSendDirectly = (ctx) =>
+    ctx?.scope === 'group' || isDirectPersonalDelivery(ctx);
+
   const assertGroupContext = (ctx) => {
-    if (ctx.scope !== 'group') return;
-    if (!String(ctx.chatId || '').endsWith('@g.us')) {
+    if (!canSendDirectly(ctx)) return;
+    if (ctx.scope === 'group' && !String(ctx.chatId || '').endsWith('@g.us')) {
       throw new Error('Pengiriman dokumen otomatis hanya diizinkan ke ID grup WhatsApp yang valid.');
     }
     if (!responseHandler && (!waha || typeof waha.sendFile !== 'function')) {
@@ -355,10 +364,16 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
     }
   };
 
-  const sendGeneratedGroupFile = async ({ record }, ctx, title) => {
-    const stored = db.getDocumentFile(record.id, 'group', null, ctx.chatId);
-    if (!stored || stored.id !== record.id || stored.chat_id !== ctx.chatId) {
-      throw new Error('Dokumen tidak ditemukan pada workspace grup asal; pengiriman dibatalkan.');
+  const sendGeneratedWorkspaceFile = async ({ record }, ctx, title) => {
+    const scope = ctx.scope === 'group' ? 'group' : 'personal';
+    const ownerId = scope === 'personal' ? ctx.requesterId : null;
+    const chatId = scope === 'group' ? ctx.chatId : null;
+    const stored = db.getDocumentFile(record.id, scope, ownerId, chatId);
+    const matchesTarget = scope === 'group'
+      ? stored?.chat_id === ctx.chatId
+      : stored?.owner_id === ctx.requesterId;
+    if (!stored || stored.id !== record.id || !matchesTarget) {
+      throw new Error('Dokumen tidak ditemukan pada workspace asal; pengiriman dibatalkan.');
     }
 
     if (!isPathWithinDir(documentService?.storageDir, stored.file_path)) {
@@ -387,36 +402,39 @@ function createDocumentTools({ db, documentService, approvalManager, waha, respo
         documentId: record.id,
         filename: stored.filename,
         fileSize: stat.size,
-        workspace: 'group',
+        workspace: scope,
         deliveryStatus: 'sent',
         targetChatId: ctx.chatId,
         messageId,
-        message: 'File berhasil dibuat, disimpan di workspace grup, dan dikirim ke grup asal.'
+        message: scope === 'group'
+          ? 'File berhasil dibuat, disimpan di workspace grup, dan dikirim ke grup asal.'
+          : 'File berhasil dibuat, disimpan di workspace, dan langsung dikirim ke chat pribadi.'
       };
     } catch (error) {
       log?.warn?.({
         documentId: record.id,
         chatId: ctx.chatId,
+        scope,
         filename: stored.filename,
         error: error?.message || 'Unknown WAHA delivery error'
-      }, 'Group document delivery failed');
+      }, scope === 'group' ? 'Group document delivery failed' : 'Personal document delivery failed');
       return {
         created: true,
         documentId: record.id,
         filename: stored.filename,
         fileSize: stat.size,
-        workspace: 'group',
+        workspace: scope,
         deliveryStatus: 'uncertain',
         targetChatId: ctx.chatId,
-        message: 'File berhasil dibuat dan disimpan, tetapi hasil pengiriman WAHA belum dapat dipastikan. Bubu tidak mengirim ulang otomatis untuk mencegah file duplikat. Periksa grup terlebih dahulu.'
+        message: 'File berhasil dibuat dan disimpan, tetapi hasil pengiriman WAHA belum dapat dipastikan. Bubu tidak mengirim ulang otomatis untuk mencegah file duplikat. Periksa chat terlebih dahulu.'
       };
     }
   };
 
   const finishGeneratedFile = async ({ saved, title }, ctx) => {
     const { file, record } = saved;
-    if (ctx.scope === 'group') {
-      return sendGeneratedGroupFile({ file, record }, ctx, title);
+    if (canSendDirectly(ctx)) {
+      return sendGeneratedWorkspaceFile({ file, record }, ctx, title);
     }
     return approvalManager.create({
       taskId: ctx.taskId, chatId: ctx.chatId, requesterId: ctx.requesterId,

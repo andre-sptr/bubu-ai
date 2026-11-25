@@ -21,6 +21,7 @@ const {
   acceptedMimesForExtension,
   detectMediaKind,
   validateMediaSignature,
+  isAnimatedWebpBuffer,
   extensionFromMime,
   resolveMediaExtension,
   formatTimestampSeconds
@@ -126,12 +127,24 @@ class MediaIntelligenceService {
     }
 
     const responseMime = response.headers?.['content-type'] || '';
-    validateResponseMime(
-      media.mimetype,
-      responseMime,
-      acceptedMimesForExtension(ext, kind),
-      ext
-    );
+    try {
+      validateResponseMime(
+        media.mimetype,
+        responseMime,
+        acceptedMimesForExtension(ext, kind),
+        ext
+      );
+    } catch (error) {
+      this.logger?.warn?.({
+        filename,
+        ext,
+        kind,
+        declaredMime: error?.declaredMime || normalizeMimeType(media.mimetype),
+        responseMime: error?.responseMime || normalizeMimeType(responseMime),
+        error: error?.message
+      }, 'Media response MIME validation failed');
+      throw error;
+    }
 
     const buffer = Buffer.from(response.data);
     if (!buffer.length || buffer.length > this.maxFileBytes) {
@@ -287,6 +300,17 @@ class MediaIntelligenceService {
   }
 
   async processImage(file, workDir = null) {
+    const ext = String(file?.ext || path.extname(file?.filePath || file?.filename || '')).toLowerCase();
+    let webpBuffer = Buffer.isBuffer(file?.buffer) ? file.buffer : null;
+    if (!webpBuffer && ext === '.webp' && file?.filePath) {
+      webpBuffer = await fsp.readFile(file.filePath).catch(() => null);
+    }
+    if (webpBuffer && isAnimatedWebpBuffer(webpBuffer)) {
+      throw new UserValidationError(
+        'Stiker atau gambar animasi WebP belum didukung untuk OCR/analisis visual. Kirim gambar statis (JPG/PNG) jika ingin dibaca Bubu.'
+      );
+    }
+
     let ownedWorkDir = null;
     const activeWorkDir = workDir || (ownedWorkDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'bubu-p3-img-')));
     try {

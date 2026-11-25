@@ -304,3 +304,11 @@ test('Stage 1: captureFromTurn supplies existing workspace memories, passes Abor
   assert.equal(usageLogs.length, 2);
   assert.equal(usageLogs[1].outcome, 'error');
 });
+
+test('DURABLE_SIGNAL captures natural Indonesian and English personal facts without triggering on ordinary questions', () => {
+  assert.equal(DURABLE_SIGNAL.test('Nama saya Andre dan saya tinggal di Pekanbaru'), true);
+  assert.equal(DURABLE_SIGNAL.test('Saya bekerja sebagai engineer RF'), true);
+  assert.equal(DURABLE_SIGNAL.test('My name is Andre and I prefer Bahasa Indonesia'), true);
+  assert.equal(DURABLE_SIGNAL.test('berapa cuaca hari ini'), false);
+  assert.equal(DURABLE_SIGNAL.test('tolong bantu cek jam sekarang'), false);
+});

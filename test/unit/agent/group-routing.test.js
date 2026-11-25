@@ -403,3 +403,45 @@ test('Stage 3: live progress reactions emit ⏳ -> ✅ on heavy tasks, ⏳ -> �
   );
   assert.deepEqual(reactions.slice(2).map((r) => r.emoji), ['⏳', '❌']);
 });
+
+test('group routing ignores stickers silently and buffers non-sticker media stubs with pushName', async () => {
+  const f = fixture({ groupMediaRequireMention: true });
+  const passiveBuffer = [];
+  f.processor.config.groupPassiveHistory = true;
+  f.processor.db.addGroupPassiveMessage = (entry) => passiveBuffer.push(entry);
+
+  // Static & animated stickers in group are ignored completely without entering agent/media/passive buffer
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      id: 'grp-sticker-1',
+      from: '120363000000000000@g.us',
+      author: '628222222222@c.us',
+      notifyName: 'Budi',
+      hasMedia: true,
+      media: { url: 'http://waha:3000/files/s.webp', mimetype: 'image/webp' },
+      _data: { Info: { MediaType: 'sticker', PushName: 'Budi' }, Message: { stickerMessage: { isAnimated: true, mimetype: 'image/webp' } } }
+    }
+  });
+  assert.equal(f.agentCalls, 0);
+  assert.equal(f.mediaCalls, 0);
+  assert.equal(f.sent.length, 0);
+  assert.equal(passiveBuffer.length, 0);
+
+  // Non-sticker unmentioned media is suppressed when groupMediaRequireMention=true and buffered as a stub with pushName
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      id: 'grp-photo-passive',
+      from: '120363000000000000@g.us',
+      author: '628222222222@c.us',
+      notifyName: 'Budi',
+      hasMedia: true,
+      media: { url: 'http://waha:3000/files/foto.jpg', filename: 'foto.jpg', mimetype: 'image/jpeg' }
+    }
+  });
+  assert.equal(f.agentCalls, 0);
+  assert.equal(passiveBuffer.length, 1);
+  assert.equal(passiveBuffer[0].senderId, 'Budi (628222222222@c.us)');
+  assert.equal(passiveBuffer[0].content, '[Mengirim gambar: foto.jpg]');
+});

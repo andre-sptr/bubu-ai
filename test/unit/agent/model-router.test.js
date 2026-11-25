@@ -90,3 +90,13 @@ test('Stage 2: router selectCandidates returns ordered deduplicated fallback mod
   const visionCandidates = router.selectCandidates('reasoning', { needsTools: true, needsVision: true });
   assert.deepEqual(visionCandidates.map((c) => c.model), ['claude-sonnet-5-5']);
 });
+
+test('short thank-you and acknowledgement messages route to fast greeting tier while action commands do not', () => {
+  assert.equal(classifyTask('Terimakasih'), 'greeting');
+  assert.equal(classifyTask('Terima kasih banyak!'), 'greeting');
+  assert.equal(classifyTask('Makasih ya'), 'greeting');
+  assert.equal(classifyTask('Wow keren'), 'greeting');
+  assert.equal(classifyTask('Oke siap'), 'greeting');
+  assert.notEqual(classifyTask('Oke, tolong buatkan laporan PDF sekarang'), 'greeting');
+  assert.notEqual(classifyTask('Makasih, sekarang carikan harga server terbaru'), 'greeting');
+});

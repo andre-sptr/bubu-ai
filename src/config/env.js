@@ -32,7 +32,7 @@ function loadConfig(env = process.env) {
   // Optional MODEL_* overrides are available, so routine model selection needs no
   // per-tier capability flags or manual smoke-test configuration.
   const modelDefaults = {
-    fast: 'deepseek-v4-pro',
+    fast: 'deepseek-flash',
     balanced: 'deepseek-v4-pro',
     reasoning: 'deepseek-v4-pro',
     coding: 'deepseek-v4-pro',
@@ -65,9 +65,9 @@ function loadConfig(env = process.env) {
     botJid: normalizeJid(env.BOT_JID || ''),
     groupPolicy: env.GROUP_POLICY || 'all',
     groupRequireMention: parseBool(env.GROUP_REQUIRE_MENTION, true),
-    groupMediaRequireMention: parseBool(env.GROUP_MEDIA_REQUIRE_MENTION, false),
+    groupMediaRequireMention: parseBool(env.GROUP_MEDIA_REQUIRE_MENTION, true),
     groupProactiveEnabled: parseBool(env.GROUP_PROACTIVE_ENABLED, false),
-    groupPassiveHistory: parseBool(env.GROUP_PASSIVE_HISTORY, false),
+    groupPassiveHistory: parseBool(env.GROUP_PASSIVE_HISTORY, true),
     groupPassiveBufferSize: Math.min(100, Math.max(5, parsePositiveInt(env.GROUP_PASSIVE_BUFFER_SIZE, 40))),
     briefing: {
       enabled: parseBool(env.DAILY_BRIEFING_ENABLED, false),

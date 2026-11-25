@@ -41,3 +41,16 @@ test('estimateModelCostUsd computes expected USD cost for DeepSeek and legacy mo
   });
   assert.equal(Number(legacyCost.toFixed(4)), 3.0);
 });
+
+test('getModelRates maps gpt-5.4-nano, gpt-5.4-mini, and gpt-5.4 rates cleanly', () => {
+  assert.deepEqual(getModelRates('gpt-5.4-nano', 'fast'), MODEL_RATES_PER_1M.gpt54Nano);
+  assert.deepEqual(getModelRates('gpt-5.4-mini', 'fast'), MODEL_RATES_PER_1M.gpt54Mini);
+  assert.deepEqual(getModelRates('gpt-5.4', 'reasoning'), MODEL_RATES_PER_1M.gpt54);
+  const miniCost = estimateModelCostUsd({
+    modelId: 'gpt-5.4-mini',
+    tier: 'fast',
+    inputTokens: 1_000_000,
+    outputTokens: 500_000
+  });
+  assert.equal(Number(miniCost.toFixed(4)), Number((MODEL_RATES_PER_1M.gpt54Mini.in + MODEL_RATES_PER_1M.gpt54Mini.out * 0.5).toFixed(4)));
+});

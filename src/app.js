@@ -441,11 +441,19 @@ function buildApp({ config, db, logger, worker = null, reminderWorker = null, se
       request.raw.on('error', cleanup);
     });
 
-    app.addHook('onClose', async () => {
+    app.closeVisualizerStreams = () => {
       for (const closeClient of [...sseClients]) {
         closeClient();
       }
+    };
+
+    app.addHook('onClose', async () => {
+      app.closeVisualizerStreams();
     });
+  }
+
+  if (typeof app.closeVisualizerStreams !== 'function') {
+    app.closeVisualizerStreams = () => {};
   }
 
   return app;

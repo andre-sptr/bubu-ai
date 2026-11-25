@@ -414,7 +414,7 @@ test('Task 3.5 & 3.6 & 3.7: P1 document tools support pagination, compare_docume
   const savedPdfBuffer = fs.readFileSync(sendCalls[0].filePath);
   assert.equal(savedPdfBuffer.subarray(0, 5).toString('ascii'), '%PDF-');
 
-  // 3. Personal DM PDF generation requires owner approval
+  // 3. Personal DM PDF generation delivers directly to owner self-DM and keeps approval for cross-chat
   const personalCtx = {
     taskId: 'task-pdf-personal',
     chatId: '6281234567890@c.us',
@@ -426,7 +426,24 @@ test('Task 3.5 & 3.6 & 3.7: P1 document tools support pagination, compare_docume
     documentType: 'invoice',
     content: '# Tagihan\nTotal: **Rp 5.000.000**',
   }, personalCtx);
-  assert.equal(personalPdfRes.pendingApproval, true);
+  assert.equal(personalPdfRes.created, true);
+  assert.equal(personalPdfRes.workspace, 'personal');
+  assert.equal(personalPdfRes.deliveryStatus, 'sent');
+  assert.equal(approvalCalls.length, 0);
+  assert.equal(sendCalls.length, 2);
+  assert.equal(sendCalls[1].chatId, '6281234567890@c.us');
+
+  const crossChatPdfRes = await createPdfTool.execute({
+    title: 'Invoice Eksternal',
+    documentType: 'invoice',
+    content: '# Tagihan\nTotal: **Rp 2.000.000**',
+  }, {
+    taskId: 'task-pdf-cross',
+    chatId: '6289999999999@c.us',
+    requesterId: '6281234567890@c.us',
+    scope: 'personal',
+  });
+  assert.equal(crossChatPdfRes.pendingApproval, true);
   assert.equal(approvalCalls.length, 1);
   assert.equal(approvalCalls[0].args.mimetype, 'application/pdf');
 

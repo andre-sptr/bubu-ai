@@ -77,3 +77,38 @@ test('Stage 2: domain selection unlocks relevant groups and omits redundant alia
   });
   assert.equal(allUnlocked.some((d) => d.function.name === REQUEST_TOOL_GROUP_NAME), false);
 });
+
+test('social URLs, quoted links, and personal system usage queries unlock the expected tool groups cleanly', () => {
+  const registry = makeRegistry();
+  const { classifyTask } = require('../../../src/agent/model-router');
+
+  // Social links & quoteText URLs activate web tools
+  const igRoute = selectToolGroups({ task: 'general_chat', text: 'https://www.instagram.com/reel/abc123/' });
+  assert.equal(igRoute.groups.has('web'), true);
+
+  const quotedLinkRoute = selectToolGroups({
+    task: 'general_chat',
+    text: 'Tolong jelaskan isi video ini',
+    quoteText: 'https://www.tiktok.com/@user/video/12345',
+    hasQuote: true
+  });
+  assert.equal(quotedLinkRoute.groups.has('web'), true);
+
+  // System usage tool available in personal scope for telemetry queries, strictly hidden in group scope
+  const sysPersonalDefs = registry.definitionsForContext('personal', {
+    task: 'general_chat',
+    text: 'Berapa penggunaan token dan biaya Sumopod hari ini?'
+  });
+  assert.equal(sysPersonalDefs.some((d) => d.function.name === 'get_bubu_usage_summary'), true);
+
+  const sysGroupDefs = registry.definitionsForContext('group', {
+    task: 'general_chat',
+    text: 'Berapa penggunaan token dan biaya Sumopod hari ini?'
+  });
+  assert.equal(sysGroupDefs.some((d) => d.function.name === 'get_bubu_usage_summary'), false);
+
+  // Brief thank-you fast-path loads 0 tool schemas
+  const ackTask = classifyTask('Terimakasih Bubu');
+  assert.equal(ackTask, 'greeting');
+  assert.deepEqual(registry.definitionsForContext('personal', { task: ackTask, text: 'Terimakasih Bubu' }), []);
+});

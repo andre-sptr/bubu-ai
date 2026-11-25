@@ -16,7 +16,7 @@ const EXTENSION_MIMES = {
   '.mp3': ['audio/mpeg', 'audio/mp3'], '.m4a': ['audio/mp4', 'audio/x-m4a'],
   '.aac': ['audio/aac', 'audio/x-aac'], '.wav': ['audio/wav', 'audio/x-wav'],
   '.flac': ['audio/flac', 'audio/x-flac'], '.amr': ['audio/amr', 'audio/3gpp'],
-  '.webm': ['audio/webm', 'video/webm'], '.mp4': ['video/mp4'],
+  '.webm': ['audio/webm', 'video/webm'], '.mp4': ['video/mp4', 'application/mp4'],
   '.mov': ['video/quicktime'], '.mkv': ['video/x-matroska'],
   '.avi': ['video/x-msvideo', 'video/avi'], '.3gp': ['video/3gpp']
 };
@@ -87,7 +87,7 @@ function extensionFromMime(mimetype, kind) {
     'audio/mp3': '.mp3', 'audio/mp4': '.m4a', 'audio/aac': '.aac',
     'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/flac': '.flac', 'audio/x-flac': '.flac',
     'audio/webm': '.webm', 'audio/x-m4a': '.m4a', 'audio/x-aac': '.aac', 'audio/3gpp': '.amr',
-    'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm',
+    'video/mp4': '.mp4', 'application/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm',
     'video/x-matroska': '.mkv', 'video/3gpp': '.3gp', 'video/x-msvideo': '.avi', 'video/avi': '.avi'
   };
   return map[mime] || (kind === 'image' ? '.jpg' : kind === 'audio' ? '.ogg' : '.mp4');
@@ -132,6 +132,34 @@ function formatTimestampSeconds(seconds) {
   return `${String(mins).padStart(2, '0')}:${rem}`;
 }
 
+function isAnimatedWebpBuffer(buffer) {
+  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  if (bytes.length < 16) return false;
+  if (bytes.subarray(0, 4).toString('ascii') !== 'RIFF' || bytes.subarray(8, 12).toString('ascii') !== 'WEBP') {
+    return false;
+  }
+
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    const fourCc = bytes.subarray(offset, offset + 4).toString('ascii');
+    const chunkSize = bytes.readUInt32LE(offset + 4);
+    if (fourCc === 'ANIM' || fourCc === 'ANMF') {
+      return true;
+    }
+    if (fourCc === 'VP8X' && offset + 9 <= bytes.length) {
+      if ((bytes[offset + 8] & 0x02) !== 0) {
+        return true;
+      }
+    }
+    const step = 8 + chunkSize + (chunkSize % 2);
+    if (step <= 8 || offset + step > bytes.length) {
+      break;
+    }
+    offset += step;
+  }
+  return false;
+}
+
 module.exports = {
   IMAGE_EXT,
   AUDIO_EXT,
@@ -142,6 +170,7 @@ module.exports = {
   acceptedMimesForExtension,
   detectMediaKind,
   validateMediaSignature,
+  isAnimatedWebpBuffer,
   extensionFromMime,
   resolveMediaExtension,
   formatTimestampSeconds

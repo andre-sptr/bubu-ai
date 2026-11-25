@@ -165,3 +165,34 @@ test('Stage 1: formatWhatsAppText preserves math multiplication, intraword aster
   assert.equal(formatWhatsAppText('Filter *.js dan *.ts saja'), 'Filter *.js dan *.ts saja');
   assert.equal(formatWhatsAppText('Ini *miring* dan (*catatan*)'), 'Ini _miring_ dan (_catatan_)');
 });
+
+test('formatWhatsAppText keeps 2-column tables compatible and formats 3+ column comparison tables cleanly', () => {
+  const twoCol = [
+    '| Item | Harga |',
+    '| --- | --- |',
+    '| Kopi | Rp20.000 |'
+  ].join('\n');
+  assert.equal(
+    formatWhatsAppText(twoCol),
+    '*Item • Harga*\n1. *Item:* Kopi\n*Harga:* Rp20.000'
+  );
+
+  const threeCol = [
+    '| Fitur | Gratis | Pro |',
+    '| --- | --- | --- |',
+    '| Kuota | 100 msg | Unlimited |',
+    '| Model | Flash | V4 Pro |'
+  ].join('\n');
+  assert.equal(
+    formatWhatsAppText(threeCol),
+    [
+      '*Fitur • Gratis • Pro*',
+      '1. *Kuota*',
+      '   • *Gratis:* 100 msg',
+      '   • *Pro:* Unlimited',
+      '2. *Model*',
+      '   • *Gratis:* Flash',
+      '   • *Pro:* V4 Pro'
+    ].join('\n')
+  );
+});

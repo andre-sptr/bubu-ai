@@ -78,6 +78,27 @@ class MessageProcessor {
     }
   }
 
+  buildMediaAttachmentEvidence(processed, fallbackFilename, maxExtractChars = 30000) {
+    const limit = maxExtractChars || 30000;
+    const extractedText = String(processed.extractedText || '').slice(0, limit);
+    return {
+      kind: processed.kind,
+      filename: processed.filename || fallbackFilename,
+      extractedText,
+      ...(processed.ocrText !== undefined ? { ocrText: String(processed.ocrText || '').slice(0, limit) } : {}),
+      ...(processed.visualMode ? { visualMode: processed.visualMode } : {}),
+      ...(processed.visualFallbackReason ? { visualFallbackReason: processed.visualFallbackReason } : {}),
+      ...(Array.isArray(processed.visualImages) && processed.visualImages.length ? { visualImages: processed.visualImages } : {}),
+      ...(Array.isArray(processed.frames) ? { frames: processed.frames } : {}),
+      ...(processed.durationSeconds !== undefined ? { durationSeconds: processed.durationSeconds } : {}),
+      ...(processed.declaredDurationSeconds !== undefined ? { declaredDurationSeconds: processed.declaredDurationSeconds } : {}),
+      ...(processed.samplingIntervalSeconds !== undefined ? { samplingIntervalSeconds: processed.samplingIntervalSeconds } : {}),
+      ...(processed.temporalStatus ? { temporalStatus: processed.temporalStatus } : {}),
+      ...(processed.partialOnly !== undefined ? { partialOnly: processed.partialOnly } : {}),
+      ...(processed.transcript !== undefined ? { transcript: String(processed.transcript || '').slice(0, 30000) } : {})
+    };
+  }
+
   async process(payload, meta = null) {
     const msg = normalizeIncoming(payload);
     if (msg.botId || msg.botLid) {
@@ -111,24 +132,45 @@ class MessageProcessor {
     let voiceInstruction = null;
     const quoteContext = msg.quote?.present || msg.quote?.rejected ? msg.quote : null;
     if (isGroup) {
+      if (msg.isSticker && !currentMessageText) {
+        this.pipelineEvents?.discardActiveRun?.(runId);
+        return;
+      }
       const snap = typeof this.sessionMonitor?.snapshot === 'function'
         ? this.sessionMonitor.snapshot()
         : null;
       const botIdentities = [this.config.botJid, snap?.botJid, snap?.botLid, msg.botId, msg.botLid].filter(Boolean);
       const hasMention = hasBotMention(msg, botIdentities);
       const isCommand = isRecognizedSlashCommand(text);
-      const mediaOnly = msg.hasMedia && !currentMessageText;
+      const mediaOnly = msg.hasMedia && !msg.isSticker && !currentMessageText;
       const mediaMayTriggerWithoutMention = mediaOnly && !this.config.groupMediaRequireMention;
 
       if (this.config.groupRequireMention &&
           !hasMention && !isCommand && !mediaMayTriggerWithoutMention) {
-        if (this.config.groupPassiveHistory && currentMessageText && typeof this.db?.addGroupPassiveMessage === 'function') {
+        let passiveContent = currentMessageText;
+        if (msg.hasMedia && !msg.isSticker) {
+          const stubKind = detectMediaKind(msg.media?.filename || msg.media?.fileName || '', msg.media?.mimetype || '');
+          const labelMap = {
+            image: 'gambar',
+            audio: msg.media?.isPtt ? 'voice note' : 'audio',
+            video: 'video',
+            document: 'dokumen'
+          };
+          const label = labelMap[stubKind] || 'media';
+          const fname = msg.media?.filename || msg.media?.fileName;
+          const stub = fname ? `[Mengirim ${label}: ${fname}]` : `[Mengirim ${label}]`;
+          passiveContent = currentMessageText ? `${stub} ${currentMessageText}` : stub;
+        }
+        const passiveSender = msg.pushName && rawSenderId
+          ? `${msg.pushName} (${rawSenderId})`
+          : (msg.pushName || rawSenderId || null);
+        if (this.config.groupPassiveHistory && passiveContent && typeof this.db?.addGroupPassiveMessage === 'function') {
           try {
             this.db.addGroupPassiveMessage({
               chatId: msg.chatId,
-              senderId: rawSenderId || null,
+              senderId: passiveSender,
               messageId: msg.eventId || null,
-              content: currentMessageText,
+              content: passiveContent,
               maxBuffer: this.config.groupPassiveBufferSize || 40
             });
           } catch (err) {
@@ -279,6 +321,13 @@ class MessageProcessor {
     let runOutcome = 'completed';
     try {
       if (msg.hasMedia) {
+        if (msg.isAnimatedSticker) {
+          await this.sendMediaNotice(
+            'Stiker animasi tidak dapat dibaca oleh Bubu. Kirim gambar statis (JPG/PNG) jika ada teks atau detail yang ingin dianalisis.',
+            msg.chatId
+          );
+          return;
+        }
         if (!msg.media?.url) {
           await this.sendMediaNotice(
             'Lampiran terdeteksi, tetapi WAHA tidak menyediakan media.url. Pastikan WAHA media download aktif.',
@@ -394,22 +443,11 @@ class MessageProcessor {
               if (!text) text = 'Tolong jalankan instruksi yang saya sampaikan melalui voice note ini.';
               historyUserText = [historyUserText, extractedText].filter(Boolean).join('\n');
             } else {
-              attachmentEvidence = {
-                kind: processed.kind || mediaKind,
-                filename: processed.filename || mediaFilename,
-                extractedText,
-                ...(processed.ocrText !== undefined ? { ocrText: String(processed.ocrText || '').slice(0, this.config.documents.maxExtractChars || 30000) } : {}),
-                ...(processed.visualMode ? { visualMode: processed.visualMode } : {}),
-                ...(processed.visualFallbackReason ? { visualFallbackReason: processed.visualFallbackReason } : {}),
-                ...(Array.isArray(processed.visualImages) && processed.visualImages.length ? { visualImages: processed.visualImages } : {}),
-                ...(Array.isArray(processed.frames) ? { frames: processed.frames } : {}),
-                ...(processed.durationSeconds !== undefined ? { durationSeconds: processed.durationSeconds } : {}),
-                ...(processed.declaredDurationSeconds !== undefined ? { declaredDurationSeconds: processed.declaredDurationSeconds } : {}),
-                ...(processed.samplingIntervalSeconds !== undefined ? { samplingIntervalSeconds: processed.samplingIntervalSeconds } : {}),
-                ...(processed.temporalStatus ? { temporalStatus: processed.temporalStatus } : {}),
-                ...(processed.partialOnly !== undefined ? { partialOnly: processed.partialOnly } : {}),
-                ...(processed.transcript !== undefined ? { transcript: String(processed.transcript || '').slice(0, 30000) } : {})
-              };
+              attachmentEvidence = this.buildMediaAttachmentEvidence(
+                { ...processed, kind: processed.kind || mediaKind },
+                mediaFilename,
+                this.config.documents.maxExtractChars || 30000
+              );
               if (!text) {
                 text = mediaKind === 'audio'
                   ? 'Tolong transkripsikan dan rangkum audio yang saya kirim.'
@@ -489,6 +527,75 @@ class MessageProcessor {
           }
         } catch (err) {
           this.logger?.warn?.({ chatId: msg.chatId, error: err.message }, 'Unable to resolve quoted workspace document');
+        }
+      }
+
+      if (quoteContext?.present && !quoteContext?.rejected &&
+          quoteContext.hasMedia && quoteContext.media?.url &&
+          !msg.hasMedia && !quoteContext.isSticker && !quoteContext.referencedDocument) {
+        try {
+          const quotedMedia = quoteContext.media;
+          const normalizedQuotedUrl = normalizeMediaUrl(quotedMedia.url, this.config.waha.baseUrl);
+          const quotedFilename = quotedMedia.filename || quotedMedia.fileName ||
+            path.basename(normalizedQuotedUrl.pathname);
+          let quotedMediaKind = detectMediaKind(
+            quotedFilename,
+            quotedMedia.mimetype || quoteContext.mimeType || ''
+          );
+          if (quotedMediaKind === 'unknown' && ['image', 'audio', 'video', 'document'].includes(quoteContext.type)) {
+            quotedMediaKind = quoteContext.type;
+          }
+          if (quotedMediaKind === 'document' && this.documentService) {
+            const doc = await this.documentService.ingestMedia({
+              media: {
+                url: quotedMedia.url,
+                filename: quotedFilename,
+                mimetype: quotedMedia.mimetype || quoteContext.mimeType || ''
+              },
+              scope,
+              ownerId: scope === 'personal' ? senderId : null,
+              chatId: scope === 'group' ? msg.chatId : null,
+              sourceEventId: quoteContext.quotedMessageId || eventId
+            });
+            quoteContext.referencedDocument = {
+              documentId: doc.id,
+              filename: doc.filename,
+              mimeType: doc.mime_type || null
+            };
+            quoteContext.mediaLoaded = true;
+            attachmentEvidence = {
+              kind: 'document',
+              ...(doc.id ? { documentId: doc.id } : {}),
+              filename: doc.filename,
+              mimeType: doc.mime_type,
+              ...(doc.pageCount ? { pageCount: doc.pageCount } : {}),
+              ...(doc.extractionMode ? { extractionMode: doc.extractionMode } : {}),
+              extractedText: String(doc.extractedText || '').slice(0, this.config.documents.maxExtractChars)
+            };
+          } else if (['image', 'audio', 'video'].includes(quotedMediaKind) &&
+              this.config.media?.enabled && this.mediaService) {
+            const processed = await this.mediaService.processIncoming({ media: quotedMedia });
+            if (quotedMediaKind !== 'audio' || !processed.noSpeech) {
+              attachmentEvidence = this.buildMediaAttachmentEvidence(
+                { ...processed, kind: processed.kind || quotedMediaKind },
+                quotedFilename,
+                this.config.documents.maxExtractChars || 30000
+              );
+              quoteContext.mediaLoaded = true;
+            }
+          }
+        } catch (quotedErr) {
+          const status = Number(quotedErr?.status || quotedErr?.response?.status || quotedErr?.cause?.status || 0);
+          if (status === 404 || status === 410 || /expired|tidak ditemukan/i.test(String(quotedErr?.message || ''))) {
+            quoteContext.mediaExpired = true;
+          } else {
+            quoteContext.mediaFetchFailed = true;
+          }
+          this.logger?.warn?.({
+            chatId: msg.chatId,
+            status: status || undefined,
+            error: quotedErr?.message
+          }, 'Unable to process quoted media');
         }
       }
 
@@ -674,7 +781,7 @@ class MessageProcessor {
                 })
               : await this.responseHandler.sendAssistantResponse(responseText, msg.chatId, outputMode);
             const waMessageId = deliveryReceipt?.deliveries?.[0]?.messageId || deliveryReceipt?.messageId || null;
-            const willCaptureMemory = Boolean(this.memoryService && !msg.hasMedia && !quoteContext);
+            const willCaptureMemory = Boolean(this.memoryService && !msg.hasMedia && !quoteContext && !isGreetingFastPath);
 
             this.db.finishTaskResponse(result.taskId, 'sent');
             this.pipelineEvents?.emitStage?.({

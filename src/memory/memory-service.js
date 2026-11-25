@@ -1,6 +1,6 @@
 const crypto = require('node:crypto');
 
-const DURABLE_SIGNAL = /\b(ingat|remember|catat|simpan|preferensi|saya suka|saya tidak suka|mulai sekarang|ke depannya|proyek|sedang mengerjakan|rencana saya|tujuan saya|jangan lupa)\b/i;
+const DURABLE_SIGNAL = /\b(ingat|remember|catat|simpan|preferensi|saya suka|saya tidak suka|mulai sekarang|ke depannya|proyek|sedang mengerjakan|rencana saya|tujuan saya|target saya|fokus saya|jangan lupa|nama saya|panggil saya|saya tinggal|pekerjaan saya|kerja saya|saya bekerja|saya kuliah|saya sedang kuliah|jurusan saya|kampus saya|hobi saya|ulang tahun|zona waktu|timezone|my name is|call me|i prefer|i like|i dislike|i live in|i work|i am working on|my goal|my project)\b/i;
 
 function extractJsonObject(raw) {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;

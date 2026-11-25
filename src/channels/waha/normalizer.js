@@ -108,6 +108,7 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
         source.imageMessage?.contextInfo,
         source.videoMessage?.contextInfo,
         source.audioMessage?.contextInfo,
+        source.stickerMessage?.contextInfo,
         source.documentMessage?.contextInfo,
         source.documentWithCaptionMessage?.message?.documentMessage?.contextInfo,
         source.messageContextInfo,
@@ -167,6 +168,13 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
   let quotedText = '';
   let mimeType = '';
   let hasMedia = false;
+  let isSticker = false;
+  let quotedIsPtt = false;
+  let quotedDurationSeconds = null;
+  let quotedFilename = '';
+
+  const replyMedia = replyTo?.media && typeof replyTo.media === 'object' ? replyTo.media : null;
+  const replyMediaTypeHint = String(replyMedia?.mediaType || replyTo?.type || '').toLowerCase();
 
   if (quotedRaw && typeof quotedRaw === 'object') {
     const quoted = unwrapQuotedMessage(quotedRaw);
@@ -175,6 +183,7 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
       ['video', quoted.videoMessage],
       ['audio', quoted.audioMessage],
       ['document', quoted.documentMessage],
+      ['sticker', quoted.stickerMessage],
       ['text', quoted.extendedTextMessage],
       ['text', typeof quoted.conversation === 'string' ? { text: quoted.conversation } : null]
     ];
@@ -189,16 +198,32 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
       content.filename,
       replyToBody
     ]);
-    mimeType = String(content.mimetype || content.mimeType || '').slice(0, 120);
-    hasMedia = ['image', 'video', 'audio', 'document'].includes(type);
+    mimeType = String(
+      content.mimetype || content.mimeType || replyMedia?.mimetype || replyMedia?.mimeType || replyTo?.mimetype || ''
+    ).slice(0, 120);
+    isSticker = type === 'sticker' ||
+      replyMediaTypeHint === 'sticker' ||
+      replyMediaTypeHint === 'user_created_sticker' ||
+      replyMedia?.isSticker === true;
+    hasMedia = ['image', 'video', 'audio', 'document', 'sticker'].includes(type) ||
+      Boolean(replyTo?.hasMedia === true || replyMedia);
+    quotedIsPtt = content.PTT === true || content.ptt === true ||
+      replyMedia?.isPtt === true || replyMedia?.ptt === true ||
+      replyMediaTypeHint === 'ptt';
+    quotedDurationSeconds = replyMedia?.durationSeconds ?? content.seconds ?? null;
+    quotedFilename = String(content.fileName || content.filename || replyMedia?.filename || replyMedia?.fileName || '').trim();
   } else {
-    const replyMedia = replyTo?.media && typeof replyTo.media === 'object' ? replyTo.media : null;
     mimeType = String(replyMedia?.mimetype || replyMedia?.mimeType || replyTo?.mimetype || '').slice(0, 120);
     hasMedia = Boolean(replyTo?.hasMedia === true || replyMedia);
-    const mediaTypeHint = String(replyMedia?.mediaType || replyTo?.type || '').toLowerCase();
-    if (hasMedia) {
-      if (['image', 'video', 'audio', 'document'].includes(mediaTypeHint)) {
-        type = mediaTypeHint;
+    isSticker = replyMediaTypeHint === 'sticker' ||
+      replyMediaTypeHint === 'user_created_sticker' ||
+      replyMedia?.isSticker === true;
+    if (isSticker) {
+      type = 'sticker';
+      hasMedia = true;
+    } else if (hasMedia) {
+      if (['image', 'video', 'audio', 'document'].includes(replyMediaTypeHint)) {
+        type = replyMediaTypeHint;
       } else if (mimeType.startsWith('image/')) {
         type = 'image';
       } else if (mimeType.startsWith('video/')) {
@@ -212,6 +237,37 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
     } else {
       type = 'text';
       quotedText = replyToBody;
+    }
+    quotedIsPtt = replyMedia?.isPtt === true || replyMedia?.ptt === true || replyMediaTypeHint === 'ptt';
+    quotedDurationSeconds = replyMedia?.durationSeconds ?? replyMedia?.seconds ?? null;
+    quotedFilename = String(replyMedia?.filename || replyMedia?.fileName || '').trim();
+  }
+
+  let quoteMedia = null;
+  if (replyMedia) {
+    const rawReplyMediaUrl = typeof replyMedia.url === 'string' ? replyMedia.url.trim() : '';
+    let safeReplyMediaUrl = '';
+    if (rawReplyMediaUrl) {
+      try {
+        const parsed = new URL(rawReplyMediaUrl);
+        if (!/(?:^|\.)mmg\.whatsapp\.net$/i.test(parsed.hostname)) {
+          safeReplyMediaUrl = rawReplyMediaUrl;
+        }
+      } catch {
+        if (!/mmg\.whatsapp\.net/i.test(rawReplyMediaUrl)) {
+          safeReplyMediaUrl = rawReplyMediaUrl;
+        }
+      }
+    }
+    if (safeReplyMediaUrl || mimeType || quotedFilename || quotedIsPtt || isSticker) {
+      quoteMedia = {
+        ...(safeReplyMediaUrl ? { url: safeReplyMediaUrl } : {}),
+        ...(mimeType ? { mimetype: mimeType } : {}),
+        ...(quotedFilename ? { filename: quotedFilename } : {}),
+        ...(quotedIsPtt ? { isPtt: true } : {}),
+        ...(quotedDurationSeconds !== null && quotedDurationSeconds !== undefined ? { durationSeconds: quotedDurationSeconds } : {}),
+        ...(isSticker ? { isSticker: true } : {})
+      };
     }
   }
 
@@ -233,7 +289,9 @@ function extractQuoteContext({ payload, messageSources, currentChatId }) {
     type,
     text: quotedText.trim().slice(0, 4000),
     mimeType,
-    hasMedia
+    hasMedia,
+    ...(isSticker ? { isSticker: true } : {}),
+    ...(quoteMedia ? { media: quoteMedia } : {})
   };
 }
 
@@ -275,13 +333,15 @@ function normalizeIncoming(body = {}) {
     extractIdString(info.Sender) ||
     chatId;
 
+  const stickerMessage = message.stickerMessage || rawMessage.stickerMessage || null;
   const nativeMediaCandidates = [
     ['image', message.imageMessage || rawMessage.imageMessage],
     ['video', message.videoMessage || rawMessage.videoMessage],
     ['audio', message.audioMessage || rawMessage.audioMessage],
     ['document', message.documentMessage || rawMessage.documentMessage],
     ['document', message.documentWithCaptionMessage?.message?.documentMessage ||
-      rawMessage.documentWithCaptionMessage?.message?.documentMessage]
+      rawMessage.documentWithCaptionMessage?.message?.documentMessage],
+    ['image', stickerMessage]
   ];
   const nativeMediaEntry = nativeMediaCandidates.find(([, value]) =>
     value && typeof value === 'object'
@@ -289,6 +349,19 @@ function normalizeIncoming(body = {}) {
   const [nativeKind, nativeMedia] = nativeMediaEntry || [null, null];
 
   const existingMedia = payload.media || data.media || null;
+  const rawMediaType = String(info.MediaType || existingMedia?.mediaType || '').toLowerCase();
+  const isSticker = Boolean(
+    stickerMessage ||
+    rawMediaType === 'sticker' ||
+    rawMediaType === 'user_created_sticker' ||
+    existingMedia?.isSticker === true
+  );
+  const isAnimatedSticker = Boolean(
+    isSticker && (
+      stickerMessage?.isAnimated === true ||
+      existingMedia?.isAnimated === true
+    )
+  );
   let media = null;
   if (existingMedia || nativeMedia) {
     const source = existingMedia || {};
@@ -303,10 +376,20 @@ function normalizeIncoming(body = {}) {
       isPtt: nativeMedia?.PTT === true || nativeMedia?.ptt === true ||
         source.isPtt === true || source.ptt === true ||
         String(info.MediaType || '').toLowerCase() === 'ptt',
+      ...(isSticker ? { isSticker: true } : {}),
+      ...(isAnimatedSticker ? { isAnimated: true } : {}),
       fileLength: source.fileLength ?? nativeMedia?.fileLength ?? null,
       durationSeconds: source.durationSeconds ?? nativeMedia?.seconds ?? null
     };
   }
+
+  const pushName = firstNonEmpty([
+    payload.notifyName,
+    payload.pushName,
+    info.PushName,
+    payload.sender?.pushName,
+    payload.sender?.name
+  ]).slice(0, 80);
 
   const bodyCandidates = [
     payload.body,
@@ -335,7 +418,7 @@ function normalizeIncoming(body = {}) {
   const hasNativeMedia = Boolean(nativeMedia);
   const hasMedia = payload.hasMedia === true || Boolean(
     media && (media.url || media.mimetype || hasNativeMedia)
-  ) || hasNativeMedia || ['image', 'video', 'audio', 'ptt', 'document'].includes(
+  ) || hasNativeMedia || ['image', 'video', 'audio', 'ptt', 'document', 'sticker', 'user_created_sticker'].includes(
     String(info.MediaType || '').toLowerCase()
   );
 
@@ -353,11 +436,14 @@ function normalizeIncoming(body = {}) {
   return {
     chatId,
     senderId,
+    ...(pushName ? { pushName } : {}),
     text: typeof text === 'string' ? text : '',
     bodyText,
     captionText,
     media,
     hasMedia,
+    isSticker,
+    isAnimatedSticker,
     quote,
     mentions: collectMentionIds(payload, info, messageSources),
     eventId,

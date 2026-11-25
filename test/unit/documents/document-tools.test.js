@@ -17,7 +17,7 @@ function harness({ sendFileError = null } = {}) {
       saved.push(doc);
       const record = { id: doc.id, scope: doc.scope, filename: doc.filename };
       documents.set(doc.id, {
-        id: doc.id, scope: doc.scope, chat_id: doc.chatId,
+        id: doc.id, scope: doc.scope, owner_id: doc.ownerId || null, chat_id: doc.chatId || null,
         filename: doc.filename, mime_type: doc.mimeType,
         file_path: doc.filePath, file_size: doc.fileSize
       });
@@ -25,7 +25,10 @@ function harness({ sendFileError = null } = {}) {
     },
     getDocumentFile: (id, scope, ownerId, chatId) => {
       const record = documents.get(id);
-      return record && record.scope === scope && record.chat_id === chatId ? record : null;
+      if (!record || record.scope !== scope) return null;
+      return scope === 'group'
+        ? (record.chat_id === chatId ? record : null)
+        : (record.owner_id === ownerId ? record : null);
     }
   };
   const documentService = {
@@ -100,21 +103,34 @@ test('group create_document generates, stores and automatically sends a group-sc
   assert.equal(h.generated.docxArgs.documentType, 'sop');
 });
 
-test('personal create_document retains owner approval workflow', async (t) => {
+test('personal create_document delivers directly to owner self-DM and keeps approval for cross-chat sends', async (t) => {
   const h = harness();
   t.after(h.cleanup);
   const tool = h.tools.find((item) => item.name === 'create_document');
-  const result = await tool.execute({
+  const directRes = await tool.execute({
     title: 'Memo',
     content: 'Isi memo',
     documentType: 'memo'
   }, { taskId: 'task-personal-doc', chatId: 'owner@c.us', requesterId: 'owner@c.us', scope: 'personal' });
 
-  assert.equal(result.pendingApproval, true);
+  assert.equal(directRes.created, true);
+  assert.equal(directRes.workspace, 'personal');
+  assert.equal(directRes.deliveryStatus, 'sent');
   assert.equal(h.saved[0].scope, 'personal');
   assert.equal(h.saved[0].ownerId, 'owner@c.us');
+  assert.equal(h.approvalCalls.length, 0);
+  assert.equal(h.sendCalls.length, 1);
+  assert.equal(h.sendCalls[0].chatId, 'owner@c.us');
+
+  const crossRes = await tool.execute({
+    title: 'Memo Eksternal',
+    content: 'Isi memo lain',
+    documentType: 'memo'
+  }, { taskId: 'task-cross-doc', chatId: 'other@c.us', requesterId: 'owner@c.us', scope: 'personal' });
+
+  assert.equal(crossRes.pendingApproval, true);
   assert.equal(h.approvalCalls.length, 1);
-  assert.equal(h.sendCalls.length, 0);
+  assert.equal(h.sendCalls.length, 1);
 });
 
 test('group create_spreadsheet supports multiple sheets and stores group-scoped XLSX', async (t) => {

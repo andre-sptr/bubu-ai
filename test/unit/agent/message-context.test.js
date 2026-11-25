@@ -345,3 +345,102 @@ test('Stage 2: greeting fast-path skips memoryService.retrieve and projectContex
   assert.deepEqual(f.calls.agent[0].memories, []);
   assert.deepEqual(f.calls.agent[0].projects, []);
 });
+
+test('quoted media preloads into attachmentEvidence, degrades cleanly on 404, DM animated sticker notifies early, and thank-you fast-path skips memory capture', async () => {
+  const f = makeFixture();
+  f.processor.mediaService = {
+    processIncoming: async ({ media }) => {
+      if (media.url.includes('expired')) {
+        const err = new Error('Not Found');
+        err.status = 404;
+        throw err;
+      }
+      return {
+        kind: 'image',
+        filename: 'quoted.jpg',
+        visualMode: 'sumopod_vision',
+        ocrText: 'Diskon 50%',
+        extractedText: 'Diskon 50%',
+        visualImages: [{ mimeType: 'image/jpeg', dataUrl: 'data:image/jpeg;base64,QQ==' }]
+      };
+    }
+  };
+
+  // 1. Quoted photo with replyTo.media preloads image evidence
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      id: 'q-img-1',
+      from: OWNER,
+      author: OWNER,
+      body: 'Bubu baca gambar yang dibalas ini',
+      replyTo: {
+        id: 'orig-img-1',
+        hasMedia: true,
+        media: { url: 'http://waha:3000/files/quoted.jpg', mimetype: 'image/jpeg', filename: 'quoted.jpg' }
+      },
+      _data: {
+        Message: {
+          extendedTextMessage: {
+            text: 'Bubu baca gambar yang dibalas ini',
+            contextInfo: { stanzaID: 'orig-img-1', quotedMessage: { imageMessage: { caption: 'Promo', mimetype: 'image/jpeg' } } }
+          }
+        }
+      }
+    }
+  });
+  assert.equal(f.calls.agent[0].attachmentEvidence.kind, 'image');
+  assert.equal(f.calls.agent[0].quoteContext.mediaLoaded, true);
+
+  // 2. Quoted media expired (404) marks mediaExpired without failing message
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      id: 'q-img-404',
+      from: OWNER,
+      author: OWNER,
+      body: 'Gambar lama ini masih bisa dilihat?',
+      replyTo: {
+        id: 'orig-img-404',
+        hasMedia: true,
+        media: { url: 'http://waha:3000/files/expired.jpg', mimetype: 'image/jpeg' }
+      }
+    }
+  });
+  assert.equal(f.calls.agent[1].quoteContext.mediaExpired, true);
+
+  // 3. DM animated sticker notifies user directly without invoking agent
+  const callsBeforeSticker = f.calls.agent.length;
+  await f.processor.process({
+    event: 'message',
+    payload: {
+      id: 'dm-anim-stk',
+      from: OWNER,
+      author: OWNER,
+      hasMedia: true,
+      media: { url: 'http://waha:3000/files/anim.webp', mimetype: 'image/webp' },
+      _data: { Info: { MediaType: 'sticker' }, Message: { stickerMessage: { isAnimated: true, mimetype: 'image/webp' } } }
+    }
+  });
+  assert.equal(f.calls.agent.length, callsBeforeSticker);
+  assert.match(f.calls.sent[f.calls.sent.length - 1][0], /Stiker animasi/);
+
+  // 4. Short thank-you fast-path skips captureFromTurn
+  const captureBefore = f.calls.memoryCapture.length;
+  await f.processor.process({
+    event: 'message',
+    payload: { id: 'ack-fast-1', from: OWNER, author: OWNER, body: 'Terimakasih Bubu' }
+  });
+  assert.equal(f.calls.memoryCapture.length, captureBefore);
+
+  // 5. /approve records both user command and assistant confirmation in chat history
+  const msgsBefore = f.calls.messages.length;
+  f.processor.approvalManager = { resolve: async () => ({ ok: true, sent: true }) };
+  await f.processor.process({
+    event: 'message',
+    payload: { id: 'apr-cmd-1', from: OWNER, author: OWNER, body: '/approve apr-123' }
+  });
+  const aprMsgs = f.calls.messages.slice(msgsBefore);
+  assert.deepEqual(aprMsgs.map((m) => m.role), ['user', 'assistant']);
+  assert.equal(aprMsgs[0].content, '/approve apr-123');
+});

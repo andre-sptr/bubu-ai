@@ -434,3 +434,40 @@ test('Stage 2: worker sends touchEventLock heartbeats, excludes in-flight events
   assert.equal(fs.existsSync(orphanFile), false);
   assert.equal(fs.existsSync(staleInboundFile), false);
 });
+
+test('createDeadLetterNotifier skips stickers and quotes group dead-letter replies when eventId is present', async () => {
+  const sent = [];
+  const notifier = createDeadLetterNotifier({
+    config: { ownerJid: '628111111111@c.us', groupPolicy: 'all', media: { voiceReplyDefault: false } },
+    db: { getChatOutputMode: () => 'text' },
+    waha: {},
+    responseHandler: { sendAssistantResponse: async (...args) => sent.push(args) },
+    logger: { warn: () => {} }
+  });
+
+  await notifier({
+    event: {
+      event_id: 'evt-stk-dead',
+      chat_id: '120363000000000000@g.us',
+      payload: {
+        id: 'wamid-stk-1',
+        from: '120363000000000000@g.us',
+        _data: { Info: { MediaType: 'sticker' }, Message: { stickerMessage: { isAnimated: true } } }
+      }
+    },
+    message: 'Should be skipped',
+    category: 'internal'
+  });
+  assert.equal(sent.length, 0);
+
+  await notifier({
+    event: {
+      event_id: 'evt-vid-dead',
+      chat_id: '120363000000000000@g.us',
+      payload: { id: 'wamid-vid-1', from: '120363000000000000@g.us', body: 'cek video ini' }
+    },
+    message: 'Gagal proses video',
+    category: 'internal'
+  });
+  assert.deepEqual(sent, [['Gagal proses video', '120363000000000000@g.us', 'text', { replyTo: 'wamid-vid-1' }]]);
+});

@@ -26,7 +26,10 @@ function classifyTask(text = '') {
     !/[.?!].*\S/.test(s) &&
     !s.endsWith('?') &&
     !/\b(rangkum|ringkas|summari[sz]e|resume|debug|bug|kode|coding|analisis|evaluasi|bandingkan|buatkan|carikan|tolong)\b/.test(s) &&
-    /^(hai|halo|hello|hi|pagi|siang|sore|malam|selamat\s+(?:pagi|siang|sore|malam))(?:\b|[!,.\s]*$)/.test(s);
+    (
+      /^(hai|halo|hello|hi|pagi|siang|sore|malam|selamat\s+(?:pagi|siang|sore|malam))(?:\b|[!,.\s]*$)/.test(s) ||
+      /^(?:(?:terima\s*kasih|terimakasih|makasih)(?:\s+banyak)?|thanks|thank\s+you|thx|ok|oke|okay|siap|mantap|sip|noted|(?:wow\s+)?keren)(?:\s+(?:bubu|ya|kak|bro|makasih|siap|oke))?[!,.\s]*$/i.test(s)
+    );
   if (isShortGreeting) return 'greeting';
   if (/\b(rangkum|ringkas|summari[sz]e|resume)\b/.test(s)) return 'summarize';
   if (/\b(debug|bug|kode|coding|program|javascript|python|error log)\b/.test(s)) return 'coding';

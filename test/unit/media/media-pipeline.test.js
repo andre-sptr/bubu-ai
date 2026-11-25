@@ -551,3 +551,64 @@ test('Stage 2: concurrent processIncoming audio calls queue safely via AsyncSema
   assert.equal(b.extractedText, 'Transkrip sukses');
   assert.equal(service.audioBusy, false);
 });
+
+test('download accepts WAHA application/mp4 & audio/webm container aliases and rejects animated WebP early', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubu-media-mime-webp-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const { isAnimatedWebpBuffer } = require('../../../src/media/media-validator');
+  const { validateResponseMime } = require('../../../src/utils/media-http');
+  const { UserValidationError } = require('../../../src/utils/error-policy');
+
+  // Compatible container MIME aliases
+  assert.doesNotThrow(() => validateResponseMime('video/mp4', 'application/mp4', ['video/mp4', 'application/mp4'], '.mp4'));
+  assert.doesNotThrow(() => validateResponseMime('audio/webm', 'video/webm', ['audio/webm'], '.webm'));
+
+  // Minimal valid ftyp MP4 buffer
+  const mp4Buf = Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x18]), Buffer.from('ftypmp42')]);
+  const mp4Service = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    httpClient: {
+      get: async () => ({
+        status: 200,
+        data: mp4Buf,
+        headers: { 'content-type': 'application/mp4', 'content-length': String(mp4Buf.length) }
+      })
+    },
+    logger: { warn: () => {} }
+  });
+  const downloaded = await mp4Service.download({
+    url: '/api/files/clip.mp4',
+    filename: 'clip.mp4',
+    mimetype: 'video/mp4'
+  });
+  assert.equal(downloaded.ext, '.mp4');
+  assert.equal(downloaded.kind, 'video');
+
+  // Animated vs static WebP RIFF headers
+  const animWebp = Buffer.concat([
+    Buffer.from('RIFF'), Buffer.from([0x24, 0, 0, 0]),
+    Buffer.from('WEBP'),
+    Buffer.from('ANIM'), Buffer.from([0x06, 0, 0, 0]), Buffer.alloc(6)
+  ]);
+  const staticWebp = Buffer.concat([
+    Buffer.from('RIFF'), Buffer.from([0x18, 0, 0, 0]),
+    Buffer.from('WEBP'),
+    Buffer.from('VP8L'), Buffer.from([0x04, 0, 0, 0]), Buffer.alloc(4)
+  ]);
+  assert.equal(isAnimatedWebpBuffer(animWebp), true);
+  assert.equal(isAnimatedWebpBuffer(staticWebp), false);
+
+  let runnerCalls = 0;
+  const imgService = new MediaIntelligenceService({
+    wahaConfig: { baseUrl: 'http://127.0.0.1:3000' },
+    storageDir: dir,
+    commandRunner: async () => { runnerCalls++; return { stdout: '' }; }
+  });
+  await assert.rejects(
+    () => imgService.processImage({ filePath: path.join(dir, 'sticker.webp'), filename: 'sticker.webp', ext: '.webp', buffer: animWebp }),
+    (err) => err instanceof UserValidationError
+  );
+  assert.equal(runnerCalls, 0);
+});

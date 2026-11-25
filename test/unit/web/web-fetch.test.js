@@ -221,3 +221,94 @@ test('WebFetchService blocks private DNS resolution and redirects to private hos
   );
   assert.equal(hop1Destroyed, true);
 });
+
+test('Tier 1 social & HTML metadata extraction preserves single fetch on normal sites and enriches IG/TikTok previews safely', async () => {
+  const {
+    extractHtmlMetadata,
+    resolveOEmbedUrl,
+    fetchJsonWithSsrfGuard
+  } = require('../../../src/web/web-service');
+
+  // 1. Plain non-oEmbed website makes strictly 1 HTTP call
+  let exampleCalls = 0;
+  const plainFetcher = new WebFetchService({
+    dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+    httpClient: {
+      get: async () => {
+        exampleCalls++;
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+          data: '<html><head><title>Plain Docs</title></head><body><p>Isi dokumentasi normal.</p></body></html>'
+        };
+      }
+    }
+  });
+  const plainRes = await plainFetcher.fetch({ url: 'https://example.com/docs' });
+  assert.equal(exampleCalls, 1);
+  assert.equal(plainRes.title, 'Plain Docs');
+  assert.match(plainRes.content, /Isi dokumentasi normal/);
+  assert.equal(plainRes.content.includes('[PAGE_METADATA]'), false);
+
+  // 2. Instagram HTML shell extracts OpenGraph + Twitter + JSON-LD caption & creator cleanly
+  const igHtml = `
+    <html><head>
+      <title>Instagram</title>
+      <meta content="instagram.com" property="og:site_name">
+      <meta property="og:title" content="Andre (@andresptr) on Instagram">
+      <meta content="Liputan teknis antena array terbaru #rf" property="og:description">
+      <meta name="twitter:creator" content="@andresptr">
+      <link rel="canonical" href="https://www.instagram.com/reel/abc123/">
+      <script type="application/ld+json">{"@type":"VideoObject","author":{"name":"Andre Saputra"},"uploadDate":"2026-11-20"}</script>
+    </head><body>Log in to Instagram</body></html>
+  `;
+  const meta = extractHtmlMetadata(igHtml);
+  assert.equal(meta.siteName, 'instagram.com');
+  assert.equal(meta.og.description, 'Liputan teknis antena array terbaru #rf');
+  assert.equal(meta.canonicalUrl, 'https://www.instagram.com/reel/abc123/');
+  assert.equal(meta.author, '@andresptr');
+  assert.equal(meta.jsonLd.published, '2026-11-20');
+
+  // 3. oEmbed allowlist & TikTok pre-parsed JSON response handling
+  assert.equal(resolveOEmbedUrl('https://example.com/video'), null);
+  assert.match(resolveOEmbedUrl('https://www.tiktok.com/@user/video/777'), /^https:\/\/www\.tiktok\.com\/oembed\?url=/);
+  assert.match(resolveOEmbedUrl('https://youtu.be/dQw4w9WgXcQ'), /^https:\/\/www\.youtube\.com\/oembed\?url=/);
+
+  const fetchedUrls = [];
+  const tiktokFetcher = new WebFetchService({
+    dnsLookup: async () => [{ address: '104.16.1.1', family: 4 }],
+    httpClient: {
+      get: async (url) => {
+        fetchedUrls.push(url);
+        if (url.includes('/oembed')) {
+          return {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+            data: {
+              title: 'Tutorial Antena',
+              author_name: 'Teknisi RF',
+              provider_name: 'TikTok',
+              html: '<blockquote class="tiktok-embed"><title>embed</title></blockquote>'
+            }
+          };
+        }
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+          data: '<html><head><meta property="og:site_name" content="TikTok"></head><body></body></html>'
+        };
+      }
+    }
+  });
+  const ttRes = await tiktokFetcher.fetch({ url: 'https://www.tiktok.com/@user/video/777' });
+  assert.equal(fetchedUrls.length, 2);
+  assert.equal(ttRes.title, 'Tutorial Antena');
+  assert.match(ttRes.content, /\[PAGE_METADATA\]/);
+  assert.match(ttRes.content, /Author\/Creator: Teknisi RF/);
+
+  // 4. SSRF block in fetchJsonWithSsrfGuard
+  await assert.rejects(
+    () => fetchJsonWithSsrfGuard('http://127.0.0.1:3000/oembed'),
+    /jaringan privat/
+  );
+});

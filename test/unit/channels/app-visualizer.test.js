@@ -172,3 +172,24 @@ test('GET /api/visualizer/stream serves SSE headers, initial snapshot, and live 
   assert.match(sseState, /claude-sonnet-5-5/);
   assert.equal(sseState.includes('628123000'), false);
 });
+
+test('app.closeVisualizerStreams drains active SSE clients so app.close resolves promptly', async () => {
+  const { app } = makeVisualizerApp({ maxSseClients: 2 });
+  await app.listen({ host: '127.0.0.1', port: 0 });
+  const { port } = app.server.address();
+
+  const streamClosed = new Promise((resolve) => {
+    const req = http.get(`http://127.0.0.1:${port}/api/visualizer/stream`, (res) => {
+      res.on('data', (chunk) => {
+        if (String(chunk).includes('event: snapshot')) {
+          app.closeVisualizerStreams();
+          app.close().then(resolve);
+        }
+      });
+    });
+    req.on('error', () => {});
+  });
+
+  await streamClosed;
+  assert.equal(typeof app.closeVisualizerStreams, 'function');
+});

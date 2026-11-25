@@ -30,7 +30,7 @@ function createWebTools({ webSearch, webFetch }) {
   if (webFetch) {
     tools.push({
       name: 'web_fetch',
-      description: 'Fetch and extract readable text from a public HTTP/HTTPS web page. Do not fetch private networks or local services.',
+      description: 'Fetch and extract readable text, OpenGraph/Twitter/JSON-LD metadata, and supported public oEmbed info (TikTok/YouTube/Vimeo; plus metadata previews for public Instagram/X links without downloading video streams) from a public HTTP/HTTPS URL. Do not fetch private networks or local services.',
       scopes: ['personal', 'group'],
       group: 'web',
       readOnly: true,

@@ -5,8 +5,9 @@ const { createWebTools } = require('../web/web-tools');
 const { createDocumentTools } = require('../documents/document-tools');
 const { createWahaTools } = require('../channels/waha/waha-tools');
 const { createPollTools } = require('../channels/waha/poll-tools');
+const { createSystemTools } = require('./system-tools');
 
-const ALL_TOOL_GROUPS = Object.freeze(['memory', 'productivity', 'web', 'documents', 'waha']);
+const ALL_TOOL_GROUPS = Object.freeze(['memory', 'productivity', 'web', 'documents', 'waha', 'system']);
 const REQUEST_TOOL_GROUP_NAME = 'request_tool_group';
 const CORE_ALWAYS_TOOLS = new Set([
   'search_memory',
@@ -19,14 +20,16 @@ const CORE_ALWAYS_TOOLS = new Set([
 const GROUP_PATTERNS = Object.freeze({
   memory: /\b(ingat|catat|catatan|memori|memory|preferensi|proyek|project|lupa|hapus memori|arsip|sinkron|konsolidasi|riwayat|tujuan|goal|fakta)\b/i,
   productivity: /\b(task|tugas|todo|to-do|kerjaan|daftar tugas|selesai|selesaikan|deadline|reminder|ingatkan|pengingat|jadwal|batal|batalkan)\b/i,
-  web: /\b(cari|carikan|search|google|internet|web|berita|terbaru|hari ini|harga|kurs|cuaca|riset|research|jurnal|artikel|link|url|situs|website|buka halaman|cek info)\b/i,
+  web: /\b(cari|carikan|search|google|internet|web|berita|terbaru|hari ini|harga|kurs|cuaca|riset|research|jurnal|artikel|link|url|situs|website|buka halaman|cek info|instagram|ig|tiktok|youtube|youtu\.be|vimeo|twitter|x\.com|threads|facebook|fb|linkedin|reddit|github)\b|https?:\/\//i,
   documents: /\b(dokumen|document|file|berkas|pdf|docx|word|xlsx|excel|spreadsheet|csv|tabel|sheet|laporan|proposal|invoice|quotation|surat|sop|notulen|memo|bandingkan|compare|halaman|page|lampiran|attachment|template)\b/i,
-  waha: /\b(kirim|kirimkan|send|pesan|chat|whatsapp|wa|poll|polling|voting|vote|lokasi|location|maps|koordinat|kontak|vcard|kartu nama|reaksi|react|emoji|preview|tautan|edit pesan|hapus pesan|ubah pesan|tarik pesan|info grup|anggota grup|peserta|admin grup|cek nomor|nomor wa|sesi waha|status waha|pesan terakhir)\b/i
+  waha: /\b(kirim|kirimkan|send|pesan|chat|whatsapp|wa|poll|polling|voting|vote|lokasi|location|maps|koordinat|kontak|vcard|kartu nama|reaksi|react|emoji|preview|tautan|edit pesan|hapus pesan|ubah pesan|tarik pesan|info grup|anggota grup|peserta|admin grup|cek nomor|nomor wa|sesi waha|status waha|pesan terakhir)\b/i,
+  system: /\b(token|sumopod|biaya|cost|usage|pemakaian|penggunaan|kuota|quota|latency|latensi|model aktif|model apa|queue|antrean|status sistem|kesehatan bubu|bubu usage|rupiah|idr)\b/i
 });
 
 function selectToolGroups({
   task = 'general_chat',
   text = '',
+  quoteText = '',
   hasAttachment = false,
   hasRecentDocuments = false,
   hasQuote = false,
@@ -44,7 +47,7 @@ function selectToolGroups({
     return { isGreetingFastPath: true, groups: new Set(), includeCore: false };
   }
 
-  const s = String(text || '');
+  const s = [text, quoteText].filter((part) => String(part || '').trim()).join('\n');
   const groups = new Set(manualGroups);
   if (GROUP_PATTERNS.memory.test(s)) groups.add('memory');
   if (GROUP_PATTERNS.productivity.test(s)) groups.add('productivity');
@@ -67,6 +70,9 @@ function selectToolGroups({
   }
   if (hasPendingApprovals || GROUP_PATTERNS.waha.test(s)) {
     groups.add('waha');
+  }
+  if (GROUP_PATTERNS.system.test(s)) {
+    groups.add('system');
   }
 
   return { isGreetingFastPath: false, groups, includeCore: true };
@@ -176,7 +182,9 @@ function registerAllTools({
   memoryService,
   documentService,
   webSearch,
-  webFetch
+  webFetch,
+  config = null,
+  worker = null
 }) {
   const registry = new ToolRegistry();
   const domainTools = [
@@ -185,7 +193,8 @@ function registerAllTools({
     ...createWebTools({ webSearch, webFetch }),
     ...createDocumentTools({ db, documentService, approvalManager, waha, responseHandler }),
     ...createWahaTools({ waha, responseHandler, approvalManager, sessionMonitor, db }),
-    ...createPollTools({ db })
+    ...createPollTools({ db }),
+    ...createSystemTools({ db, config, worker, sessionMonitor })
   ];
   for (const tool of domainTools) {
     registry.register(tool);

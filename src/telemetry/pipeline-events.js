@@ -145,6 +145,9 @@ function resolveToolGroup(toolRegistry, toolName) {
   if (name.includes('whatsapp') || name.includes('poll') || name.includes('waha') || name.includes('group') || name.includes('react') || name.includes('location') || name.includes('contact') || name.includes('link_preview') || name.includes('bot_message') || name.includes('recent_chat')) {
     return 'waha';
   }
+  if (name.includes('usage') || name.includes('bubu_usage') || name.includes('system')) {
+    return 'system';
+  }
   return 'core';
 }
 
